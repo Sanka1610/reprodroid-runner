@@ -4,16 +4,16 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 1A（管理基盤）まで実装済みです。
+Phase 1B（永続化した模擬Job）まで実装済みです。
 
-- Kotlin/JVM + KtorのGradleプロジェクトとVersion Catalog
-- 公式SHA-256を固定したGradle Wrapper 8.14.3
-- SQLite/Ktor/serialization依存の固定
-- mainクラスのcompile・起動確認
+- `127.0.0.1:8080`へbindするKtor HTTP API v1
+- SQLiteへ永続化する単一workerの非同期Jobキュー
+- 外部プロセスを起動しない模擬成功・模擬失敗
+- 差分取得できるログと模擬APKメタデータ
+- 起動時に実行途中のJobを`INTERRUPTED`へ移す復旧処理
+- API、成功・失敗、cancel、再起動永続化の自動テスト
 
-Phase 1Aのmainはscaffold状態を表示して終了します。HTTP API、SQLite、Job executor、`SIMULATED`、`REAL_TRUSTED`は未実装で、Phase 1B以降に追加します。
-
-初期実装では、Jobの永続化、模擬成功・失敗、信頼済みGit clone、Gradle Wrapper検査、実ビルド、APK検出・配信までを実装します。
+`REAL_TRUSTED`、Git clone、Gradle Wrapper検査、実ビルドはPhase 1C、APK本体の配信はPhase 1Dで実装します。Phase 1Bのartifact endpointはメタデータだけを返し、content endpointは`ARTIFACT_CONTENT_UNAVAILABLE`で拒否します。
 
 ## リポジトリ構成
 
@@ -125,13 +125,22 @@ INTERRUPTED
 
 ## bindと接続
 
-以下はPhase 1B以降の予定です。Phase 1AではHTTP listenerを起動しません。
-
 デフォルトは`127.0.0.1:8080`です。
 
 ```bash
 ./gradlew run
 ```
+
+永続データは既定で`~/.local/state/reprodroid-runner`へ保存します。上書き可能な設定は次のとおりです。
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `REPRODROID_STATE_DIR` | `~/.local/state/reprodroid-runner` | SQLite、ログ、後続Phaseの成果物 |
+| `REPRODROID_HOST` | `127.0.0.1` | bind先 |
+| `REPRODROID_PORT` | `8080` | port |
+| `REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK` | `false` | 非loopback bindの危険受容 |
+
+非loopbackへbindする場合は`REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`による明示的な危険受容が必要です。認証は未実装であるため、通常の利用では指定しないでください。
 
 Androidからは開発用のADB reverseを使用します。
 
@@ -161,7 +170,7 @@ JDK 21.0.12.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 
 ./gradlew run
 ```
 
-Phase 1Aでは`./gradlew build run`が成功し、scaffold mainの起動を確認済みです。HTTPサーバーの起動手順はPhase 1Bで更新します。
+Phase 1Bでは`./gradlew test`と`./gradlew build`で、HTTP API、SQLite、模擬成功・失敗、cancel、再起動時の`INTERRUPTED`処理を検証します。
 
 ## 初期実装で扱わないもの
 
