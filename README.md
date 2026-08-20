@@ -4,7 +4,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 1D（APK転送）まで実装済みです。
+Phase 1D（APK転送）まで実装済みで、Phase 1Eは検証途中です。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -19,6 +19,8 @@ Phase 1D（APK転送）まで実装済みです。
 - `SUCCEEDED` Jobの登録済みAPKだけを返すcontent endpoint
 - 配信前のpath confinement、symbolic link、size、SHA-256再検査
 - APK MIME type、Content-Length、SHA-256由来ETag
+
+Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIからそれぞれ実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得と、同じstate directoryでのRunner再起動後にJob、artifact、log cursorが復元されることも確認済みである。Android側download以降のインストールE2Eは未確認。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、保持中のstateと再起動コマンドは[Phase 1E再開手順](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 
 ## リポジトリ構成
 
@@ -176,7 +178,7 @@ JDK 21.0.12.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 
 ./gradlew run
 ```
 
-Phase 1Dでは`./gradlew test`と`./gradlew build`で、既存のHTTP API、SQLite、模擬成功・失敗、cancel、安全ゲートに加え、APK content、transfer header、保存後改ざん拒否、schema v3 migrationを検証します。実ビルドを有効化する例:
+Phase 1Dでは`./gradlew test`と`./gradlew build`で、既存のHTTP API、SQLite、模擬成功・失敗、cancel、安全ゲートに加え、APK content、transfer header、保存後改ざん拒否、schema v3 migrationを検証します。Phase 1E中断時点では`./gradlew test build`が成功したが、8 tasksすべてが`UP-TO-DATE`であり、`--rerun-tasks`による再実行はしていません。実ビルドを有効化する例:
 
 ```bash
 REPRODROID_ENABLE_REAL_BUILDS=true ./gradlew run
