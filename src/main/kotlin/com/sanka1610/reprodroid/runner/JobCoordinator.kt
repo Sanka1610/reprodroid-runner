@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.Closeable
 import java.net.URI
+import java.nio.file.Path
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.CoroutineContext
@@ -76,11 +77,24 @@ internal class JobCoordinator(
     private val store: SQLiteJobStore,
     coroutineContext: CoroutineContext,
     simulationStepDelayMillis: Long,
+    private val realBuildEnabled: Boolean = false,
+    stateDirectory: Path,
+    private val recipeRegistry: BuildRecipeRegistry = BuildRecipeRegistry(),
+    processExecutor: ProcessExecutor = SystemProcessExecutor(),
+    sourceResolver: SourceResolver? = null,
+    wrapperVerifier: WrapperVerifier = WrapperVerifier(),
 ) : Closeable {
     private val scope = CoroutineScope(coroutineContext + SupervisorJob())
     private val queuedJobIds = Channel<String>(Channel.UNLIMITED)
     private val runningJobs = ConcurrentHashMap<String, Job>()
     private val simulatedExecutor = SimulatedBuildExecutor(store, simulationStepDelayMillis)
+    private val sourceResolver = sourceResolver ?: GitSourceResolver(processExecutor, store, stateDirectory)
+    private val trustedBuildExecutor = TrustedBuildExecutor(
+        store = store,
+        processExecutor = processExecutor,
+        wrapperVerifier = wrapperVerifier,
+        stateDirectory = stateDirectory,
+    )
 
     init {
         store.markRunningJobsInterrupted()
@@ -99,10 +113,13 @@ internal class JobCoordinator(
     fun create(request: CreateJobRequest): CreateJobResponse {
         validate(request)
         if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
-            throw ApiException.forbidden(
-                code = "REAL_BUILD_DISABLED",
-                message = "REAL_TRUSTED execution is not implemented in Phase 1B.",
-            )
+            if (!realBuildEnabled) {
+                throw ApiException.forbidden(
+                    code = "REAL_BUILD_DISABLED",
+                    message = "REAL_TRUSTED execution is disabled by Runner configuration.",
+                )
+            }
+            recipeRegistry.requireAllowed(request.repositoryUrl, request.revision)
         }
         val response = store.createJob(request)
         check(queuedJobIds.trySend(response.jobId).isSuccess) { "The job queue is not accepting work." }
@@ -118,12 +135,40 @@ internal class JobCoordinator(
         store.listArtifacts(jobId) ?: throw ApiException.notFound(),
     )
 
-    fun confirm(jobId: String) {
-        get(jobId)
-        throw ApiException.conflict(
-            code = "CONFIRMATION_NOT_APPLICABLE",
-            message = "SIMULATED jobs do not require confirmation.",
-        )
+    fun confirm(jobId: String, request: ConfirmJobRequest) {
+        val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+        if (job.executionMode != ExecutionMode.REAL_TRUSTED) {
+            throw ApiException.conflict(
+                code = "CONFIRMATION_NOT_APPLICABLE",
+                message = "SIMULATED jobs do not require confirmation.",
+            )
+        }
+        if (!request.riskAcknowledged) {
+            throw ApiException.forbidden(
+                code = "RISK_ACKNOWLEDGEMENT_REQUIRED",
+                message = "Explicit acknowledgement of host arbitrary-code-execution risk is required.",
+            )
+        }
+        if (job.state != JobState.AWAITING_CONFIRMATION) {
+            throw ApiException.conflict(
+                code = "JOB_NOT_AWAITING_CONFIRMATION",
+                message = "The job is not awaiting real-build confirmation.",
+            )
+        }
+        val confirmedSha = request.resolvedCommitSha.lowercase()
+        if (confirmedSha != job.resolvedCommitSha) {
+            throw ApiException.conflict(
+                code = "RESOLVED_COMMIT_MISMATCH",
+                message = "The confirmed commit does not match the Runner-resolved commit.",
+            )
+        }
+        if (!store.confirmRealJob(jobId, confirmedSha)) {
+            throw ApiException.conflict(
+                code = "CONFIRMATION_RACE",
+                message = "The job changed state before confirmation was applied.",
+            )
+        }
+        check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting work." }
     }
 
     fun validateArtifact(jobId: String, artifactId: String) {
@@ -163,18 +208,43 @@ internal class JobCoordinator(
     }
 
     private suspend fun runJob(jobId: String) {
-        if (!store.markQueuedIfCreated(jobId)) return
         val job = store.getStoredJob(jobId) ?: return
         try {
-            simulatedExecutor.execute(job)
+            when (job.executionMode) {
+                ExecutionMode.SIMULATED -> {
+                    if (!store.markQueuedIfCreated(jobId)) return
+                    simulatedExecutor.execute(store.getStoredJob(jobId) ?: return)
+                }
+                ExecutionMode.REAL_TRUSTED -> runRealJob(job)
+            }
         } catch (_: CancellationException) {
             // cancel() persists the terminal state before cancelling this coroutine.
+        } catch (failure: TrustedBuildFailure) {
+            store.failIfActive(
+                jobId = jobId,
+                error = JobError(failure.code, failure.message),
+                logMessage = failure.message,
+            )
         } catch (failure: Throwable) {
             store.failIfActive(
                 jobId = jobId,
-                error = JobError("INTERNAL_EXECUTION_ERROR", "The simulated executor failed unexpectedly."),
+                error = JobError("INTERNAL_EXECUTION_ERROR", "The job executor failed unexpectedly."),
                 logMessage = failure.message ?: failure::class.simpleName.orEmpty(),
             )
+        }
+    }
+
+    private suspend fun runRealJob(job: StoredJob) {
+        val recipe = recipeRegistry.find(job.repositoryUrl)
+            ?: throw TrustedBuildFailure("RECIPE_NOT_FOUND", "The persisted repository no longer has an allowlisted recipe.")
+        when (job.state) {
+            JobState.CREATED -> {
+                if (!store.beginResolvingRealJob(job.jobId, recipe)) return
+                val resolvedCommit = sourceResolver.resolve(recipe, job.revision, job.jobId)
+                store.awaitRealConfirmation(job.jobId, resolvedCommit)
+            }
+            JobState.QUEUED -> trustedBuildExecutor.execute(job, recipe)
+            else -> Unit
         }
     }
 

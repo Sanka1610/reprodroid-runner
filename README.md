@@ -4,16 +4,19 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 1B（永続化した模擬Job）まで実装済みです。
+Phase 1C（allowlist登録済みリポジトリの確認付き実ビルド）を実装済みです。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
 - 外部プロセスを起動しない模擬成功・模擬失敗
 - 差分取得できるログと模擬APKメタデータ
 - 起動時に実行途中のJobを`INTERRUPTED`へ移す復旧処理
-- API、成功・失敗、cancel、再起動永続化の自動テスト
+- GitHub ref解決、commit/RCE確認ゲート、detached checkout
+- Gradle公式checksumによるdistribution/Wrapper JAR検査
+- 固定task実行、timeout/cancel、APK検出、Build Environment Manifest、監査ログ
+- API、成功・失敗、cancel、再起動永続化、安全ゲートの自動テスト
 
-`REAL_TRUSTED`、Git clone、Gradle Wrapper検査、実ビルドはPhase 1C、APK本体の配信はPhase 1Dで実装します。Phase 1Bのartifact endpointはメタデータだけを返し、content endpointは`ARTIFACT_CONTENT_UNAVAILABLE`で拒否します。
+APK本体の配信、Android側のAPK解析・SHA-256再計算、標準インストールはPhase 1Dです。Phase 1Cのartifact endpointはRunnerが検出したAPKのファイル名・サイズ・SHA-256を返しますが、content endpointは`ARTIFACT_CONTENT_UNAVAILABLE`で拒否します。
 
 ## リポジトリ構成
 
@@ -76,13 +79,13 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 - HTTPSの`distributionUrl`と許可ホスト
 - Gradle distributionの公式SHA-256
 - `gradle-wrapper.jar`の公式SHA-256
-- レシピに記載したGradle version/taskとの整合
+- レシピに記載したdistribution version、Wrapper JAR生成version、taskとの整合
 
 対象リポジトリに`distributionSha256Sum`がない場合、レシピが明示的に許可した対象だけ、Runnerが公式checksumを取得して検証します。検査結果は`SUPPLIED_BY_RUNNER`として記録します。公式値で検証できない場合に続行するoverrideは実装しません。
 
 ## Jobと永続化
 
-SQLiteへJob、request、resolved commit、状態、進捗、確認、エラー、ログ索引、artifactメタデータ、checksum、Wrapper検査結果を保存します。APK、cloneしたソース、ログ本体は専用state directoryへ保存します。
+SQLiteへJob、request、resolved commit、状態、進捗、確認、エラー、ログ索引、artifactメタデータ、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、APK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。既存のPhase 1B schemaは起動時にv2へtransactionalに移行します。
 
 Runner再起動時、実行途中だったJobは自動再実行せず`INTERRUPTED`へ移します。
 
@@ -112,7 +115,7 @@ INTERRUPTED
 - ログ差分取得
 - cancel・retry
 - APK候補一覧
-- artifact download
+- artifact metadata（content downloadはPhase 1D）
 - health check
 
 詳細は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
@@ -138,6 +141,7 @@ INTERRUPTED
 | `REPRODROID_STATE_DIR` | `~/.local/state/reprodroid-runner` | SQLite、ログ、後続Phaseの成果物 |
 | `REPRODROID_HOST` | `127.0.0.1` | bind先 |
 | `REPRODROID_PORT` | `8080` | port |
+| `REPRODROID_ENABLE_REAL_BUILDS` | `false` | `REAL_TRUSTED`ホスト実行の危険受容 |
 | `REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK` | `false` | 非loopback bindの危険受容 |
 
 非loopbackへbindする場合は`REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`による明示的な危険受容が必要です。認証は未実装であるため、通常の利用では指定しないでください。
@@ -170,7 +174,13 @@ JDK 21.0.12.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 
 ./gradlew run
 ```
 
-Phase 1Bでは`./gradlew test`と`./gradlew build`で、HTTP API、SQLite、模擬成功・失敗、cancel、再起動時の`INTERRUPTED`処理を検証します。
+Phase 1Cでは`./gradlew test`と`./gradlew build`で、HTTP API、SQLite、模擬成功・失敗、cancel、再起動時の`INTERRUPTED`処理に加え、allowlist、commit/RCE確認、Wrapper checksum補完・不一致拒否を検証します。実ビルドを有効化する例:
+
+```bash
+REPRODROID_ENABLE_REAL_BUILDS=true ./gradlew run
+```
+
+起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
 ## 初期実装で扱わないもの
 

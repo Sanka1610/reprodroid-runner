@@ -18,6 +18,7 @@ internal data class StoredJob(
     val repositoryUrl: String,
     val revision: RequestedRevision,
     val simulationOutcome: SimulationOutcome?,
+    val resolvedCommitSha: String?,
     val state: JobState,
 )
 
@@ -82,7 +83,7 @@ class SQLiteJobStore(
         connection.prepareStatement(
             """
             SELECT job_id, execution_mode, repository_url, revision_type, revision_value,
-                   simulation_outcome, state
+                   simulation_outcome, resolved_commit_sha, state
             FROM jobs WHERE job_id = ?
             """.trimIndent(),
         ).use { statement ->
@@ -152,6 +153,124 @@ class SQLiteJobStore(
     }
 
     @Synchronized
+    internal fun beginResolvingRealJob(jobId: String, recipe: BuildRecipe): Boolean {
+        val current = getStateAndProgress(jobId) ?: return false
+        if (current.state != JobState.CREATED) return false
+        appendLog(jobId, LogLevel.INFO, "Resolving the allowlisted ref with recipe ${recipe.id}.")
+        return connection().use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE jobs
+                SET state = ?, progress_percent = 5, effective_build_root = ?,
+                    effective_build_tasks = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, JobState.RESOLVING_SOURCE.name)
+                statement.setString(2, recipe.buildRoot)
+                statement.setString(3, recipe.tasks.joinToString("\n"))
+                statement.setString(4, Instant.now(clock).toString())
+                statement.setString(5, jobId)
+                statement.setString(6, JobState.CREATED.name)
+                statement.executeUpdate() == 1
+            }
+        }
+    }
+
+    @Synchronized
+    fun awaitRealConfirmation(jobId: String, resolvedCommitSha: String): Boolean {
+        val current = getStateAndProgress(jobId) ?: return false
+        if (current.state.isTerminal) return false
+        appendLog(
+            jobId,
+            LogLevel.WARN,
+            "Host execution is paused until the client confirms commit $resolvedCommitSha and acknowledges RCE risk.",
+        )
+        return connection().use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE jobs
+                SET resolved_commit_sha = ?, state = ?, progress_percent = 10,
+                    requires_confirmation = 1, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, resolvedCommitSha)
+                statement.setString(2, JobState.AWAITING_CONFIRMATION.name)
+                statement.setString(3, Instant.now(clock).toString())
+                statement.setString(4, jobId)
+                statement.setString(5, JobState.RESOLVING_SOURCE.name)
+                statement.executeUpdate() == 1
+            }
+        }
+    }
+
+    @Synchronized
+    fun confirmRealJob(jobId: String, resolvedCommitSha: String): Boolean {
+        val current = getStoredJob(jobId) ?: return false
+        if (current.state != JobState.AWAITING_CONFIRMATION || current.resolvedCommitSha != resolvedCommitSha) return false
+        appendLog(jobId, LogLevel.WARN, "Client acknowledged RCE risk for commit $resolvedCommitSha.")
+        return connection().use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE jobs
+                SET state = ?, progress_percent = 15, requires_confirmation = 0, updated_at = ?
+                WHERE job_id = ? AND state = ? AND resolved_commit_sha = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, JobState.QUEUED.name)
+                statement.setString(2, Instant.now(clock).toString())
+                statement.setString(3, jobId)
+                statement.setString(4, JobState.AWAITING_CONFIRMATION.name)
+                statement.setString(5, resolvedCommitSha)
+                statement.executeUpdate() == 1
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun recordWrapperVerification(jobId: String, verification: WrapperVerification): Boolean =
+        connection().use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE jobs
+                SET gradle_version = ?, distribution_url = ?, distribution_sha256 = ?,
+                    distribution_checksum_source = ?, wrapper_jar_gradle_version = ?,
+                    wrapper_jar_sha256 = ?, updated_at = ?
+                WHERE job_id = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, verification.gradleVersion)
+                statement.setString(2, verification.distributionUrl)
+                statement.setString(3, verification.distributionSha256)
+                statement.setString(4, verification.distributionChecksumSource)
+                statement.setString(5, verification.wrapperJarGradleVersion)
+                statement.setString(6, verification.wrapperJarSha256)
+                statement.setString(7, Instant.now(clock).toString())
+                statement.setString(8, jobId)
+                statement.executeUpdate() == 1
+            }
+        }
+
+    @Synchronized
+    internal fun recordBuildManifest(jobId: String, relativePath: String, sha256: String): Boolean =
+        connection().use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE jobs
+                SET manifest_path = ?, manifest_sha256 = ?, updated_at = ?
+                WHERE job_id = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, relativePath)
+                statement.setString(2, sha256)
+                statement.setString(3, Instant.now(clock).toString())
+                statement.setString(4, jobId)
+                statement.executeUpdate() == 1
+            }
+        }
+
+    @Synchronized
     fun transitionIfActive(
         jobId: String,
         state: JobState,
@@ -175,6 +294,15 @@ class SQLiteJobStore(
     }
 
     @Synchronized
+    fun completeRealSuccessIfActive(jobId: String, artifacts: List<ArtifactMetadata>): Boolean {
+        val current = getStateAndProgress(jobId) ?: return false
+        if (current.state.isTerminal) return false
+        artifacts.forEach { addArtifact(jobId, it) }
+        appendLog(jobId, LogLevel.INFO, "Trusted real build succeeded; ${artifacts.size} APK artifact(s) registered.")
+        return updateState(jobId, JobState.SUCCEEDED, 100)
+    }
+
+    @Synchronized
     fun failIfActive(
         jobId: String,
         error: JobError,
@@ -185,6 +313,7 @@ class SQLiteJobStore(
         if (current.state.isTerminal) return false
         deleteArtifacts(jobId)
         appendLog(jobId, LogLevel.ERROR, logMessage)
+        clearConfirmation(jobId)
         return updateState(
             jobId = jobId,
             state = JobState.FAILED,
@@ -199,6 +328,7 @@ class SQLiteJobStore(
         if (current.state.isTerminal) return CancelJobResult.ALREADY_TERMINAL
         deleteArtifacts(jobId)
         appendLog(jobId, LogLevel.WARN, "Job cancelled by the client.")
+        clearConfirmation(jobId)
         updateState(jobId, JobState.CANCELLED, current.progressPercent)
         return CancelJobResult.CANCELLED
     }
@@ -383,67 +513,87 @@ class SQLiteJobStore(
 
     private fun initializeSchema() {
         connection().use { connection ->
-            connection.createStatement().use { statement ->
-                val schemaVersion = statement.executeQuery("PRAGMA user_version").use { result ->
-                    result.next()
-                    result.getInt(1)
+            connection.autoCommit = false
+            try {
+                connection.createStatement().use { statement ->
+                    val schemaVersion = statement.executeQuery("PRAGMA user_version").use { result ->
+                        result.next()
+                        result.getInt(1)
+                    }
+                    require(schemaVersion in 0..SCHEMA_VERSION) {
+                        "Unsupported Runner database schema version: $schemaVersion"
+                    }
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS jobs (
+                            job_id TEXT PRIMARY KEY,
+                            execution_mode TEXT NOT NULL,
+                            repository_url TEXT NOT NULL,
+                            revision_type TEXT NOT NULL,
+                            revision_value TEXT NOT NULL,
+                            simulation_outcome TEXT,
+                            resolved_commit_sha TEXT,
+                            state TEXT NOT NULL,
+                            progress_percent INTEGER NOT NULL,
+                            requires_confirmation INTEGER NOT NULL,
+                            effective_build_root TEXT,
+                            effective_build_tasks TEXT,
+                            error_code TEXT,
+                            error_message TEXT,
+                            gradle_version TEXT,
+                            distribution_url TEXT,
+                            distribution_sha256 TEXT,
+                            distribution_checksum_source TEXT,
+                            wrapper_jar_gradle_version TEXT,
+                            wrapper_jar_sha256 TEXT,
+                            manifest_path TEXT,
+                            manifest_sha256 TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS artifacts (
+                            artifact_id TEXT PRIMARY KEY,
+                            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                            file_name TEXT NOT NULL,
+                            size_bytes INTEGER NOT NULL,
+                            sha256 TEXT NOT NULL,
+                            package_name TEXT NOT NULL,
+                            version_name TEXT NOT NULL,
+                            version_code INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS log_entries (
+                            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                            sequence INTEGER NOT NULL,
+                            timestamp TEXT NOT NULL,
+                            level TEXT NOT NULL,
+                            file_offset INTEGER NOT NULL,
+                            byte_length INTEGER NOT NULL,
+                            PRIMARY KEY (job_id, sequence)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        "CREATE INDEX IF NOT EXISTS jobs_state_index ON jobs(state)",
+                    )
+                    if (schemaVersion == 1) {
+                        AUDIT_COLUMNS.forEach { columnDefinition ->
+                            statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
+                        }
+                    }
+                    statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
-                require(schemaVersion == 0 || schemaVersion == SCHEMA_VERSION) {
-                    "Unsupported Runner database schema version: $schemaVersion"
-                }
-                statement.executeUpdate(
-                    """
-                    CREATE TABLE IF NOT EXISTS jobs (
-                        job_id TEXT PRIMARY KEY,
-                        execution_mode TEXT NOT NULL,
-                        repository_url TEXT NOT NULL,
-                        revision_type TEXT NOT NULL,
-                        revision_value TEXT NOT NULL,
-                        simulation_outcome TEXT,
-                        resolved_commit_sha TEXT,
-                        state TEXT NOT NULL,
-                        progress_percent INTEGER NOT NULL,
-                        requires_confirmation INTEGER NOT NULL,
-                        effective_build_root TEXT,
-                        effective_build_tasks TEXT,
-                        error_code TEXT,
-                        error_message TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )
-                    """.trimIndent(),
-                )
-                statement.executeUpdate(
-                    """
-                    CREATE TABLE IF NOT EXISTS artifacts (
-                        artifact_id TEXT PRIMARY KEY,
-                        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-                        file_name TEXT NOT NULL,
-                        size_bytes INTEGER NOT NULL,
-                        sha256 TEXT NOT NULL,
-                        package_name TEXT NOT NULL,
-                        version_name TEXT NOT NULL,
-                        version_code INTEGER NOT NULL
-                    )
-                    """.trimIndent(),
-                )
-                statement.executeUpdate(
-                    """
-                    CREATE TABLE IF NOT EXISTS log_entries (
-                        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-                        sequence INTEGER NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        level TEXT NOT NULL,
-                        file_offset INTEGER NOT NULL,
-                        byte_length INTEGER NOT NULL,
-                        PRIMARY KEY (job_id, sequence)
-                    )
-                    """.trimIndent(),
-                )
-                statement.executeUpdate(
-                    "CREATE INDEX IF NOT EXISTS jobs_state_index ON jobs(state)",
-                )
-                if (schemaVersion == 0) statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
+                connection.commit()
+            } catch (failure: Throwable) {
+                connection.rollback()
+                throw failure
             }
         }
     }
@@ -479,6 +629,17 @@ class SQLiteJobStore(
     private fun deleteArtifacts(jobId: String) {
         connection().use { connection ->
             connection.prepareStatement("DELETE FROM artifacts WHERE job_id = ?").use { statement ->
+                statement.setString(1, jobId)
+                statement.executeUpdate()
+            }
+        }
+    }
+
+    private fun clearConfirmation(jobId: String) {
+        connection().use { connection ->
+            connection.prepareStatement(
+                "UPDATE jobs SET requires_confirmation = 0 WHERE job_id = ?",
+            ).use { statement ->
                 statement.setString(1, jobId)
                 statement.executeUpdate()
             }
@@ -541,6 +702,7 @@ class SQLiteJobStore(
             value = getString("revision_value"),
         ),
         simulationOutcome = getString("simulation_outcome")?.let(SimulationOutcome::valueOf),
+        resolvedCommitSha = getString("resolved_commit_sha"),
         state = JobState.valueOf(getString("state")),
     )
 
@@ -593,6 +755,16 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
+        val AUDIT_COLUMNS = listOf(
+            "gradle_version TEXT",
+            "distribution_url TEXT",
+            "distribution_sha256 TEXT",
+            "distribution_checksum_source TEXT",
+            "wrapper_jar_gradle_version TEXT",
+            "wrapper_jar_sha256 TEXT",
+            "manifest_path TEXT",
+            "manifest_sha256 TEXT",
+        )
     }
 }

@@ -195,6 +195,98 @@ class RunnerApiTest {
         assertThrows(IllegalArgumentException::class.java) {
             RunnerConfig.fromEnvironment(mapOf("REPRODROID_STATE_DIR" to ""))
         }
+        assertTrue(
+            RunnerConfig.fromEnvironment(mapOf("REPRODROID_ENABLE_REAL_BUILDS" to "true"))
+                .realBuildEnabled,
+        )
+    }
+
+    @Test
+    fun `runner migrates phase one schema and persists real build audit fields`() {
+        Class.forName("org.sqlite.JDBC")
+        val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
+        val jobId = "11111111-1111-1111-1111-111111111111"
+        DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeUpdate(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT PRIMARY KEY,
+                        execution_mode TEXT NOT NULL,
+                        repository_url TEXT NOT NULL,
+                        revision_type TEXT NOT NULL,
+                        revision_value TEXT NOT NULL,
+                        simulation_outcome TEXT,
+                        resolved_commit_sha TEXT,
+                        state TEXT NOT NULL,
+                        progress_percent INTEGER NOT NULL,
+                        requires_confirmation INTEGER NOT NULL,
+                        effective_build_root TEXT,
+                        effective_build_tasks TEXT,
+                        error_code TEXT,
+                        error_message TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+                statement.executeUpdate(
+                    """
+                    INSERT INTO jobs (
+                        job_id, execution_mode, repository_url, revision_type, revision_value,
+                        state, progress_percent, requires_confirmation, created_at, updated_at
+                    ) VALUES (
+                        '$jobId', 'REAL_TRUSTED', 'https://github.com/MorpheApp/MicroG-RE.git',
+                        'BRANCH', 'main', 'AWAITING_CONFIRMATION', 10, 1,
+                        '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z'
+                    )
+                    """.trimIndent(),
+                )
+                statement.execute("PRAGMA user_version = 1")
+            }
+        }
+
+        val store = SQLiteJobStore(stateDirectory)
+        assertEquals(JobState.AWAITING_CONFIRMATION, requireNotNull(store.getJob(jobId)).state)
+        assertTrue(
+            store.recordWrapperVerification(
+                jobId,
+                WrapperVerification(
+                    gradleVersion = "8.14.3",
+                    distributionUrl = "https://services.gradle.org/distributions/gradle-8.14.3-bin.zip",
+                    distributionSha256 = "a".repeat(64),
+                    distributionChecksumSource = "SUPPLIED_BY_RUNNER",
+                    wrapperJarGradleVersion = "8.11.1",
+                    wrapperJarSha256 = "b".repeat(64),
+                ),
+            ),
+        )
+        assertTrue(store.recordBuildManifest(jobId, "manifests/$jobId/reprodroid-build.json", "c".repeat(64)))
+
+        DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
+            connection.createStatement().use { statement ->
+                assertEquals(2, statement.executeQuery("PRAGMA user_version").use { result ->
+                    result.next()
+                    result.getInt(1)
+                })
+                statement.executeQuery(
+                    """
+                    SELECT gradle_version, distribution_sha256, distribution_checksum_source,
+                           wrapper_jar_gradle_version, wrapper_jar_sha256, manifest_path, manifest_sha256
+                    FROM jobs WHERE job_id = '$jobId'
+                    """.trimIndent(),
+                ).use { result ->
+                    assertTrue(result.next())
+                    assertEquals("8.14.3", result.getString("gradle_version"))
+                    assertEquals("a".repeat(64), result.getString("distribution_sha256"))
+                    assertEquals("SUPPLIED_BY_RUNNER", result.getString("distribution_checksum_source"))
+                    assertEquals("8.11.1", result.getString("wrapper_jar_gradle_version"))
+                    assertEquals("b".repeat(64), result.getString("wrapper_jar_sha256"))
+                    assertEquals("manifests/$jobId/reprodroid-build.json", result.getString("manifest_path"))
+                    assertEquals("c".repeat(64), result.getString("manifest_sha256"))
+                }
+            }
+        }
     }
 
     @Test
@@ -203,7 +295,7 @@ class RunnerApiTest {
         val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute("PRAGMA user_version = 2")
+                statement.execute("PRAGMA user_version = 3")
             }
         }
 

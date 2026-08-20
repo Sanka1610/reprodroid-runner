@@ -12,6 +12,7 @@ data class RunnerConfig(
     val port: Int,
     val stateDirectory: Path,
     val simulationStepDelayMillis: Long = 350,
+    val realBuildEnabled: Boolean = false,
 ) {
     companion object {
         fun fromEnvironment(environment: Map<String, String> = System.getenv()): RunnerConfig {
@@ -43,7 +44,9 @@ data class RunnerConfig(
                 "REPRODROID_STATE_DIR must not be blank."
             }
             val stateDirectory = configuredStateDirectory?.let(::Path) ?: defaultStateDirectory
-            return RunnerConfig(host, port, stateDirectory)
+            val realBuildEnabled = environment["REPRODROID_ENABLE_REAL_BUILDS"]
+                ?.equals("true", ignoreCase = true) == true
+            return RunnerConfig(host, port, stateDirectory, realBuildEnabled = realBuildEnabled)
         }
     }
 }
@@ -54,6 +57,11 @@ fun main() {
         LoggerFactory.getLogger("ReproDroidRunner").warn(
             "Binding the unauthenticated Runner API to non-loopback address {}.",
             config.host,
+        )
+    }
+    if (config.realBuildEnabled) {
+        LoggerFactory.getLogger("ReproDroidRunner").warn(
+            "REAL_TRUSTED host execution is enabled. Allowlisted Gradle builds can execute arbitrary code.",
         )
     }
     embeddedServer(

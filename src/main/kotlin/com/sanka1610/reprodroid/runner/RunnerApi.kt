@@ -44,6 +44,8 @@ fun Application.runnerModule(config: RunnerConfig) {
         store = store,
         coroutineContext = Dispatchers.IO,
         simulationStepDelayMillis = config.simulationStepDelayMillis,
+        realBuildEnabled = config.realBuildEnabled,
+        stateDirectory = config.stateDirectory,
     )
     monitor.subscribe(ApplicationStopped) { coordinator.close() }
 
@@ -88,7 +90,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                     HealthResponse(
                         runnerVersion = "0.1.0-alpha01",
                         apiVersion = "v1",
-                        realBuildEnabled = false,
+                        realBuildEnabled = config.realBuildEnabled,
                         databaseReady = store.isReady(),
                     ),
                 )
@@ -101,8 +103,9 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.respond(coordinator.get(call.requiredJobId()))
             }
             post("/jobs/{jobId}/confirm") {
-                call.receive<ConfirmJobRequest>()
-                coordinator.confirm(call.requiredJobId())
+                val request = call.receive<ConfirmJobRequest>()
+                coordinator.confirm(call.requiredJobId(), request)
+                call.respond(HttpStatusCode.NoContent)
             }
             post("/jobs/{jobId}/cancel") {
                 coordinator.cancel(call.requiredJobId())
@@ -132,7 +135,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                 coordinator.validateArtifact(call.requiredJobId(), artifactId)
                 throw ApiException.conflict(
                     code = "ARTIFACT_CONTENT_UNAVAILABLE",
-                    message = "Phase 1B provides simulated artifact metadata, not APK content.",
+                    message = "Artifact download is not available until Phase 1D.",
                 )
             }
         }
