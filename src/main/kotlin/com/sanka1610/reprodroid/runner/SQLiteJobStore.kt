@@ -22,6 +22,11 @@ internal data class StoredJob(
     val state: JobState,
 )
 
+internal data class StoredArtifact(
+    val metadata: ArtifactMetadata,
+    val contentRelativePath: String?,
+)
+
 internal enum class CancelJobResult {
     CANCELLED,
     NOT_FOUND,
@@ -294,7 +299,7 @@ class SQLiteJobStore(
     }
 
     @Synchronized
-    fun completeRealSuccessIfActive(jobId: String, artifacts: List<ArtifactMetadata>): Boolean {
+    internal fun completeRealSuccessIfActive(jobId: String, artifacts: List<StoredArtifact>): Boolean {
         val current = getStateAndProgress(jobId) ?: return false
         if (current.state.isTerminal) return false
         artifacts.forEach { addArtifact(jobId, it) }
@@ -334,23 +339,28 @@ class SQLiteJobStore(
     }
 
     private fun addArtifact(jobId: String, artifact: ArtifactMetadata) {
+        addArtifact(jobId, StoredArtifact(artifact, contentRelativePath = null))
+    }
+
+    private fun addArtifact(jobId: String, artifact: StoredArtifact) {
         connection().use { connection ->
             connection.prepareStatement(
                 """
                 INSERT INTO artifacts (
                     artifact_id, job_id, file_name, size_bytes, sha256,
-                    package_name, version_name, version_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    package_name, version_name, version_code, content_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """.trimIndent(),
             ).use { statement ->
-                statement.setString(1, artifact.artifactId)
+                statement.setString(1, artifact.metadata.artifactId)
                 statement.setString(2, jobId)
-                statement.setString(3, artifact.fileName)
-                statement.setLong(4, artifact.sizeBytes)
-                statement.setString(5, artifact.sha256)
-                statement.setString(6, artifact.packageName)
-                statement.setString(7, artifact.versionName)
-                statement.setLong(8, artifact.versionCode)
+                statement.setString(3, artifact.metadata.fileName)
+                statement.setLong(4, artifact.metadata.sizeBytes)
+                statement.setString(5, artifact.metadata.sha256)
+                statement.setString(6, artifact.metadata.packageName)
+                statement.setString(7, artifact.metadata.versionName)
+                statement.setLong(8, artifact.metadata.versionCode)
+                statement.setString(9, artifact.contentRelativePath)
                 statement.executeUpdate()
             }
         }
@@ -361,6 +371,28 @@ class SQLiteJobStore(
         connection().use { connection ->
             if (!jobExists(connection, jobId)) return null
             return listArtifacts(connection, jobId)
+        }
+    }
+
+    @Synchronized
+    internal fun getStoredArtifact(jobId: String, artifactId: String): StoredArtifact? = connection().use { connection ->
+        connection.prepareStatement(
+            """
+            SELECT artifact_id, file_name, size_bytes, sha256, package_name, version_name,
+                   version_code, content_path
+            FROM artifacts
+            WHERE job_id = ? AND artifact_id = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.setString(2, artifactId)
+            statement.executeQuery().use { result ->
+                if (!result.next()) return@use null
+                StoredArtifact(
+                    metadata = result.toArtifactMetadata(),
+                    contentRelativePath = result.getString("content_path"),
+                )
+            }
         }
     }
 
@@ -563,7 +595,8 @@ class SQLiteJobStore(
                             sha256 TEXT NOT NULL,
                             package_name TEXT NOT NULL,
                             version_name TEXT NOT NULL,
-                            version_code INTEGER NOT NULL
+                            version_code INTEGER NOT NULL,
+                            content_path TEXT
                         )
                         """.trimIndent(),
                     )
@@ -588,6 +621,9 @@ class SQLiteJobStore(
                             statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
                         }
                     }
+                    if (schemaVersion in 1..2 && !columnExists(connection, "artifacts", "content_path")) {
+                        statement.executeUpdate("ALTER TABLE artifacts ADD COLUMN content_path TEXT")
+                    }
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
                 connection.commit()
@@ -604,6 +640,16 @@ class SQLiteJobStore(
             statement.execute("PRAGMA busy_timeout = 5000")
         }
     }
+
+    private fun columnExists(connection: Connection, table: String, column: String): Boolean =
+        connection.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA table_info($table)").use { result ->
+                while (result.next()) {
+                    if (result.getString("name") == column) return true
+                }
+                false
+            }
+        }
 
     private fun jobExists(connection: Connection, jobId: String): Boolean =
         connection.prepareStatement("SELECT 1 FROM jobs WHERE job_id = ?").use { statement ->
@@ -677,17 +723,7 @@ class SQLiteJobStore(
             statement.executeQuery().use { result ->
                 buildList {
                     while (result.next()) {
-                        add(
-                            ArtifactMetadata(
-                                artifactId = result.getString("artifact_id"),
-                                fileName = result.getString("file_name"),
-                                sizeBytes = result.getLong("size_bytes"),
-                                sha256 = result.getString("sha256"),
-                                packageName = result.getString("package_name"),
-                                versionName = result.getString("version_name"),
-                                versionCode = result.getLong("version_code"),
-                            ),
-                        )
+                        add(result.toArtifactMetadata())
                     }
                 }
             }
@@ -704,6 +740,16 @@ class SQLiteJobStore(
         simulationOutcome = getString("simulation_outcome")?.let(SimulationOutcome::valueOf),
         resolvedCommitSha = getString("resolved_commit_sha"),
         state = JobState.valueOf(getString("state")),
+    )
+
+    private fun ResultSet.toArtifactMetadata(): ArtifactMetadata = ArtifactMetadata(
+        artifactId = getString("artifact_id"),
+        fileName = getString("file_name"),
+        sizeBytes = getLong("size_bytes"),
+        sha256 = getString("sha256"),
+        packageName = getString("package_name"),
+        versionName = getString("version_name"),
+        versionCode = getLong("version_code"),
     )
 
     private fun ResultSet.toJobResponse(
@@ -755,7 +801,7 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 2
+        const val SCHEMA_VERSION = 3
         val AUDIT_COLUMNS = listOf(
             "gradle_version TEXT",
             "distribution_url TEXT",

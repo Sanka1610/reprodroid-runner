@@ -12,6 +12,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.file.FileSystems
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.time.Clock
@@ -333,7 +334,7 @@ internal class TrustedBuildExecutor(
 
         transition(job.jobId, JobState.DISCOVERING_ARTIFACTS, 90, "Discovering APKs using the fixed artifact recipe.")
         val artifactPaths = discoverArtifacts(buildRoot, recipe)
-        val artifacts = artifactPaths.map { artifactPath ->
+        val discoveredArtifacts = artifactPaths.map { artifactPath ->
             ArtifactMetadata(
                 artifactId = UUID.randomUUID().toString(),
                 fileName = artifactPath.name,
@@ -361,7 +362,7 @@ internal class TrustedBuildExecutor(
             androidSdk = environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"],
             wrapper = wrapper,
             dependencies = captureDependencies(gradleUserHome),
-            artifacts = artifactPaths.zip(artifacts).map { (path, metadata) ->
+            artifacts = artifactPaths.zip(discoveredArtifacts).map { (path, metadata) ->
                 ManifestFile(buildRoot.relativize(path).toString().replace('\\', '/'), metadata.sizeBytes, metadata.sha256)
             },
         )
@@ -381,10 +382,28 @@ internal class TrustedBuildExecutor(
             )
         }
         store.appendLog(job.jobId, LogLevel.INFO, "Build Environment Manifest recorded with SHA-256 $manifestSha256.")
-        artifacts.forEach { artifact ->
+        val storedArtifacts = mutableListOf<StoredArtifact>()
+        try {
+            artifactPaths.zip(discoveredArtifacts).forEach { (sourcePath, metadata) ->
+                storedArtifacts += persistArtifact(job.jobId, sourcePath, metadata)
+            }
+        } catch (failure: Throwable) {
+            deleteStoredArtifacts(storedArtifacts)
+            throw failure
+        }
+        discoveredArtifacts.forEach { artifact ->
             store.appendLog(job.jobId, LogLevel.INFO, "APK detected: ${artifact.fileName}, ${artifact.sizeBytes} bytes, SHA-256 ${artifact.sha256}.")
         }
-        store.completeRealSuccessIfActive(job.jobId, artifacts)
+        val registered = try {
+            store.completeRealSuccessIfActive(job.jobId, storedArtifacts)
+        } catch (failure: Throwable) {
+            deleteStoredArtifacts(storedArtifacts)
+            throw failure
+        }
+        if (!registered) {
+            deleteStoredArtifacts(storedArtifacts)
+            throw CancellationException("Job became terminal before APK artifacts were registered.")
+        }
     }
 
     private suspend fun runChecked(
@@ -440,7 +459,7 @@ internal class TrustedBuildExecutor(
         }
         val matches = Files.walk(buildRoot).use { paths ->
             paths.filter { path ->
-                path.isRegularFile() && path.name.endsWith(".apk", ignoreCase = true) &&
+                Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && path.name.endsWith(".apk", ignoreCase = true) &&
                     matchers.any { it.matches(buildRoot.relativize(path)) }
             }.sorted().toList()
         }
@@ -451,6 +470,47 @@ internal class TrustedBuildExecutor(
             throw TrustedBuildFailure("UNEXPECTED_APK_COUNT", "The recipe requires exactly one APK but found ${matches.size}.")
         }
         return matches
+    }
+
+    private fun persistArtifact(jobId: String, sourcePath: Path, metadata: ArtifactMetadata): StoredArtifact {
+        val artifactDirectory = stateDirectory.resolve("artifacts").resolve(jobId).also(Path::createDirectories)
+        val storedPath = confinedPath(artifactDirectory, "${metadata.artifactId}.apk")
+        if (!Files.isRegularFile(sourcePath, LinkOption.NOFOLLOW_LINKS)) {
+            throw TrustedBuildFailure(
+                "ARTIFACT_PERSISTENCE_MISMATCH",
+                "The APK changed before it was copied into Runner artifact storage.",
+            )
+        }
+        try {
+            Files.copy(sourcePath, storedPath, LinkOption.NOFOLLOW_LINKS)
+            if (!Files.isRegularFile(storedPath, LinkOption.NOFOLLOW_LINKS)) {
+                throw TrustedBuildFailure(
+                    "ARTIFACT_PERSISTENCE_MISMATCH",
+                    "The APK changed while it was copied into Runner artifact storage.",
+                )
+            }
+            val storedSize = Files.size(storedPath)
+            val storedSha256 = sha256(storedPath)
+            if (storedSize != metadata.sizeBytes || storedSha256 != metadata.sha256) {
+                throw TrustedBuildFailure(
+                    "ARTIFACT_PERSISTENCE_MISMATCH",
+                    "The APK changed while it was copied into Runner artifact storage.",
+                )
+            }
+        } catch (failure: Throwable) {
+            runCatching { Files.deleteIfExists(storedPath) }
+            throw failure
+        }
+        return StoredArtifact(
+            metadata = metadata,
+            contentRelativePath = "artifacts/$jobId/${metadata.artifactId}.apk",
+        )
+    }
+
+    private fun deleteStoredArtifacts(storedArtifacts: Iterable<StoredArtifact>) {
+        storedArtifacts.mapNotNull(StoredArtifact::contentRelativePath).forEach { relativePath ->
+            runCatching { Files.deleteIfExists(confinedPath(stateDirectory, relativePath)) }
+        }
     }
 
     private fun captureDependencies(gradleUserHome: Path): List<ManifestFile> {

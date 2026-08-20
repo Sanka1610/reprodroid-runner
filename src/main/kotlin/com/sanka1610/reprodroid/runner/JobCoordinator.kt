@@ -11,7 +11,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.Closeable
 import java.net.URI
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.LinkOption
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.CoroutineContext
@@ -78,12 +80,17 @@ internal class JobCoordinator(
     coroutineContext: CoroutineContext,
     simulationStepDelayMillis: Long,
     private val realBuildEnabled: Boolean = false,
-    stateDirectory: Path,
+    private val stateDirectory: Path,
     private val recipeRegistry: BuildRecipeRegistry = BuildRecipeRegistry(),
     processExecutor: ProcessExecutor = SystemProcessExecutor(),
     sourceResolver: SourceResolver? = null,
     wrapperVerifier: WrapperVerifier = WrapperVerifier(),
 ) : Closeable {
+    internal data class ArtifactContent(
+        val metadata: ArtifactMetadata,
+        val path: Path,
+    )
+
     private val scope = CoroutineScope(coroutineContext + SupervisorJob())
     private val queuedJobIds = Channel<String>(Channel.UNLIMITED)
     private val runningJobs = ConcurrentHashMap<String, Job>()
@@ -171,9 +178,38 @@ internal class JobCoordinator(
         check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting work." }
     }
 
-    fun validateArtifact(jobId: String, artifactId: String) {
-        val artifacts = store.listArtifacts(jobId) ?: throw ApiException.notFound()
-        if (artifacts.none { it.artifactId == artifactId }) throw ApiException.artifactNotFound()
+    fun artifactContent(jobId: String, artifactId: String): ArtifactContent {
+        val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+        val storedArtifact = store.getStoredArtifact(jobId, artifactId) ?: throw ApiException.artifactNotFound()
+        if (job.state != JobState.SUCCEEDED) {
+            throw ApiException.conflict(
+                code = "JOB_NOT_SUCCEEDED",
+                message = "Artifact content is available only for a succeeded job.",
+            )
+        }
+        val relativePath = storedArtifact.contentRelativePath ?: throw ApiException.conflict(
+            code = "ARTIFACT_CONTENT_UNAVAILABLE",
+            message = "This artifact has no downloadable APK content.",
+        )
+        val stateRoot = stateDirectory.toRealPath()
+        val artifactRoot = stateRoot.resolve("artifacts").resolve(jobId).normalize()
+        val contentPath = stateRoot.resolve(relativePath).normalize()
+        val artifactRootRealPath = runCatching { artifactRoot.toRealPath() }.getOrNull()
+        val contentRealPath = runCatching { contentPath.toRealPath() }.getOrNull()
+        if (
+            artifactRootRealPath == null || contentRealPath == null ||
+            !artifactRootRealPath.startsWith(stateRoot) ||
+            !contentRealPath.startsWith(artifactRootRealPath) ||
+            !Files.isRegularFile(contentPath, LinkOption.NOFOLLOW_LINKS) ||
+            Files.size(contentPath) != storedArtifact.metadata.sizeBytes ||
+            sha256(contentPath) != storedArtifact.metadata.sha256
+        ) {
+            throw ApiException.conflict(
+                code = "ARTIFACT_CONTENT_INVALID",
+                message = "The stored APK no longer matches its registered metadata.",
+            )
+        }
+        return ArtifactContent(storedArtifact.metadata, contentRealPath)
     }
 
     fun cancel(jobId: String) {

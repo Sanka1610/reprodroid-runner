@@ -1,6 +1,7 @@
 package com.sanka1610.reprodroid.runner
 
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.HttpHeaders
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationStopped
@@ -13,6 +14,8 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.plugins.statuspages.exception
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondFile
+import io.ktor.server.response.header
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
@@ -132,11 +135,11 @@ fun Application.runnerModule(config: RunnerConfig) {
             get("/jobs/{jobId}/artifacts/{artifactId}/content") {
                 val artifactId = call.parameters["artifactId"]?.takeIf(String::isNotBlank)
                     ?: throw ApiException.badRequest("ARTIFACT_ID_REQUIRED", "artifactId is required.")
-                coordinator.validateArtifact(call.requiredJobId(), artifactId)
-                throw ApiException.conflict(
-                    code = "ARTIFACT_CONTENT_UNAVAILABLE",
-                    message = "Artifact download is not available until Phase 1D.",
-                )
+                val artifact = coordinator.artifactContent(call.requiredJobId(), artifactId)
+                call.response.header(HttpHeaders.ContentType, "application/vnd.android.package-archive")
+                call.response.header(HttpHeaders.ContentLength, artifact.metadata.sizeBytes.toString())
+                call.response.header(HttpHeaders.ETag, "\"${artifact.metadata.sha256}\"")
+                call.respondFile(artifact.path.toFile())
             }
         }
     }

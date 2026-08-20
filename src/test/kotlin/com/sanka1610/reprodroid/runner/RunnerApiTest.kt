@@ -5,7 +5,9 @@ import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsBytes
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
@@ -20,6 +22,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Path
+import java.nio.file.Files
 import java.sql.DriverManager
 
 class RunnerApiTest {
@@ -47,10 +50,67 @@ class RunnerApiTest {
         assertEquals(1, completed.artifacts.size)
         assertEquals("0".repeat(64), completed.artifacts.single().sha256)
 
+        val unavailable = client.get(
+            "/v1/jobs/${created.jobId}/artifacts/${completed.artifacts.single().artifactId}/content",
+        )
+        assertEquals(HttpStatusCode.Conflict, unavailable.status)
+        assertEquals("ARTIFACT_CONTENT_UNAVAILABLE", unavailable.body<ApiErrorResponse>().code)
+
         val logs = client.get("/v1/jobs/${created.jobId}/logs?afterSequence=0&limit=200")
             .body<LogResponse>()
         assertTrue(logs.entries.size >= 6)
         assertEquals(logs.entries.last().sequence, logs.nextAfterSequence)
+    }
+
+    @Test
+    fun `succeeded real artifact content includes immutable transfer metadata`() = testApplication {
+        val bytes = "signed-apk-test-content".toByteArray()
+        val (jobId, artifact) = seedDownloadableArtifact(bytes)
+        application { runnerModule(testConfig()) }
+
+        val response = client.get("/v1/jobs/$jobId/artifacts/${artifact.artifactId}/content")
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals("application/vnd.android.package-archive", response.headers[HttpHeaders.ContentType])
+        assertEquals(bytes.size.toString(), response.headers[HttpHeaders.ContentLength])
+        assertEquals("\"${artifact.sha256}\"", response.headers[HttpHeaders.ETag])
+        assertTrue(bytes.contentEquals(response.bodyAsBytes()))
+    }
+
+    @Test
+    fun `artifact content is rejected after stored bytes no longer match metadata`() = testApplication {
+        val (jobId, artifact) = seedDownloadableArtifact("original-apk".toByteArray())
+        val storedPath = stateDirectory.resolve("artifacts/$jobId/${artifact.artifactId}.apk")
+        Files.writeString(storedPath, "tampered")
+        application { runnerModule(testConfig()) }
+        val client = createClient {
+            install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
+        }
+
+        val response = client.get("/v1/jobs/$jobId/artifacts/${artifact.artifactId}/content")
+
+        assertEquals(HttpStatusCode.Conflict, response.status)
+        assertEquals("ARTIFACT_CONTENT_INVALID", response.body<ApiErrorResponse>().code)
+    }
+
+    @Test
+    fun `artifact content is rejected when the stored path becomes a symbolic link`() = testApplication {
+        val bytes = "original-apk".toByteArray()
+        val (jobId, artifact) = seedDownloadableArtifact(bytes)
+        val storedPath = stateDirectory.resolve("artifacts/$jobId/${artifact.artifactId}.apk")
+        val externalPath = stateDirectory.resolve("external.apk")
+        Files.write(externalPath, bytes)
+        Files.delete(storedPath)
+        Files.createSymbolicLink(storedPath, externalPath)
+        application { runnerModule(testConfig()) }
+        val client = createClient {
+            install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
+        }
+
+        val response = client.get("/v1/jobs/$jobId/artifacts/${artifact.artifactId}/content")
+
+        assertEquals(HttpStatusCode.Conflict, response.status)
+        assertEquals("ARTIFACT_CONTENT_INVALID", response.body<ApiErrorResponse>().code)
     }
 
     @Test
@@ -265,7 +325,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(2, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(3, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
@@ -285,6 +345,12 @@ class RunnerApiTest {
                     assertEquals("manifests/$jobId/reprodroid-build.json", result.getString("manifest_path"))
                     assertEquals("c".repeat(64), result.getString("manifest_sha256"))
                 }
+                assertTrue(
+                    statement.executeQuery("PRAGMA table_info(artifacts)").use { result ->
+                        generateSequence { if (result.next()) result.getString("name") else null }
+                            .any { it == "content_path" }
+                    },
+                )
             }
         }
     }
@@ -295,12 +361,42 @@ class RunnerApiTest {
         val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute("PRAGMA user_version = 3")
+                statement.execute("PRAGMA user_version = 4")
             }
         }
 
         assertThrows(IllegalArgumentException::class.java) {
             SQLiteJobStore(stateDirectory)
+        }
+    }
+
+    @Test
+    fun `runner migrates phase one C artifact rows to nullable content paths`() {
+        Class.forName("org.sqlite.JDBC")
+        val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
+        SQLiteJobStore(stateDirectory)
+        DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute("ALTER TABLE artifacts DROP COLUMN content_path")
+                statement.execute("PRAGMA user_version = 2")
+            }
+        }
+
+        SQLiteJobStore(stateDirectory)
+
+        DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
+            connection.createStatement().use { statement ->
+                assertEquals(3, statement.executeQuery("PRAGMA user_version").use { result ->
+                    result.next()
+                    result.getInt(1)
+                })
+                assertTrue(
+                    statement.executeQuery("PRAGMA table_info(artifacts)").use { result ->
+                        generateSequence { if (result.next()) result.getString("name") else null }
+                            .any { it == "content_path" }
+                    },
+                )
+            }
         }
     }
 
@@ -310,6 +406,42 @@ class RunnerApiTest {
         stateDirectory = stateDirectory,
         simulationStepDelayMillis = 1,
     )
+
+    private fun seedDownloadableArtifact(bytes: ByteArray): Pair<String, ArtifactMetadata> {
+        val store = SQLiteJobStore(stateDirectory)
+        val created = store.createJob(
+            CreateJobRequest(
+                executionMode = ExecutionMode.REAL_TRUSTED,
+                repositoryUrl = "https://github.com/MorpheApp/MicroG-RE.git",
+                revision = RequestedRevision(RevisionType.BRANCH, "main"),
+            ),
+        )
+        val artifactId = "22222222-2222-2222-2222-222222222222"
+        val artifactPath = stateDirectory.resolve("artifacts/${created.jobId}/$artifactId.apk")
+        Files.createDirectories(artifactPath.parent)
+        Files.write(artifactPath, bytes)
+        val artifact = ArtifactMetadata(
+            artifactId = artifactId,
+            fileName = "verified-debug.apk",
+            sizeBytes = bytes.size.toLong(),
+            sha256 = sha256(artifactPath),
+            packageName = "",
+            versionName = "",
+            versionCode = 0,
+        )
+        assertTrue(
+            store.completeRealSuccessIfActive(
+                created.jobId,
+                listOf(
+                    StoredArtifact(
+                        metadata = artifact,
+                        contentRelativePath = "artifacts/${created.jobId}/$artifactId.apk",
+                    ),
+                ),
+            ),
+        )
+        return created.jobId to artifact
+    }
 
     private fun simulatedRequest(outcome: SimulationOutcome) = CreateJobRequest(
         executionMode = ExecutionMode.SIMULATED,

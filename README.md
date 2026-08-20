@@ -4,7 +4,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 1C（allowlist登録済みリポジトリの確認付き実ビルド）を実装済みです。
+Phase 1D（APK転送）まで実装済みです。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -15,8 +15,10 @@ Phase 1C（allowlist登録済みリポジトリの確認付き実ビルド）を
 - Gradle公式checksumによるdistribution/Wrapper JAR検査
 - 固定task実行、timeout/cancel、APK検出、Build Environment Manifest、監査ログ
 - API、成功・失敗、cancel、再起動永続化、安全ゲートの自動テスト
-
-APK本体の配信、Android側のAPK解析・SHA-256再計算、標準インストールはPhase 1Dです。Phase 1Cのartifact endpointはRunnerが検出したAPKのファイル名・サイズ・SHA-256を返しますが、content endpointは`ARTIFACT_CONTENT_UNAVAILABLE`で拒否します。
+- build workspaceとは別の専用artifact領域へのAPK保存
+- `SUCCEEDED` Jobの登録済みAPKだけを返すcontent endpoint
+- 配信前のpath confinement、symbolic link、size、SHA-256再検査
+- APK MIME type、Content-Length、SHA-256由来ETag
 
 ## リポジトリ構成
 
@@ -85,7 +87,7 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 
 ## Jobと永続化
 
-SQLiteへJob、request、resolved commit、状態、進捗、確認、エラー、ログ索引、artifactメタデータ、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、APK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。既存のPhase 1B schemaは起動時にv2へtransactionalに移行します。
+SQLiteへJob、request、resolved commit、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。既存schemaは起動時にv3へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
 
 Runner再起動時、実行途中だったJobは自動再実行せず`INTERRUPTED`へ移します。
 
@@ -115,7 +117,7 @@ INTERRUPTED
 - ログ差分取得
 - cancel・retry
 - APK候補一覧
-- artifact metadata（content downloadはPhase 1D）
+- artifact metadataとAPK content download
 - health check
 
 詳細は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
@@ -174,7 +176,7 @@ JDK 21.0.12.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 
 ./gradlew run
 ```
 
-Phase 1Cでは`./gradlew test`と`./gradlew build`で、HTTP API、SQLite、模擬成功・失敗、cancel、再起動時の`INTERRUPTED`処理に加え、allowlist、commit/RCE確認、Wrapper checksum補完・不一致拒否を検証します。実ビルドを有効化する例:
+Phase 1Dでは`./gradlew test`と`./gradlew build`で、既存のHTTP API、SQLite、模擬成功・失敗、cancel、安全ゲートに加え、APK content、transfer header、保存後改ざん拒否、schema v3 migrationを検証します。実ビルドを有効化する例:
 
 ```bash
 REPRODROID_ENABLE_REAL_BUILDS=true ./gradlew run
