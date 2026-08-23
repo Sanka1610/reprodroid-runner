@@ -22,6 +22,12 @@ Phase 1E（Android Emulator E2E）まで完了しています。
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 
+## Phase 2のRunner境界
+
+Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidアプリ側で取得し、Android側で参照APK比較と更新候補判定を行います。Phase 2Aの初期実装では、Runnerは引き続きソース取得、allowlist済み実ビルド、Build Environment Manifest、ビルドartifact配信を担当し、公式APKを取得するAPIは追加しません。
+
+取得したAPKのpackage、`versionName`、`longVersionCode`、signing certificate、size、SHA-256はAndroid側の比較・更新状態として扱います。Runnerのビルドartifactと配布元APKの比較結果はRunner Jobの成功状態へ混ぜず、必要なAPI変更が判明した場合は別途契約を更新します。詳細なPhase 2境界は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)を参照してください。
+
 ## リポジトリ構成
 
 - `reprodroid-runner`: 本リポジトリ。Runner実装
@@ -186,11 +192,11 @@ REPRODROID_ENABLE_REAL_BUILDS=true ./gradlew run
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## 初期実装で扱わないもの
+## Phase 1時点でRunnerが扱わないもの
 
 - allowlist外リポジトリの実ビルド
 - Docker等のサンドボックス
 - HTTPS/WebSocket
 - LANへの無認証デフォルト公開
-- 公式APKとの比較
+- 公式APKとの比較（Phase 2ではAndroid側で実施）
 - split APK、APKS、AAB
