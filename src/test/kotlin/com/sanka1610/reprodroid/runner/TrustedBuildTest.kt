@@ -65,6 +65,9 @@ class TrustedBuildTest {
             assertEquals(resolvedCommit, awaiting.resolvedCommitSha)
             assertTrue(awaiting.requiresConfirmation)
             assertEquals(listOf(":play-services-core:assembleDefaultDebug"), awaiting.effectiveBuild?.tasks)
+            assertEquals("morpheapp-microg-re-main-debug", awaiting.effectiveBuild?.recipeId)
+            assertEquals("defaultDebug", awaiting.effectiveBuild?.variantName)
+            assertEquals(21, awaiting.effectiveBuild?.javaMajor)
 
             val missingRisk = assertThrows(ApiException::class.java) {
                 coordinator.confirm(created.jobId, ConfirmJobRequest(resolvedCommit, false))
@@ -182,10 +185,18 @@ class TrustedBuildTest {
     @Test
     fun `real repository URL and ref must match the fixed allowlist recipe`() {
         val registry = BuildRecipeRegistry()
-        assertEquals("morpheapp-microg-re", registry.requireAllowed(
+        assertEquals("morpheapp-microg-re-main-debug", registry.requireAllowed(
             "https://github.com/morpheapp/microg-re",
             RequestedRevision(RevisionType.BRANCH, "main"),
         ).id)
+        val release = registry.requireAllowed(
+            "https://github.com/MorpheApp/MicroG-RE.git",
+            RequestedRevision(RevisionType.TAG, "6.1.4"),
+        )
+        assertEquals("morpheapp-microg-re-6.1.4-default-release", release.id)
+        assertEquals("defaultRelease", release.variantName)
+        assertEquals(18, release.javaMajor)
+        assertEquals(listOf("clean", ":play-services-core:assembleDefaultRelease"), release.tasks)
         assertEquals("REPOSITORY_NOT_ALLOWLISTED", assertThrows(ApiException::class.java) {
             registry.requireAllowed(
                 "https://github.com/example/app.git",
@@ -206,5 +217,7 @@ class TrustedBuildTest {
         revision = RequestedRevision(RevisionType.BRANCH, "main"),
     )
 
-    private fun defaultRecipe(): BuildRecipe = BuildRecipeRegistry.defaultRecipes.single()
+    private fun defaultRecipe(): BuildRecipe = BuildRecipeRegistry.defaultRecipes.single {
+        it.revision == RequestedRevision(RevisionType.BRANCH, "main")
+    }
 }

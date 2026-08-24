@@ -245,7 +245,8 @@ internal class TrustedBuildExecutor(
         if (Files.exists(sourceDirectory)) {
             throw TrustedBuildFailure("WORKSPACE_ALREADY_EXISTS", "The job workspace already contains a source checkout.")
         }
-        val environment = restrictedEnvironment(homeDirectory, gradleUserHome)
+        val buildJava = resolveBuildJavaRuntime(recipe)
+        val environment = restrictedEnvironment(homeDirectory, gradleUserHome, buildJava.home)
 
         transition(job.jobId, JobState.CLONING, 25, "Cloning the allowlisted repository without submodules or Git LFS smudging.")
         runChecked(
@@ -305,16 +306,8 @@ internal class TrustedBuildExecutor(
                 "(${wrapper.distributionChecksumSource}), official Wrapper JAR ${wrapper.wrapperJarGradleVersion} " +
                 "${wrapper.wrapperJarSha256}.",
         )
-        val javaMajor = Runtime.version().feature()
-        if (javaMajor != recipe.javaMajor) {
-            throw TrustedBuildFailure(
-                "JAVA_VERSION_MISMATCH",
-                "The recipe requires Java ${recipe.javaMajor}, but Runner is using Java $javaMajor.",
-            )
-        }
-
         transition(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks: ${recipe.tasks.joinToString(" ")}.")
-        val javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString()
+        val javaExecutable = buildJava.executable.toString()
         val wrapperJar = confinedPath(buildRoot, "gradle/wrapper/gradle-wrapper.jar")
         runChecked(
             jobId = job.jobId,
@@ -356,8 +349,8 @@ internal class TrustedBuildExecutor(
             buildRoot = recipe.buildRoot,
             tasks = recipe.tasks,
             gradleVersion = wrapper.gradleVersion,
-            javaVersion = System.getProperty("java.version"),
-            javaVendor = System.getProperty("java.vendor"),
+            javaVersion = buildJava.version,
+            javaVendor = buildJava.vendor,
             operatingSystem = "${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}",
             androidSdk = environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"],
             wrapper = wrapper,
@@ -529,7 +522,60 @@ internal class TrustedBuildExecutor(
                 .toList()
         }
     }
+
+    private fun resolveBuildJavaRuntime(recipe: BuildRecipe): BuildJavaRuntime {
+        val configuredHome = recipe.javaHomeEnvironmentVariable?.let { variable ->
+            System.getenv(variable)?.takeIf(String::isNotBlank)
+                ?: throw TrustedBuildFailure(
+                    "BUILD_JAVA_HOME_MISSING",
+                    "The ${recipe.id} recipe requires $variable to identify its fixed Java ${recipe.javaMajor} runtime.",
+                )
+        } ?: System.getProperty("java.home")
+        val home = runCatching { Path.of(configuredHome).toRealPath() }.getOrNull()
+            ?: throw TrustedBuildFailure("BUILD_JAVA_HOME_INVALID", "The recipe Java home is not an existing directory.")
+        if (!Files.isDirectory(home, LinkOption.NOFOLLOW_LINKS)) {
+            throw TrustedBuildFailure("BUILD_JAVA_HOME_INVALID", "The recipe Java home is not a regular directory.")
+        }
+        val executable = home.resolve("bin/java")
+        val releaseFile = home.resolve("release")
+        if (
+            !Files.isRegularFile(executable, LinkOption.NOFOLLOW_LINKS) ||
+            !Files.isExecutable(executable) ||
+            !Files.isRegularFile(releaseFile, LinkOption.NOFOLLOW_LINKS)
+        ) {
+            throw TrustedBuildFailure("BUILD_JAVA_HOME_INVALID", "The recipe Java home has no verified java executable and release metadata.")
+        }
+        val release = Properties().apply {
+            try {
+                Files.newBufferedReader(releaseFile).use(::load)
+            } catch (_: IOException) {
+                throw TrustedBuildFailure("BUILD_JAVA_HOME_INVALID", "The recipe Java release metadata could not be read.")
+            }
+        }
+        val version = release.getProperty("JAVA_VERSION")?.trim()?.trim('"')
+            ?: throw TrustedBuildFailure("BUILD_JAVA_HOME_INVALID", "The recipe Java version is missing.")
+        val major = version.substringBefore('.').toIntOrNull()
+        if (major != recipe.javaMajor) {
+            throw TrustedBuildFailure(
+                "JAVA_VERSION_MISMATCH",
+                "The recipe requires Java ${recipe.javaMajor}, but its configured Java home contains version $version.",
+            )
+        }
+        return BuildJavaRuntime(
+            home = home,
+            executable = executable,
+            version = version,
+            vendor = release.getProperty("IMPLEMENTOR")?.trim()?.trim('"') ?: "Unknown",
+        )
+    }
 }
+
+internal data class BuildJavaRuntime(
+    val home: Path,
+    val executable: Path,
+    val version: String,
+    val vendor: String,
+)
 
 @Serializable
 internal data class BuildEnvironmentManifest(
@@ -559,13 +605,18 @@ internal data class ManifestFile(
     val sha256: String,
 )
 
-internal fun restrictedEnvironment(homeDirectory: Path, gradleUserHome: Path? = null): Map<String, String> = buildMap {
+internal fun restrictedEnvironment(
+    homeDirectory: Path,
+    gradleUserHome: Path? = null,
+    javaHome: Path = Path.of(System.getProperty("java.home")),
+): Map<String, String> = buildMap {
     val inherited = System.getenv()
     listOf("PATH", "LANG", "LC_ALL", "TMPDIR", "ANDROID_HOME", "ANDROID_SDK_ROOT").forEach { key ->
         inherited[key]?.takeIf(String::isNotBlank)?.let { put(key, it) }
     }
     put("HOME", homeDirectory.toString())
-    put("JAVA_HOME", System.getProperty("java.home"))
+    put("JAVA_HOME", javaHome.toString())
+    put("PATH", "${javaHome.resolve("bin")}:${get("PATH").orEmpty()}")
     put("GIT_LFS_SKIP_SMUDGE", "1")
     gradleUserHome?.let { put("GRADLE_USER_HOME", it.toString()) }
 }

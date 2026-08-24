@@ -6,9 +6,11 @@ import java.time.Duration
 internal data class BuildRecipe(
     val id: String,
     val repositoryUrl: String,
-    val allowedRevisions: Set<RequestedRevision>,
+    val revision: RequestedRevision,
+    val variantName: String,
     val buildRoot: String,
     val javaMajor: Int,
+    val javaHomeEnvironmentVariable: String? = null,
     val gradleVersion: String,
     val distributionType: String,
     val wrapperJarGradleVersion: String,
@@ -22,31 +24,31 @@ internal data class BuildRecipe(
 internal class BuildRecipeRegistry(
     recipes: List<BuildRecipe> = defaultRecipes,
 ) {
-    private val recipesByRepository = recipes.associateBy { canonicalRepositoryKey(it.repositoryUrl) }
+    private val recipesByRepository = recipes.groupBy { canonicalRepositoryKey(it.repositoryUrl) }
 
     fun requireAllowed(repositoryUrl: String, revision: RequestedRevision): BuildRecipe {
-        val recipe = recipesByRepository[canonicalRepositoryKey(repositoryUrl)]
+        val repositoryRecipes = recipesByRepository[canonicalRepositoryKey(repositoryUrl)]
             ?: throw ApiException.forbidden(
                 code = "REPOSITORY_NOT_ALLOWLISTED",
                 message = "Real build is not permitted for this repository.",
             )
-        if (revision !in recipe.allowedRevisions) {
-            throw ApiException.forbidden(
+        return repositoryRecipes.singleOrNull { it.revision == revision }
+            ?: throw ApiException.forbidden(
                 code = "REVISION_NOT_ALLOWLISTED",
                 message = "The requested ref is not permitted by the repository build recipe.",
             )
-        }
-        return recipe
     }
 
-    fun find(repositoryUrl: String): BuildRecipe? = recipesByRepository[canonicalRepositoryKey(repositoryUrl)]
+    fun find(repositoryUrl: String, revision: RequestedRevision): BuildRecipe? =
+        recipesByRepository[canonicalRepositoryKey(repositoryUrl)]?.singleOrNull { it.revision == revision }
 
     companion object {
         val defaultRecipes = listOf(
             BuildRecipe(
-                id = "morpheapp-microg-re",
+                id = "morpheapp-microg-re-main-debug",
                 repositoryUrl = "https://github.com/MorpheApp/MicroG-RE.git",
-                allowedRevisions = setOf(RequestedRevision(RevisionType.BRANCH, "main")),
+                revision = RequestedRevision(RevisionType.BRANCH, "main"),
+                variantName = "defaultDebug",
                 buildRoot = ".",
                 javaMajor = 21,
                 gradleVersion = "8.14.3",
@@ -55,6 +57,25 @@ internal class BuildRecipeRegistry(
                 tasks = listOf(":play-services-core:assembleDefaultDebug"),
                 artifactPatterns = listOf(
                     "play-services-core/build/outputs/apk/default/debug/*.apk",
+                ),
+                requireSingleApk = true,
+                timeout = Duration.ofMinutes(30),
+                allowRunnerSuppliedDistributionChecksum = true,
+            ),
+            BuildRecipe(
+                id = "morpheapp-microg-re-6.1.4-default-release",
+                repositoryUrl = "https://github.com/MorpheApp/MicroG-RE.git",
+                revision = RequestedRevision(RevisionType.TAG, "6.1.4"),
+                variantName = "defaultRelease",
+                buildRoot = ".",
+                javaMajor = 18,
+                javaHomeEnvironmentVariable = "REPRODROID_JDK_18_HOME",
+                gradleVersion = "8.14.3",
+                distributionType = "bin",
+                wrapperJarGradleVersion = "8.11.1",
+                tasks = listOf("clean", ":play-services-core:assembleDefaultRelease"),
+                artifactPatterns = listOf(
+                    "play-services-core/build/outputs/apk/default/release/*.apk",
                 ),
                 requireSingleApk = true,
                 timeout = Duration.ofMinutes(30),

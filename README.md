@@ -4,7 +4,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 1E（Android Emulator E2E）まで完了しています。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -19,14 +19,19 @@ Phase 1E（Android Emulator E2E）まで完了しています。
 - `SUCCEEDED` Jobの登録済みAPKだけを返すcontent endpoint
 - 配信前のpath confinement、symbolic link、size、SHA-256再検査
 - APK MIME type、Content-Length、SHA-256由来ETag
+- repositoryとrevisionを組にしたexact recipe allowlist
+- API／SQLiteへ永続化するrecipe ID、variant、Java major
+- recipe別build JDKのpath／major検査と固定Java executableによるWrapper起動
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 
 ## Phase 2のRunner境界
 
-Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidアプリ側で取得し、Android側で参照APK比較と更新候補判定を行います。Phase 2Aの初期実装では、Runnerは引き続きソース取得、allowlist済み実ビルド、Build Environment Manifest、ビルドartifact配信を担当し、公式APKを取得するAPIは追加しません。
+Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidアプリ側で取得し、Android側で参照APK比較と更新候補判定を行います。Runnerは引き続きソース取得、allowlist済み実ビルド、Build Environment Manifest、ビルドartifact配信を担当し、公式APKを取得するAPIは追加しません。
 
-取得したAPKのpackage、`versionName`、`longVersionCode`、signing certificate、size、SHA-256はAndroid側の比較・更新状態として扱います。Runnerのビルドartifactと配布元APKの比較結果はRunner Jobの成功状態へ混ぜず、必要なAPI変更が判明した場合は別途契約を更新します。詳細なPhase 2境界は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)を参照してください。
+Phase 2BはMicroG-RE `TAG 6.1.4`だけを許可する`defaultRelease` profileを追加しました。Runner本体はJDK 21で動かし、外部buildは検査済み`REPRODROID_JDK_18_HOME`のTemurin 18で`clean :play-services-core:assembleDefaultRelease`を実行します。`effectiveBuild`にはrecipe ID、variant、Java majorを追加し、Androidが対象同一性をfail closedで検査します。Runnerの`SUCCEEDED`はbuild成功だけを表し、配布元APKとの`MATCH`／`DIFFERENT`／`INCOMPARABLE`はAndroid側へ保持します。詳細は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)と[ADR-0010](../reprodroid-project/docs/adr/0010-phase-2b-executable-apk-content-comparison.md)を参照してください。
+
+この固定taskが生成するAPKは上流workflowの後段sign action前なのでunsignedです。Runnerはartifactのsize／SHA-256／配信完全性を保証しますが、比較用artifactへ署名を追加しません。Android側はcomparison専用経路でだけ扱い、通常のinstaller導線から分離します。
 
 ## リポジトリ構成
 
@@ -95,7 +100,7 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 
 ## Jobと永続化
 
-SQLiteへJob、request、resolved commit、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。既存schemaは起動時にv3へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
+SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。既存schemaは起動時にv4へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
 
 Runner再起動時、実行途中だったJobは自動再実行せず`INTERRUPTED`へ移します。
 
@@ -152,6 +157,7 @@ INTERRUPTED
 | `REPRODROID_HOST` | `127.0.0.1` | bind先 |
 | `REPRODROID_PORT` | `8080` | port |
 | `REPRODROID_ENABLE_REAL_BUILDS` | `false` | `REAL_TRUSTED`ホスト実行の危険受容 |
+| `REPRODROID_JDK_18_HOME` | なし | MicroG-RE `6.1.4` release profile専用JDK 18 |
 | `REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK` | `false` | 非loopback bindの危険受容 |
 
 非loopbackへbindする場合は`REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`による明示的な危険受容が必要です。認証は未実装であるため、通常の利用では指定しないでください。
@@ -172,7 +178,7 @@ adb reverse tcp:8080 tcp:8080
 ../reprodroid-project/scripts/setup-env.sh
 ```
 
-JDK 21.0.12.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 36.0.0、emulator、system image、SDKライセンスを扱います。JDKはユーザー領域へ導入されるため、実行前にスクリプト末尾の`JAVA_HOME`を現在のshellへ設定してください。
+JDK 21.0.12.1+1、JDK 18.0.2.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 36.0.0、emulator、system image、SDKライセンスを扱います。JDKはユーザー領域へ導入されるため、実行前にスクリプト末尾の`JAVA_HOME`と`REPRODROID_JDK_18_HOME`を現在のshellへ設定してください。
 
 ## ビルド・検証
 
@@ -187,7 +193,9 @@ JDK 21.0.12.1+1、Android SDK API 36、platform-tools、固定したbuild-tools 
 Phase 1Dでは`./gradlew test`と`./gradlew build`で、既存のHTTP API、SQLite、模擬成功・失敗、cancel、安全ゲートに加え、APK content、transfer header、保存後改ざん拒否、schema v3 migrationを検証します。Phase 1E完了時に`./gradlew test build --rerun-tasks`を実行し、8 actionable tasksすべてexecuted、`BUILD SUCCESSFUL`を確認しました。実ビルドを有効化する例:
 
 ```bash
-REPRODROID_ENABLE_REAL_BUILDS=true ./gradlew run
+REPRODROID_ENABLE_REAL_BUILDS=true \
+REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
+./gradlew run
 ```
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。

@@ -166,17 +166,21 @@ class SQLiteJobStore(
             connection.prepareStatement(
                 """
                 UPDATE jobs
-                SET state = ?, progress_percent = 5, effective_build_root = ?,
+                SET state = ?, progress_percent = 5, effective_recipe_id = ?,
+                    effective_variant_name = ?, effective_build_root = ?, effective_java_major = ?,
                     effective_build_tasks = ?, updated_at = ?
                 WHERE job_id = ? AND state = ?
                 """.trimIndent(),
             ).use { statement ->
                 statement.setString(1, JobState.RESOLVING_SOURCE.name)
-                statement.setString(2, recipe.buildRoot)
-                statement.setString(3, recipe.tasks.joinToString("\n"))
-                statement.setString(4, Instant.now(clock).toString())
-                statement.setString(5, jobId)
-                statement.setString(6, JobState.CREATED.name)
+                statement.setString(2, recipe.id)
+                statement.setString(3, recipe.variantName)
+                statement.setString(4, recipe.buildRoot)
+                statement.setInt(5, recipe.javaMajor)
+                statement.setString(6, recipe.tasks.joinToString("\n"))
+                statement.setString(7, Instant.now(clock).toString())
+                statement.setString(8, jobId)
+                statement.setString(9, JobState.CREATED.name)
                 statement.executeUpdate() == 1
             }
         }
@@ -568,7 +572,10 @@ class SQLiteJobStore(
                             state TEXT NOT NULL,
                             progress_percent INTEGER NOT NULL,
                             requires_confirmation INTEGER NOT NULL,
+                            effective_recipe_id TEXT,
+                            effective_variant_name TEXT,
                             effective_build_root TEXT,
+                            effective_java_major INTEGER,
                             effective_build_tasks TEXT,
                             error_code TEXT,
                             error_message TEXT,
@@ -623,6 +630,13 @@ class SQLiteJobStore(
                     }
                     if (schemaVersion in 1..2 && !columnExists(connection, "artifacts", "content_path")) {
                         statement.executeUpdate("ALTER TABLE artifacts ADD COLUMN content_path TEXT")
+                    }
+                    if (schemaVersion in 1..3) {
+                        BUILD_PROFILE_COLUMNS.forEach { columnDefinition ->
+                            if (!columnExists(connection, "jobs", columnDefinition.substringBefore(' '))) {
+                                statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
+                            }
+                        }
                     }
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
@@ -769,7 +783,10 @@ class SQLiteJobStore(
         requiresConfirmation = getInt("requires_confirmation") != 0,
         effectiveBuild = getString("effective_build_root")?.let { buildRoot ->
             EffectiveBuild(
+                recipeId = getString("effective_recipe_id"),
+                variantName = getString("effective_variant_name"),
                 buildRoot = buildRoot,
+                javaMajor = getInt("effective_java_major").takeUnless { wasNull() },
                 tasks = getString("effective_build_tasks")
                     ?.split('\n')
                     ?.filter(String::isNotBlank)
@@ -801,7 +818,7 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 3
+        const val SCHEMA_VERSION = 4
         val AUDIT_COLUMNS = listOf(
             "gradle_version TEXT",
             "distribution_url TEXT",
@@ -811,6 +828,11 @@ class SQLiteJobStore(
             "wrapper_jar_sha256 TEXT",
             "manifest_path TEXT",
             "manifest_sha256 TEXT",
+        )
+        val BUILD_PROFILE_COLUMNS = listOf(
+            "effective_recipe_id TEXT",
+            "effective_variant_name TEXT",
+            "effective_java_major INTEGER",
         )
     }
 }

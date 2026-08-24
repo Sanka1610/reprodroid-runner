@@ -271,7 +271,7 @@ internal class JobCoordinator(
     }
 
     private suspend fun runRealJob(job: StoredJob) {
-        val recipe = recipeRegistry.find(job.repositoryUrl)
+        val recipe = recipeRegistry.find(job.repositoryUrl, job.revision)
             ?: throw TrustedBuildFailure("RECIPE_NOT_FOUND", "The persisted repository no longer has an allowlisted recipe.")
         when (job.state) {
             JobState.CREATED -> {

@@ -76,7 +76,10 @@ data class ConfirmJobRequest(
 
 @Serializable
 data class EffectiveBuild(
+    val recipeId: String? = null,
+    val variantName: String? = null,
     val buildRoot: String,
+    val javaMajor: Int? = null,
     val tasks: List<String>,
 )
 
