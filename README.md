@@ -4,7 +4,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2CはAndroid側のtrust／update／install／settings統合であり、Runner API v1とSQLite schema v4は変更しません。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2CはAndroid側のtrust／update／install／settings統合、Phase 2D-1は既存APIで独立Jobを2件作る再ビルド比較であり、Runner API v1とSQLite schema v4は変更しません。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -30,6 +30,10 @@ Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、
 Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidアプリ側で取得し、Android側で参照APK比較と更新候補判定を行います。Runnerは引き続きソース取得、allowlist済み実ビルド、Build Environment Manifest、ビルドartifact配信を担当し、公式APKを取得するAPIは追加しません。
 
 Phase 2BはMicroG-RE `TAG 6.1.4`だけを許可する`defaultRelease` profileを追加しました。Runner本体はJDK 21で動かし、外部buildは検査済み`REPRODROID_JDK_18_HOME`のTemurin 18で`clean :play-services-core:assembleDefaultRelease`を実行します。`effectiveBuild`にはrecipe ID、variant、Java majorを追加し、Androidが対象同一性をfail closedで検査します。Runnerの`SUCCEEDED`はbuild成功だけを表し、配布元APKとの`MATCH`／`DIFFERENT`／`INCOMPARABLE`はAndroid側へ保持します。詳細は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)と[ADR-0010](../reprodroid-project/docs/adr/0010-phase-2b-executable-apk-content-comparison.md)を参照してください。
+
+Phase 2D-1ではAndroidが同じtagでBuild A／Build Bの独立Jobを順に作成します。Runnerは各Jobでref解決、commit／host RCE確認、clone、per-job HOME／Gradle user home、Wrapper検査、固定recipe、artifact／Manifest保存を繰り返します。1回目の確認を2回目へ継承せず、batch build APIも追加しません。3軸の比較とtrustはAndroid側の責務であり、Runner SQLite v4には比較状態を追加しません。詳細は[ADR-0012](../reprodroid-project/docs/adr/0012-phase-2d-repeat-build-and-advanced-comparison.md)を参照してください。
+
+Phase 2D-1 E2Eでは、MicroG-RE `6.1.4`のBuild A／Bが別Job／別workspace／別Gradle user homeで同じfull SHA `d8df10ab687a1c1ca05221634cfa46bad262023a`を解決し、個別確認後に成功しました。両artifactは13,258,872 byte、SHA-256 `30de03caea3da52c9febbeebb5d7f0d3246811d288d81b522bb456da19e7b033`で一致しています。
 
 この固定taskが生成するAPKは上流workflowの後段sign action前なのでunsignedです。Runnerはartifactのsize／SHA-256／配信完全性を保証しますが、比較用artifactへ署名を追加しません。Android側はcomparison専用経路でだけ扱い、通常のinstaller導線から分離します。
 
