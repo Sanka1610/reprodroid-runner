@@ -4,7 +4,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2CはAndroid側のtrust／update／install／settings統合であり、Runner API v1とSQLite schema v4は変更しません。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -32,6 +32,8 @@ Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidア
 Phase 2BはMicroG-RE `TAG 6.1.4`だけを許可する`defaultRelease` profileを追加しました。Runner本体はJDK 21で動かし、外部buildは検査済み`REPRODROID_JDK_18_HOME`のTemurin 18で`clean :play-services-core:assembleDefaultRelease`を実行します。`effectiveBuild`にはrecipe ID、variant、Java majorを追加し、Androidが対象同一性をfail closedで検査します。Runnerの`SUCCEEDED`はbuild成功だけを表し、配布元APKとの`MATCH`／`DIFFERENT`／`INCOMPARABLE`はAndroid側へ保持します。詳細は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)と[ADR-0010](../reprodroid-project/docs/adr/0010-phase-2b-executable-apk-content-comparison.md)を参照してください。
 
 この固定taskが生成するAPKは上流workflowの後段sign action前なのでunsignedです。Runnerはartifactのsize／SHA-256／配信完全性を保証しますが、比較用artifactへ署名を追加しません。Android側はcomparison専用経路でだけ扱い、通常のinstaller導線から分離します。
+
+将来ReproDroid鍵でlocal comparison artifactを署名する案は候補として残しますが、Phase 2への採用は確定していません。Runnerは信頼済みrepositoryであってもGradle build scriptによる任意コード実行を許す境界にあるため、private keyを現行Runner process／build workspaceへ置きません。採用する場合は鍵の配置、分離、backup、rotation、signer continuityを別ADRで確定してから実装します。
 
 ## リポジトリ構成
 
