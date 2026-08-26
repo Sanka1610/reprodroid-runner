@@ -286,6 +286,12 @@ internal class TrustedBuildExecutor(
             throw TrustedBuildFailure("CHECKOUT_COMMIT_MISMATCH", "Detached checkout does not match the confirmed commit.")
         }
         store.appendLog(job.jobId, LogLevel.INFO, "Detached checkout verified at commit $resolvedCommit.")
+        val validatedAndroidSdk = validateAndroidSdkEnvironment(environment, recipe)
+        store.appendLog(
+            job.jobId,
+            LogLevel.INFO,
+            "Validated Android SDK API ${validatedAndroidSdk.apiLevel} and Build Tools ${validatedAndroidSdk.buildToolsVersion}.",
+        )
 
         transition(job.jobId, JobState.VERIFYING_WRAPPER, 40, "Verifying Gradle distribution and Wrapper JAR checksums.")
         val buildRoot = confinedPath(sourceDirectory, recipe.buildRoot)
@@ -353,6 +359,8 @@ internal class TrustedBuildExecutor(
             javaVendor = buildJava.vendor,
             operatingSystem = "${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}",
             androidSdk = environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"],
+            androidSdkApiLevel = validatedAndroidSdk.apiLevel,
+            buildToolsVersion = validatedAndroidSdk.buildToolsVersion,
             wrapper = wrapper,
             dependencies = captureDependencies(gradleUserHome),
             artifacts = artifactPaths.zip(discoveredArtifacts).map { (path, metadata) ->
@@ -579,7 +587,7 @@ internal data class BuildJavaRuntime(
 
 @Serializable
 internal data class BuildEnvironmentManifest(
-    val schemaVersion: Int = 1,
+    val schemaVersion: Int = 2,
     val generatedAt: String,
     val jobId: String,
     val recipeId: String,
@@ -593,6 +601,8 @@ internal data class BuildEnvironmentManifest(
     val javaVendor: String,
     val operatingSystem: String,
     val androidSdk: String?,
+    val androidSdkApiLevel: Int,
+    val buildToolsVersion: String,
     val wrapper: WrapperVerification,
     val dependencies: List<ManifestFile>,
     val artifacts: List<ManifestFile>,
@@ -604,6 +614,65 @@ internal data class ManifestFile(
     val sizeBytes: Long,
     val sha256: String,
 )
+
+internal data class ValidatedAndroidSdk(
+    val apiLevel: Int,
+    val buildToolsVersion: String,
+)
+
+internal fun validateAndroidSdkEnvironment(
+    environment: Map<String, String>,
+    recipe: BuildRecipe,
+): ValidatedAndroidSdk {
+    val configuredRoot = environment["ANDROID_SDK_ROOT"]
+        ?: environment["ANDROID_HOME"]
+        ?: throw TrustedBuildFailure(
+            "ANDROID_SDK_ROOT_MISSING",
+            "The fixed build recipe requires a configured Android SDK root.",
+        )
+    val sdkRoot = runCatching { Path.of(configuredRoot).toRealPath() }.getOrNull()
+        ?: throw TrustedBuildFailure(
+            "ANDROID_SDK_ROOT_INVALID",
+            "The configured Android SDK root is not an existing directory.",
+        )
+    if (!Files.isDirectory(sdkRoot, LinkOption.NOFOLLOW_LINKS)) {
+        throw TrustedBuildFailure(
+            "ANDROID_SDK_ROOT_INVALID",
+            "The configured Android SDK root is not a non-symlink directory.",
+        )
+    }
+    val platformDirectory = sdkRoot.resolve("platforms/android-${recipe.androidSdkApiLevel}").normalize()
+    val androidJar = platformDirectory.resolve("android.jar").normalize()
+    val buildToolsDirectory = sdkRoot.resolve("build-tools/${recipe.buildToolsVersion}").normalize()
+    val aapt2 = buildToolsDirectory.resolve("aapt2").normalize()
+    val platformRealPath = runCatching { platformDirectory.toRealPath() }.getOrNull()
+    val androidJarRealPath = runCatching { androidJar.toRealPath() }.getOrNull()
+    val buildToolsRealPath = runCatching { buildToolsDirectory.toRealPath() }.getOrNull()
+    val aapt2RealPath = runCatching { aapt2.toRealPath() }.getOrNull()
+    if (
+        platformRealPath == null || androidJarRealPath == null ||
+        !platformRealPath.startsWith(sdkRoot) || !androidJarRealPath.startsWith(platformRealPath) ||
+        !Files.isDirectory(platformDirectory, LinkOption.NOFOLLOW_LINKS) ||
+        !Files.isRegularFile(androidJar, LinkOption.NOFOLLOW_LINKS)
+    ) {
+        throw TrustedBuildFailure(
+            "ANDROID_SDK_PLATFORM_INVALID",
+            "The recipe Android SDK platform package is missing or invalid.",
+        )
+    }
+    if (
+        buildToolsRealPath == null || aapt2RealPath == null ||
+        !buildToolsRealPath.startsWith(sdkRoot) || !aapt2RealPath.startsWith(buildToolsRealPath) ||
+        !Files.isDirectory(buildToolsDirectory, LinkOption.NOFOLLOW_LINKS) ||
+        !Files.isRegularFile(aapt2, LinkOption.NOFOLLOW_LINKS) || !Files.isExecutable(aapt2)
+    ) {
+        throw TrustedBuildFailure(
+            "ANDROID_BUILD_TOOLS_INVALID",
+            "The recipe Android Build Tools package is missing or invalid.",
+        )
+    }
+    return ValidatedAndroidSdk(recipe.androidSdkApiLevel, recipe.buildToolsVersion)
+}
 
 internal fun restrictedEnvironment(
     homeDirectory: Path,
@@ -644,4 +713,7 @@ internal fun sha256(path: Path): String {
 }
 
 private val SHA256 = Regex("[0-9a-f]{64}")
-private val MANIFEST_JSON = Json { prettyPrint = true }
+private val MANIFEST_JSON = Json {
+    prettyPrint = true
+    encodeDefaults = true
+}

@@ -132,6 +132,9 @@ fun Application.runnerModule(config: RunnerConfig) {
             get("/jobs/{jobId}/artifacts") {
                 call.respond(coordinator.artifacts(call.requiredJobId()))
             }
+            get("/jobs/{jobId}/build-environment-manifest") {
+                call.respond(coordinator.buildEnvironmentManifest(call.requiredJobId()))
+            }
             get("/jobs/{jobId}/artifacts/{artifactId}/content") {
                 val artifactId = call.parameters["artifactId"]?.takeIf(String::isNotBlank)
                     ?: throw ApiException.badRequest("ARTIFACT_ID_REQUIRED", "artifactId is required.")

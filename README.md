@@ -6,7 +6,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v4 のままです。
 
-Phase 3 は文書契約を作成済みですが、Runner code は未実装です。3A では private Build Environment Manifest の redacted public projection を API v1 に additive に追加し、3B〜3E では recipe pinning、determinism、static scan、Docker sandbox feasibility を段階的に扱います。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE 確認境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md) と [ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md) です。
+Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Android側のRoom v10・取得・表示は別リポジトリで実装します。3B〜3E の recipe pinning、determinism、static scan、Docker sandbox feasibility は未実装です。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE 確認境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md) と [ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md) です。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -35,7 +35,7 @@ Phase 2BはMicroG-RE `TAG 6.1.4`だけを許可する`defaultRelease` profileを
 
 Phase 2DではAndroidが同じtagでBuild A／Build Bの独立Jobを順に作成します。Runnerは各Jobでref解決、commit／host RCE確認、clone、per-job HOME／Gradle user home、Wrapper検査、固定recipe、artifact／Manifest保存を繰り返します。1回目の確認を2回目へ継承せず、batch build APIも追加しません。raw 3軸比較、APK全entry inventory、DEX構造比較、Manifest／resource table意味比較、trustはAndroid側の責務であり、Runnerへ公式APK取得、semantic parser、比較結果、Build Environment Manifest公開APIを追加しません。詳細は[ADR-0012](../reprodroid-project/docs/adr/0012-phase-2d-repeat-build-and-advanced-comparison.md)を参照してください。
 
-この「公開 API を追加しない」は Phase 2D の境界である。Phase 3A は別 ADR により、private Manifest を直接配信せず redaction / integrity 検査済み projection を返す endpoint を予定する。現行 Runner には endpoint が存在しないため、[Runner API v1](../reprodroid-project/docs/api/runner-api.md) の planned contract を current API として呼び出してはならない。
+この「公開 API を追加しない」は Phase 2D の境界である。Phase 3A は別 ADR により、private Manifest を直接配信せず redaction / integrity 検査済み projection を返す endpoint を追加した。既存 API v1 endpoint とRunner SQLite schema v4は変更していない。
 
 Phase 2D最終E2Eは2026-08-26にfresh stateから再実行しました。MicroG-RE `6.1.4`のBuild A Job `df527f0e-dccf-4cb2-8cbf-f294cfeed611`とBuild B Job `94831a75-d879-4ae3-ad96-a53e4aabb686`は、別workspace／別Gradle user homeで同じfull SHA `d8df10ab687a1c1ca05221634cfa46bad262023a`を解決し、それぞれ個別のcommit／host RCE確認後に成功しました。両artifactは13,258,872 byte、SHA-256 `30de03caea3da52c9febbeebb5d7f0d3246811d288d81b522bb456da19e7b033`で一致しています。
 
@@ -145,7 +145,7 @@ INTERRUPTED
 
 詳細は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
 
-Phase 3A の `GET /v1/jobs/{jobId}/build-environment-manifest` は planned contract であり、現行APIには含まれません。実装後も private Manifest file を配信せず、redacted projection だけを返します。
+Phase 3A の `GET /v1/jobs/{jobId}/build-environment-manifest` は、成功した`REAL_TRUSTED` Jobのprivate Manifestをpath confinement、non-symlink regular file、32 MiB、監査SHA-256、strict JSON、schema / field integrity、redaction上限で検査し、public projectionだけを返します。private Manifest fileは配信しません。
 
 ## 初期テスト対象
 
@@ -212,11 +212,10 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 3 開始時点の未実装・対象外
+## Phase 3A Runner実装後の未実装・対象外
 
 ### Phase 3 で予定するが、まだ実装していないもの
 
-- redacted Build Environment Manifest public endpoint と internal Manifest schema v2
 - recipe dependency pinning、lockfile integrity verification、`--offline`
 - recipe determinism options、static source scanner、scan summary API field
 - Docker engine feasibility調査とopt-in sandbox mode

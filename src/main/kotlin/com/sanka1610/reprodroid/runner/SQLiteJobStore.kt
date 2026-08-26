@@ -27,6 +27,11 @@ internal data class StoredArtifact(
     val contentRelativePath: String?,
 )
 
+internal data class StoredBuildManifestAudit(
+    val relativePath: String,
+    val sha256: String,
+)
+
 internal enum class CancelJobResult {
     CANCELLED,
     NOT_FOUND,
@@ -278,6 +283,21 @@ class SQLiteJobStore(
                 statement.executeUpdate() == 1
             }
         }
+
+    @Synchronized
+    internal fun getBuildManifestAudit(jobId: String): StoredBuildManifestAudit? = connection().use { connection ->
+        connection.prepareStatement(
+            "SELECT manifest_path, manifest_sha256 FROM jobs WHERE job_id = ?",
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { result ->
+                if (!result.next()) return@use null
+                val relativePath = result.getString("manifest_path") ?: return@use null
+                val sha256 = result.getString("manifest_sha256") ?: return@use null
+                StoredBuildManifestAudit(relativePath, sha256)
+            }
+        }
+    }
 
     @Synchronized
     fun transitionIfActive(

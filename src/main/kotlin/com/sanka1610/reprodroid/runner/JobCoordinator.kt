@@ -102,6 +102,7 @@ internal class JobCoordinator(
         wrapperVerifier = wrapperVerifier,
         stateDirectory = stateDirectory,
     )
+    private val buildManifestPublisher = BuildManifestPublisher(store, stateDirectory)
 
     init {
         store.markRunningJobsInterrupted()
@@ -141,6 +142,9 @@ internal class JobCoordinator(
     fun artifacts(jobId: String): ArtifactListResponse = ArtifactListResponse(
         store.listArtifacts(jobId) ?: throw ApiException.notFound(),
     )
+
+    fun buildEnvironmentManifest(jobId: String): BuildEnvironmentManifestResponse =
+        buildManifestPublisher.publicManifest(jobId)
 
     fun confirm(jobId: String, request: ConfirmJobRequest) {
         val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()

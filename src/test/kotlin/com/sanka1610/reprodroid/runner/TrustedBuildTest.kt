@@ -196,6 +196,8 @@ class TrustedBuildTest {
         assertEquals("morpheapp-microg-re-6.1.4-default-release", release.id)
         assertEquals("defaultRelease", release.variantName)
         assertEquals(18, release.javaMajor)
+        assertEquals(36, release.androidSdkApiLevel)
+        assertEquals("36.0.0", release.buildToolsVersion)
         assertEquals(listOf("clean", ":play-services-core:assembleDefaultRelease"), release.tasks)
         assertEquals("REPOSITORY_NOT_ALLOWLISTED", assertThrows(ApiException::class.java) {
             registry.requireAllowed(
@@ -209,6 +211,31 @@ class TrustedBuildTest {
                 RequestedRevision(RevisionType.TAG, "latest"),
             )
         }.code)
+    }
+
+    @Test
+    fun `recipe SDK values are validated against confined platform and build tools packages`() {
+        val sdkRoot = stateDirectory.resolve("sdk").also(Path::createDirectories)
+        val platform = sdkRoot.resolve("platforms/android-36").also(Path::createDirectories)
+        Files.writeString(platform.resolve("android.jar"), "android")
+        val buildTools = sdkRoot.resolve("build-tools/36.0.0").also(Path::createDirectories)
+        val aapt2 = buildTools.resolve("aapt2")
+        Files.writeString(aapt2, "aapt2")
+        assertTrue(aapt2.toFile().setExecutable(true))
+
+        val validated = validateAndroidSdkEnvironment(mapOf("ANDROID_SDK_ROOT" to sdkRoot.toString()), defaultRecipe())
+
+        assertEquals(36, validated.apiLevel)
+        assertEquals("36.0.0", validated.buildToolsVersion)
+    }
+
+    @Test
+    fun `recipe SDK validation fails closed before Gradle when a package is missing`() {
+        val sdkRoot = stateDirectory.resolve("sdk").also(Path::createDirectories)
+        val failure = assertThrows(TrustedBuildFailure::class.java) {
+            validateAndroidSdkEnvironment(mapOf("ANDROID_SDK_ROOT" to sdkRoot.toString()), defaultRecipe())
+        }
+        assertEquals("ANDROID_SDK_PLATFORM_INVALID", failure.code)
     }
 
     private fun realRequest() = CreateJobRequest(
