@@ -4,7 +4,9 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。Phase 2D完了後もRunner API v1とSQLite schema v4は変更しません。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v4 のままです。
+
+Phase 3 は文書契約を作成済みですが、Runner code は未実装です。3A では private Build Environment Manifest の redacted public projection を API v1 に additive に追加し、3B〜3E では recipe pinning、determinism、static scan、Docker sandbox feasibility を段階的に扱います。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE 確認境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md) と [ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md) です。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -32,6 +34,8 @@ Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidア
 Phase 2BはMicroG-RE `TAG 6.1.4`だけを許可する`defaultRelease` profileを追加しました。Runner本体はJDK 21で動かし、外部buildは検査済み`REPRODROID_JDK_18_HOME`のTemurin 18で`clean :play-services-core:assembleDefaultRelease`を実行します。`effectiveBuild`にはrecipe ID、variant、Java majorを追加し、Androidが対象同一性をfail closedで検査します。Runnerの`SUCCEEDED`はbuild成功だけを表し、配布元APKとの`MATCH`／`DIFFERENT`／`INCOMPARABLE`はAndroid側へ保持します。詳細は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)と[ADR-0010](../reprodroid-project/docs/adr/0010-phase-2b-executable-apk-content-comparison.md)を参照してください。
 
 Phase 2DではAndroidが同じtagでBuild A／Build Bの独立Jobを順に作成します。Runnerは各Jobでref解決、commit／host RCE確認、clone、per-job HOME／Gradle user home、Wrapper検査、固定recipe、artifact／Manifest保存を繰り返します。1回目の確認を2回目へ継承せず、batch build APIも追加しません。raw 3軸比較、APK全entry inventory、DEX構造比較、Manifest／resource table意味比較、trustはAndroid側の責務であり、Runnerへ公式APK取得、semantic parser、比較結果、Build Environment Manifest公開APIを追加しません。詳細は[ADR-0012](../reprodroid-project/docs/adr/0012-phase-2d-repeat-build-and-advanced-comparison.md)を参照してください。
+
+この「公開 API を追加しない」は Phase 2D の境界である。Phase 3A は別 ADR により、private Manifest を直接配信せず redaction / integrity 検査済み projection を返す endpoint を予定する。現行 Runner には endpoint が存在しないため、[Runner API v1](../reprodroid-project/docs/api/runner-api.md) の planned contract を current API として呼び出してはならない。
 
 Phase 2D最終E2Eは2026-08-26にfresh stateから再実行しました。MicroG-RE `6.1.4`のBuild A Job `df527f0e-dccf-4cb2-8cbf-f294cfeed611`とBuild B Job `94831a75-d879-4ae3-ad96-a53e4aabb686`は、別workspace／別Gradle user homeで同じfull SHA `d8df10ab687a1c1ca05221634cfa46bad262023a`を解決し、それぞれ個別のcommit／host RCE確認後に成功しました。両artifactは13,258,872 byte、SHA-256 `30de03caea3da52c9febbeebb5d7f0d3246811d288d81b522bb456da19e7b033`で一致しています。
 
@@ -106,7 +110,7 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 
 ## Jobと永続化
 
-SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。既存schemaは起動時にv4へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
+SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。これは private audit record であり、現行 API から直接配信しません。既存schemaは起動時にv4へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
 
 Runner再起動時、実行途中だったJobは自動再実行せず`INTERRUPTED`へ移します。
 
@@ -129,7 +133,7 @@ INTERRUPTED
 
 ## API
 
-初期APIは次を提供します。
+現行APIは次を提供します。
 
 - Job作成・取得
 - 実ビルド確認
@@ -140,6 +144,8 @@ INTERRUPTED
 - health check
 
 詳細は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
+
+Phase 3A の `GET /v1/jobs/{jobId}/build-environment-manifest` は planned contract であり、現行APIには含まれません。実装後も private Manifest file を配信せず、redacted projection だけを返します。
 
 ## 初期テスト対象
 
@@ -206,10 +212,18 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 1時点でRunnerが扱わないもの
+## Phase 3 開始時点の未実装・対象外
+
+### Phase 3 で予定するが、まだ実装していないもの
+
+- redacted Build Environment Manifest public endpoint と internal Manifest schema v2
+- recipe dependency pinning、lockfile integrity verification、`--offline`
+- recipe determinism options、static source scanner、scan summary API field
+- Docker engine feasibility調査とopt-in sandbox mode
+
+### Phase 3 の対象外
 
 - allowlist外リポジトリの実ビルド
-- Docker等のサンドボックス
 - HTTPS/WebSocket
 - LANへの無認証デフォルト公開
 - 公式APKとの比較（Phase 2ではAndroid側で実施）
