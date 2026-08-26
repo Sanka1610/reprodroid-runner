@@ -4,7 +4,7 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2CはAndroid側のtrust／update／install／settings統合、Phase 2D-1は既存APIで独立Jobを2件作る再ビルド比較であり、Runner API v1とSQLite schema v4は変更しません。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。Phase 2D完了後もRunner API v1とSQLite schema v4は変更しません。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -31,9 +31,9 @@ Phase 2では、公式APKまたは開発者公開APKと更新情報をAndroidア
 
 Phase 2BはMicroG-RE `TAG 6.1.4`だけを許可する`defaultRelease` profileを追加しました。Runner本体はJDK 21で動かし、外部buildは検査済み`REPRODROID_JDK_18_HOME`のTemurin 18で`clean :play-services-core:assembleDefaultRelease`を実行します。`effectiveBuild`にはrecipe ID、variant、Java majorを追加し、Androidが対象同一性をfail closedで検査します。Runnerの`SUCCEEDED`はbuild成功だけを表し、配布元APKとの`MATCH`／`DIFFERENT`／`INCOMPARABLE`はAndroid側へ保持します。詳細は[ADR-0009](../reprodroid-project/docs/adr/0009-phase-2-reference-apk-and-update-boundary.md)と[ADR-0010](../reprodroid-project/docs/adr/0010-phase-2b-executable-apk-content-comparison.md)を参照してください。
 
-Phase 2D-1ではAndroidが同じtagでBuild A／Build Bの独立Jobを順に作成します。Runnerは各Jobでref解決、commit／host RCE確認、clone、per-job HOME／Gradle user home、Wrapper検査、固定recipe、artifact／Manifest保存を繰り返します。1回目の確認を2回目へ継承せず、batch build APIも追加しません。3軸の比較とtrustはAndroid側の責務であり、Runner SQLite v4には比較状態を追加しません。詳細は[ADR-0012](../reprodroid-project/docs/adr/0012-phase-2d-repeat-build-and-advanced-comparison.md)を参照してください。
+Phase 2DではAndroidが同じtagでBuild A／Build Bの独立Jobを順に作成します。Runnerは各Jobでref解決、commit／host RCE確認、clone、per-job HOME／Gradle user home、Wrapper検査、固定recipe、artifact／Manifest保存を繰り返します。1回目の確認を2回目へ継承せず、batch build APIも追加しません。raw 3軸比較、APK全entry inventory、DEX構造比較、Manifest／resource table意味比較、trustはAndroid側の責務であり、Runnerへ公式APK取得、semantic parser、比較結果、Build Environment Manifest公開APIを追加しません。詳細は[ADR-0012](../reprodroid-project/docs/adr/0012-phase-2d-repeat-build-and-advanced-comparison.md)を参照してください。
 
-Phase 2D-1 E2Eでは、MicroG-RE `6.1.4`のBuild A／Bが別Job／別workspace／別Gradle user homeで同じfull SHA `d8df10ab687a1c1ca05221634cfa46bad262023a`を解決し、個別確認後に成功しました。両artifactは13,258,872 byte、SHA-256 `30de03caea3da52c9febbeebb5d7f0d3246811d288d81b522bb456da19e7b033`で一致しています。
+Phase 2D最終E2Eは2026-08-26にfresh stateから再実行しました。MicroG-RE `6.1.4`のBuild A Job `df527f0e-dccf-4cb2-8cbf-f294cfeed611`とBuild B Job `94831a75-d879-4ae3-ad96-a53e4aabb686`は、別workspace／別Gradle user homeで同じfull SHA `d8df10ab687a1c1ca05221634cfa46bad262023a`を解決し、それぞれ個別のcommit／host RCE確認後に成功しました。両artifactは13,258,872 byte、SHA-256 `30de03caea3da52c9febbeebb5d7f0d3246811d288d81b522bb456da19e7b033`で一致しています。
 
 この固定taskが生成するAPKは上流workflowの後段sign action前なのでunsignedです。Runnerはartifactのsize／SHA-256／配信完全性を保証しますが、比較用artifactへ署名を追加しません。Android側はcomparison専用経路でだけ扱い、通常のinstaller導線から分離します。
 
