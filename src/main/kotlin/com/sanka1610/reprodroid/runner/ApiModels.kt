@@ -152,7 +152,7 @@ data class PublicBuildDependency(
 
 @Serializable
 data class BuildEnvironmentManifestResponse(
-    val schemaVersion: Int = 1,
+    val schemaVersion: Int,
     val commit: String,
     val java: PublicJavaRuntime,
     val gradle: String,

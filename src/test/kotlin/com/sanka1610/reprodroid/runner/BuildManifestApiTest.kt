@@ -37,6 +37,7 @@ class BuildManifestApiTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         val rawResponse = response.bodyAsText()
+        assertTrue(rawResponse.contains("\"schemaVersion\":1"))
         val projection = API_JSON.decodeFromString<BuildEnvironmentManifestResponse>(rawResponse)
         assertEquals(1, projection.schemaVersion)
         assertEquals(COMMIT, projection.commit)

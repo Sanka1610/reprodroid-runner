@@ -145,6 +145,7 @@ internal class BuildManifestPublisher(
             throw manifestInvalid()
         }
         return BuildEnvironmentManifestResponse(
+            schemaVersion = PUBLIC_MANIFEST_SCHEMA_VERSION,
             commit = manifest.resolvedCommitSha,
             java = PublicJavaRuntime(manifest.javaVersion, manifest.javaVendor),
             gradle = manifest.gradleVersion,
@@ -209,6 +210,7 @@ internal class BuildManifestPublisher(
     )
 
     private companion object {
+        const val PUBLIC_MANIFEST_SCHEMA_VERSION = 1
         const val INTERNAL_MANIFEST_SCHEMA_VERSION = 2
         const val MAX_PUBLIC_TEXT_BYTES = 255
         val LOWERCASE_COMMIT_SHA = Regex("[0-9a-f]{40}")
