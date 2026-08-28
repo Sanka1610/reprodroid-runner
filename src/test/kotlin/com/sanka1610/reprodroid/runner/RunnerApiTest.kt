@@ -327,7 +327,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(5, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(6, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
@@ -336,7 +336,8 @@ class RunnerApiTest {
                     SELECT gradle_version, distribution_sha256, distribution_checksum_source,
                            wrapper_jar_gradle_version, wrapper_jar_sha256, manifest_path, manifest_sha256,
                            effective_dependency_pinning, dependency_lock_pre_sha256,
-                           dependency_lock_post_sha256
+                           dependency_lock_post_sha256, effective_source_date_epoch,
+                           effective_no_build_cache, effective_fixed_locale
                     FROM jobs WHERE job_id = '$jobId'
                     """.trimIndent(),
                 ).use { result ->
@@ -351,6 +352,9 @@ class RunnerApiTest {
                     assertEquals("NONE", result.getString("effective_dependency_pinning"))
                     assertEquals("d".repeat(64), result.getString("dependency_lock_pre_sha256"))
                     assertEquals("d".repeat(64), result.getString("dependency_lock_post_sha256"))
+                    assertEquals(null, result.getString("effective_source_date_epoch"))
+                    assertEquals(0, result.getInt("effective_no_build_cache"))
+                    assertEquals(null, result.getString("effective_fixed_locale"))
                 }
                 assertTrue(
                     statement.executeQuery("PRAGMA table_info(artifacts)").use { result ->
@@ -368,7 +372,7 @@ class RunnerApiTest {
         val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute("PRAGMA user_version = 6")
+                statement.execute("PRAGMA user_version = 7")
             }
         }
 
@@ -393,7 +397,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(5, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(6, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })

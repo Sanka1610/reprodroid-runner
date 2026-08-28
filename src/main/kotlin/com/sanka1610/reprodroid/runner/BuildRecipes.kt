@@ -22,11 +22,16 @@ internal data class BuildRecipe(
     val timeout: Duration,
     val allowRunnerSuppliedDistributionChecksum: Boolean,
     val dependencyPinning: DependencyPinning = DependencyPinning.LOCKFILE_OFFLINE,
+    val determinism: DeterminismOptions = DeterminismOptions(noBuildCache = false),
 )
 
 internal class BuildRecipeRegistry(
     recipes: List<BuildRecipe> = defaultRecipes,
 ) {
+    init {
+        recipes.forEach(::validateDeterminismRecipe)
+    }
+
     private val recipesByRepository = recipes.groupBy { canonicalRepositoryKey(it.repositoryUrl) }
 
     fun requireAllowed(repositoryUrl: String, revision: RequestedRevision): BuildRecipe {
@@ -67,6 +72,7 @@ internal class BuildRecipeRegistry(
                 timeout = Duration.ofMinutes(30),
                 allowRunnerSuppliedDistributionChecksum = true,
                 dependencyPinning = DependencyPinning.NONE,
+                determinism = DeterminismOptions(noBuildCache = false),
             ),
             BuildRecipe(
                 id = "morpheapp-microg-re-6.1.4-default-release",
@@ -89,6 +95,7 @@ internal class BuildRecipeRegistry(
                 timeout = Duration.ofMinutes(30),
                 allowRunnerSuppliedDistributionChecksum = true,
                 dependencyPinning = DependencyPinning.NONE,
+                determinism = DeterminismOptions(noBuildCache = false),
             ),
         )
 
@@ -119,5 +126,14 @@ internal class BuildRecipeRegistry(
         }
 
         private val GITHUB_SEGMENT = Regex("[A-Za-z0-9_.-]+")
+
+        private fun validateDeterminismRecipe(recipe: BuildRecipe) {
+            require(recipe.determinism.sourceDateEpoch?.let { it >= 0 } != false) {
+                "source_date_epoch must be a non-negative Unix seconds literal."
+            }
+            require(recipe.tasks.none { it == "--build-cache" || it == "--no-build-cache" }) {
+                "Gradle build-cache options are reserved for the determinism recipe block."
+            }
+        }
     }
 }

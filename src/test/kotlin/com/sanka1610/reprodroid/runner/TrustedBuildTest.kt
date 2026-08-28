@@ -32,12 +32,15 @@ class TrustedBuildTest {
                 javaMajor = 21,
                 tasks = listOf("assemble"),
                 dependencyPinning = DependencyPinning.NONE,
+                determinism = DeterminismOptions(noBuildCache = false),
             ),
         )
         val requestJson = Json.encodeToString(realRequest())
 
         assertTrue(effectiveJson.contains("\"dependencyPinning\":\"NONE\""))
+        assertTrue(effectiveJson.contains("\"determinism\":{\"noBuildCache\":false}"))
         assertFalse(requestJson.contains("dependencyPinning"))
+        assertFalse(requestJson.contains("determinism"))
     }
 
     @Test
@@ -400,6 +403,69 @@ class TrustedBuildTest {
         assertEquals("DEPENDENCY_LOCKFILE_CHANGED", lockFailure {
             verifier.postBuildHash(sourceDirectory, buildRoot)
         }.code)
+    }
+
+    @Test
+    fun `determinism injects canonical epoch locale and no build cache only when configured`() {
+        val base = mapOf(
+            "PATH" to "/usr/bin",
+            "LANG" to "ja_JP.UTF-8",
+            "LC_ALL" to "ja_JP.UTF-8",
+        )
+        val determinism = DeterminismOptions(
+            sourceDateEpoch = 1_777_393_787,
+            noBuildCache = true,
+            fixedLocale = FixedLocale.C_UTF_8,
+        )
+        val recipe = defaultRecipe().copy(determinism = determinism)
+
+        val gradleEnvironment = deterministicGradleEnvironment(base, determinism)
+
+        assertEquals("1777393787", gradleEnvironment["SOURCE_DATE_EPOCH"])
+        assertEquals("C.UTF-8", gradleEnvironment["LANG"])
+        assertEquals("C.UTF-8", gradleEnvironment["LC_ALL"])
+        assertEquals("ja_JP.UTF-8", base["LANG"])
+        assertEquals(
+            listOf("--no-daemon", "--console=plain", "--no-build-cache"),
+            gradleOptions(recipe),
+        )
+        assertFalse(deterministicGradleEnvironment(base, DeterminismOptions(noBuildCache = false))
+            .containsKey("SOURCE_DATE_EPOCH"))
+    }
+
+    @Test
+    fun `determinism recipe rejects negative epoch and reserved cache options`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            BuildRecipeRegistry(
+                listOf(
+                    defaultRecipe().copy(
+                        determinism = DeterminismOptions(sourceDateEpoch = -1, noBuildCache = false),
+                    ),
+                ),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            BuildRecipeRegistry(listOf(defaultRecipe().copy(tasks = listOf("--build-cache", "assemble"))))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            BuildRecipeRegistry(listOf(defaultRecipe().copy(tasks = listOf("--no-build-cache", "assemble"))))
+        }
+    }
+
+    @Test
+    fun `sqlite persists effective determinism without registry inference`() {
+        val store = SQLiteJobStore(stateDirectory)
+        val created = store.createJob(realRequest())
+        val determinism = DeterminismOptions(
+            sourceDateEpoch = 1_777_393_787,
+            noBuildCache = true,
+            fixedLocale = FixedLocale.C_UTF_8,
+        )
+        assertTrue(store.beginResolvingRealJob(created.jobId, defaultRecipe().copy(determinism = determinism)))
+        assertEquals(determinism, requireNotNull(requireNotNull(store.getJob(created.jobId)).effectiveBuild).determinism)
+
+        val restarted = SQLiteJobStore(stateDirectory)
+        assertEquals(determinism, requireNotNull(requireNotNull(restarted.getJob(created.jobId)).effectiveBuild).determinism)
     }
 
     private fun realRequest() = CreateJobRequest(

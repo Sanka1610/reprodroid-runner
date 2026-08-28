@@ -48,7 +48,7 @@ internal class BuildManifestPublisher(
             throw manifestInvalid()
         }
         if (schemaVersion == null || schemaVersion == 1) throw redactedEmpty()
-        if (schemaVersion != INTERNAL_MANIFEST_SCHEMA_VERSION) throw manifestInvalid()
+        if (schemaVersion !in SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS) throw manifestInvalid()
         val manifest = try {
             PRIVATE_JSON.decodeFromString<BuildEnvironmentManifest>(privateJson)
         } catch (_: SerializationException) {
@@ -56,7 +56,10 @@ internal class BuildManifestPublisher(
         } catch (_: IllegalArgumentException) {
             throw manifestInvalid()
         }
-        val response = project(job, manifest)
+        if ((schemaVersion == 2 && manifest.determinism != null) || (schemaVersion == 3 && manifest.determinism == null)) {
+            throw manifestInvalid()
+        }
+        val response = project(job, manifest, schemaVersion)
         val responseBytes = PUBLIC_JSON.encodeToString(response).toByteArray(StandardCharsets.UTF_8).size
         if (responseBytes > limits.maxPublicResponseBytes) throw publicationLimitExceeded()
         return response
@@ -105,8 +108,11 @@ internal class BuildManifestPublisher(
     private fun project(
         job: StoredJob,
         manifest: BuildEnvironmentManifest,
+        internalSchemaVersion: Int,
     ): BuildEnvironmentManifestResponse {
         val resolvedCommit = job.resolvedCommitSha
+        val effectiveDeterminism = store.getJob(job.jobId)?.effectiveBuild?.determinism
+        val unconfiguredDeterminism = DeterminismOptions(noBuildCache = false)
         if (
             !LOWERCASE_COMMIT_SHA.matches(manifest.resolvedCommitSha) ||
             manifest.resolvedCommitSha != resolvedCommit ||
@@ -119,7 +125,9 @@ internal class BuildManifestPublisher(
             manifest.androidSdkApiLevel !in 1..999 ||
             !VERSION_VALUE.matches(manifest.buildToolsVersion) ||
             !isSafePublicText(manifest.javaVersion) ||
-            !isSafePublicText(manifest.javaVendor)
+            !isSafePublicText(manifest.javaVendor) ||
+            (internalSchemaVersion == 2 && effectiveDeterminism != unconfiguredDeterminism) ||
+            (internalSchemaVersion == 3 && manifest.determinism != effectiveDeterminism)
         ) {
             throw manifestInvalid()
         }
@@ -145,7 +153,7 @@ internal class BuildManifestPublisher(
             throw manifestInvalid()
         }
         return BuildEnvironmentManifestResponse(
-            schemaVersion = PUBLIC_MANIFEST_SCHEMA_VERSION,
+            schemaVersion = if (internalSchemaVersion == 3) 2 else 1,
             commit = manifest.resolvedCommitSha,
             java = PublicJavaRuntime(manifest.javaVersion, manifest.javaVendor),
             gradle = manifest.gradleVersion,
@@ -153,6 +161,7 @@ internal class BuildManifestPublisher(
             buildTools = manifest.buildToolsVersion,
             dependencies = dependencies,
             apkHash = manifestArtifact.sha256,
+            determinism = manifest.determinism,
         )
     }
 
@@ -210,8 +219,7 @@ internal class BuildManifestPublisher(
     )
 
     private companion object {
-        const val PUBLIC_MANIFEST_SCHEMA_VERSION = 1
-        const val INTERNAL_MANIFEST_SCHEMA_VERSION = 2
+        val SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS = setOf(2, 3)
         const val MAX_PUBLIC_TEXT_BYTES = 255
         val LOWERCASE_COMMIT_SHA = Regex("[0-9a-f]{40}")
         val LOWERCASE_SHA256 = Regex("[0-9a-f]{64}")

@@ -1,5 +1,6 @@
 package com.sanka1610.reprodroid.runner
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -56,6 +57,19 @@ enum class DependencyPinning {
 }
 
 @Serializable
+enum class FixedLocale {
+    @SerialName("C.UTF-8")
+    C_UTF_8,
+}
+
+@Serializable
+data class DeterminismOptions(
+    val sourceDateEpoch: Long? = null,
+    val noBuildCache: Boolean,
+    val fixedLocale: FixedLocale? = null,
+)
+
+@Serializable
 data class RequestedRevision(
     val type: RevisionType,
     val value: String,
@@ -89,6 +103,7 @@ data class EffectiveBuild(
     val javaMajor: Int? = null,
     val tasks: List<String>,
     val dependencyPinning: DependencyPinning,
+    val determinism: DeterminismOptions,
 )
 
 @Serializable
@@ -168,6 +183,7 @@ data class BuildEnvironmentManifestResponse(
     val buildTools: String,
     val dependencies: List<PublicBuildDependency>,
     val apkHash: String,
+    val determinism: DeterminismOptions? = null,
 )
 
 @Serializable

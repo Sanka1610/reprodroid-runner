@@ -173,7 +173,9 @@ class SQLiteJobStore(
                 UPDATE jobs
                 SET state = ?, progress_percent = 5, effective_recipe_id = ?,
                     effective_variant_name = ?, effective_build_root = ?, effective_java_major = ?,
-                    effective_build_tasks = ?, effective_dependency_pinning = ?, updated_at = ?
+                    effective_build_tasks = ?, effective_dependency_pinning = ?,
+                    effective_source_date_epoch = ?, effective_no_build_cache = ?,
+                    effective_fixed_locale = ?, updated_at = ?
                 WHERE job_id = ? AND state = ?
                 """.trimIndent(),
             ).use { statement ->
@@ -184,9 +186,13 @@ class SQLiteJobStore(
                 statement.setInt(5, recipe.javaMajor)
                 statement.setString(6, recipe.tasks.joinToString("\n"))
                 statement.setString(7, recipe.dependencyPinning.name)
-                statement.setString(8, Instant.now(clock).toString())
-                statement.setString(9, jobId)
-                statement.setString(10, JobState.CREATED.name)
+                recipe.determinism.sourceDateEpoch?.let { statement.setLong(8, it) }
+                    ?: statement.setNull(8, java.sql.Types.BIGINT)
+                statement.setInt(9, if (recipe.determinism.noBuildCache) 1 else 0)
+                statement.setString(10, recipe.determinism.fixedLocale?.name)
+                statement.setString(11, Instant.now(clock).toString())
+                statement.setString(12, jobId)
+                statement.setString(13, JobState.CREATED.name)
                 statement.executeUpdate() == 1
             }
         }
@@ -621,6 +627,9 @@ class SQLiteJobStore(
                             effective_java_major INTEGER,
                             effective_build_tasks TEXT,
                             effective_dependency_pinning TEXT NOT NULL DEFAULT 'NONE',
+                            effective_source_date_epoch INTEGER,
+                            effective_no_build_cache INTEGER NOT NULL DEFAULT 0,
+                            effective_fixed_locale TEXT,
                             dependency_lock_pre_sha256 TEXT,
                             dependency_lock_post_sha256 TEXT,
                             error_code TEXT,
@@ -686,6 +695,13 @@ class SQLiteJobStore(
                     }
                     if (schemaVersion in 1..4) {
                         PINNING_COLUMNS.forEach { columnDefinition ->
+                            if (!columnExists(connection, "jobs", columnDefinition.substringBefore(' '))) {
+                                statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
+                            }
+                        }
+                    }
+                    if (schemaVersion in 1..5) {
+                        DETERMINISM_COLUMNS.forEach { columnDefinition ->
                             if (!columnExists(connection, "jobs", columnDefinition.substringBefore(' '))) {
                                 statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
                             }
@@ -845,6 +861,11 @@ class SQLiteJobStore(
                     ?.filter(String::isNotBlank)
                     .orEmpty(),
                 dependencyPinning = DependencyPinning.valueOf(getString("effective_dependency_pinning")),
+                determinism = DeterminismOptions(
+                    sourceDateEpoch = getLong("effective_source_date_epoch").takeUnless { wasNull() },
+                    noBuildCache = getInt("effective_no_build_cache") != 0,
+                    fixedLocale = getString("effective_fixed_locale")?.let(FixedLocale::valueOf),
+                ),
             )
         },
         latestLogSequence = latestLogSequence,
@@ -872,7 +893,7 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 5
+        const val SCHEMA_VERSION = 6
         val AUDIT_COLUMNS = listOf(
             "gradle_version TEXT",
             "distribution_url TEXT",
@@ -892,6 +913,11 @@ class SQLiteJobStore(
             "effective_dependency_pinning TEXT NOT NULL DEFAULT 'NONE'",
             "dependency_lock_pre_sha256 TEXT",
             "dependency_lock_post_sha256 TEXT",
+        )
+        val DETERMINISM_COLUMNS = listOf(
+            "effective_source_date_epoch INTEGER",
+            "effective_no_build_cache INTEGER NOT NULL DEFAULT 0",
+            "effective_fixed_locale TEXT",
         )
     }
 }

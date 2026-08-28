@@ -37,9 +37,11 @@ class BuildManifestApiTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         val rawResponse = response.bodyAsText()
-        assertTrue(rawResponse.contains("\"schemaVersion\":1"))
+        assertTrue(rawResponse.contains("\"schemaVersion\":2"))
+        assertTrue(rawResponse.contains("\"determinism\":{\"noBuildCache\":false}"))
         val projection = API_JSON.decodeFromString<BuildEnvironmentManifestResponse>(rawResponse)
-        assertEquals(1, projection.schemaVersion)
+        assertEquals(2, projection.schemaVersion)
+        assertEquals(DeterminismOptions(noBuildCache = false), projection.determinism)
         assertEquals(COMMIT, projection.commit)
         assertEquals(36, projection.androidSdk)
         assertEquals("36.0.0", projection.buildTools)
@@ -79,6 +81,55 @@ class BuildManifestApiTest {
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
         assertEquals(HttpStatusCode.Gone, response.status)
         assertEquals("BUILD_MANIFEST_REDACTED_EMPTY", response.decode<ApiErrorResponse>().code)
+    }
+
+    @Test
+    fun `keeps private schema two compatibility as public schema one`() = testApplication {
+        val seeded = seedManifest { it.copy(schemaVersion = 2, determinism = null) }
+        application { runnerModule(testConfig()) }
+        val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        val rawResponse = response.bodyAsText()
+        assertTrue(rawResponse.contains("\"schemaVersion\":1"))
+        assertFalse(rawResponse.contains("determinism"))
+    }
+
+    @Test
+    fun `rejects private schema two for a job with configured determinism`() = testApplication {
+        val configuredRecipe = releaseRecipe().copy(
+            determinism = DeterminismOptions(
+                sourceDateEpoch = 1_777_393_787,
+                noBuildCache = true,
+                fixedLocale = FixedLocale.C_UTF_8,
+            ),
+        )
+        val seeded = seedManifest(recipe = configuredRecipe) {
+            it.copy(schemaVersion = 2, determinism = null)
+        }
+        application { runnerModule(testConfig()) }
+        val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
+
+        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
+    }
+
+    @Test
+    fun `rejects private manifest determinism that differs from effective job policy`() = testApplication {
+        val seeded = seedManifest { manifest ->
+            manifest.copy(
+                determinism = DeterminismOptions(
+                    sourceDateEpoch = 1_777_393_787,
+                    noBuildCache = true,
+                    fixedLocale = FixedLocale.C_UTF_8,
+                ),
+            )
+        }
+        application { runnerModule(testConfig()) }
+        val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
+
+        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
     @Test
@@ -204,10 +255,10 @@ class BuildManifestApiTest {
     private fun seedManifest(
         rawJson: String? = null,
         relativePath: String? = null,
+        recipe: BuildRecipe = releaseRecipe(),
         transform: (BuildEnvironmentManifest) -> BuildEnvironmentManifest = { it },
     ): SeededManifest {
         val store = SQLiteJobStore(stateDirectory)
-        val recipe = releaseRecipe()
         val jobId = store.createJob(realRequest()).jobId
         assertTrue(store.beginResolvingRealJob(jobId, recipe))
         assertTrue(store.awaitRealConfirmation(jobId, COMMIT))
@@ -239,6 +290,7 @@ class BuildManifestApiTest {
                 androidSdk = "/private/android/sdk",
                 androidSdkApiLevel = recipe.androidSdkApiLevel,
                 buildToolsVersion = recipe.buildToolsVersion,
+                determinism = recipe.determinism,
                 wrapper = WrapperVerification(
                     gradleVersion = recipe.gradleVersion,
                     distributionUrl = "https://services.gradle.org/distributions/gradle-8.14.3-bin.zip",

@@ -326,6 +326,21 @@ internal fun gradleOptions(recipe: BuildRecipe): List<String> = buildList {
     add("--no-daemon")
     add("--console=plain")
     if (recipe.dependencyPinning == DependencyPinning.LOCKFILE_OFFLINE) add("--offline")
+    if (recipe.determinism.noBuildCache) add("--no-build-cache")
+}
+
+internal fun deterministicGradleEnvironment(
+    restrictedEnvironment: Map<String, String>,
+    determinism: DeterminismOptions,
+): Map<String, String> = restrictedEnvironment.toMutableMap().apply {
+    determinism.sourceDateEpoch?.let { put("SOURCE_DATE_EPOCH", it.toString()) }
+    determinism.fixedLocale?.let { fixedLocale ->
+        val value = when (fixedLocale) {
+            FixedLocale.C_UTF_8 -> "C.UTF-8"
+        }
+        put("LANG", value)
+        put("LC_ALL", value)
+    }
 }
 
 internal class TrustedBuildExecutor(
@@ -431,6 +446,23 @@ internal class TrustedBuildExecutor(
                 "(${wrapper.distributionChecksumSource}), official Wrapper JAR ${wrapper.wrapperJarGradleVersion} " +
                 "${wrapper.wrapperJarSha256}.",
         )
+        val gradleEnvironment = deterministicGradleEnvironment(environment, recipe.determinism)
+        recipe.determinism.fixedLocale?.let {
+            val charmap = captureChecked(
+                command = listOf("locale", "charmap"),
+                workingDirectory = workspace,
+                environment = gradleEnvironment,
+                timeout = Duration.ofMinutes(1),
+                failureCode = "DETERMINISM_LOCALE_UNAVAILABLE",
+            ).singleOrNull()?.trim()?.replace("-", "")?.uppercase()
+            if (charmap != "UTF8") {
+                throw TrustedBuildFailure(
+                    "DETERMINISM_LOCALE_UNAVAILABLE",
+                    "The fixed recipe locale is not available as UTF-8.",
+                )
+            }
+            store.appendLog(job.jobId, LogLevel.INFO, "Validated fixed Gradle process locale C.UTF-8.")
+        }
         transition(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks: ${recipe.tasks.joinToString(" ")}.")
         val javaExecutable = buildJava.executable.toString()
         val wrapperJar = confinedPath(buildRoot, "gradle/wrapper/gradle-wrapper.jar")
@@ -445,7 +477,7 @@ internal class TrustedBuildExecutor(
                     "org.gradle.wrapper.GradleWrapperMain",
                 ) + gradleOptions(recipe) + recipe.tasks,
                 workingDirectory = buildRoot,
-                environment = environment,
+                environment = gradleEnvironment,
                 timeout = recipe.timeout,
                 failureCode = "GRADLE_BUILD_FAILED",
                 outputPrefix = "gradle",
@@ -521,6 +553,7 @@ internal class TrustedBuildExecutor(
             androidSdk = environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"],
             androidSdkApiLevel = validatedAndroidSdk.apiLevel,
             buildToolsVersion = validatedAndroidSdk.buildToolsVersion,
+            determinism = recipe.determinism,
             wrapper = wrapper,
             dependencies = captureDependencies(gradleUserHome),
             artifacts = artifactPaths.zip(discoveredArtifacts).map { (path, metadata) ->
@@ -747,7 +780,7 @@ internal data class BuildJavaRuntime(
 
 @Serializable
 internal data class BuildEnvironmentManifest(
-    val schemaVersion: Int = 2,
+    val schemaVersion: Int = 3,
     val generatedAt: String,
     val jobId: String,
     val recipeId: String,
@@ -763,6 +796,7 @@ internal data class BuildEnvironmentManifest(
     val androidSdk: String?,
     val androidSdkApiLevel: Int,
     val buildToolsVersion: String,
+    val determinism: DeterminismOptions? = null,
     val wrapper: WrapperVerification,
     val dependencies: List<ManifestFile>,
     val artifacts: List<ManifestFile>,
