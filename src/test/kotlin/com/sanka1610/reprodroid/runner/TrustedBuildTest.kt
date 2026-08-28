@@ -4,6 +4,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -19,6 +21,24 @@ import kotlin.io.path.createDirectories
 class TrustedBuildTest {
     @TempDir
     lateinit var stateDirectory: Path
+
+    @Test
+    fun `job response emits dependency pinning while job requests cannot select it`() {
+        val effectiveJson = Json.encodeToString(
+            EffectiveBuild(
+                recipeId = "recipe",
+                variantName = "release",
+                buildRoot = ".",
+                javaMajor = 21,
+                tasks = listOf("assemble"),
+                dependencyPinning = DependencyPinning.NONE,
+            ),
+        )
+        val requestJson = Json.encodeToString(realRequest())
+
+        assertTrue(effectiveJson.contains("\"dependencyPinning\":\"NONE\""))
+        assertFalse(requestJson.contains("dependencyPinning"))
+    }
 
     @Test
     fun `real job stops at resolved commit until exact risk confirmation`() = runBlocking {
@@ -68,6 +88,7 @@ class TrustedBuildTest {
             assertEquals("morpheapp-microg-re-main-debug", awaiting.effectiveBuild?.recipeId)
             assertEquals("defaultDebug", awaiting.effectiveBuild?.variantName)
             assertEquals(21, awaiting.effectiveBuild?.javaMajor)
+            assertEquals(DependencyPinning.NONE, awaiting.effectiveBuild?.dependencyPinning)
 
             val missingRisk = assertThrows(ApiException::class.java) {
                 coordinator.confirm(created.jobId, ConfirmJobRequest(resolvedCommit, false))
@@ -199,6 +220,8 @@ class TrustedBuildTest {
         assertEquals(36, release.androidSdkApiLevel)
         assertEquals("36.0.0", release.buildToolsVersion)
         assertEquals(listOf("clean", ":play-services-core:assembleDefaultRelease"), release.tasks)
+        assertEquals(DependencyPinning.NONE, release.dependencyPinning)
+        assertTrue(BuildRecipeRegistry.defaultRecipes.all { it.dependencyPinning == DependencyPinning.NONE })
         assertEquals("REPOSITORY_NOT_ALLOWLISTED", assertThrows(ApiException::class.java) {
             registry.requireAllowed(
                 "https://github.com/example/app.git",
@@ -238,6 +261,147 @@ class TrustedBuildTest {
         assertEquals("ANDROID_SDK_PLATFORM_INVALID", failure.code)
     }
 
+    @Test
+    fun `new recipe defaults to lockfile offline`() {
+        val recipe = BuildRecipe(
+            id = "fixture",
+            repositoryUrl = "https://github.com/example/fixture.git",
+            revision = RequestedRevision(RevisionType.TAG, "1.0"),
+            variantName = "release",
+            buildRoot = ".",
+            javaMajor = 21,
+            gradleVersion = "8.14.3",
+            androidSdkApiLevel = 36,
+            buildToolsVersion = "36.0.0",
+            distributionType = "bin",
+            wrapperJarGradleVersion = "8.14.3",
+            tasks = listOf("assemble"),
+            artifactPatterns = listOf("build/outputs/*.apk"),
+            requireSingleApk = true,
+            timeout = Duration.ofMinutes(1),
+            allowRunnerSuppliedDistributionChecksum = false,
+        )
+
+        assertEquals(DependencyPinning.LOCKFILE_OFFLINE, recipe.dependencyPinning)
+        assertEquals(
+            listOf("--no-daemon", "--console=plain", "--offline"),
+            gradleOptions(recipe),
+        )
+        assertEquals(
+            listOf("--no-daemon", "--console=plain"),
+            gradleOptions(recipe.copy(dependencyPinning = DependencyPinning.LOCKFILE)),
+        )
+        assertEquals(
+            listOf("--no-daemon", "--console=plain"),
+            gradleOptions(recipe.copy(dependencyPinning = DependencyPinning.NONE)),
+        )
+    }
+
+    @Test
+    fun `dependency lockfile accepts unchanged confined regular file and detects change`() {
+        val sourceDirectory = stateDirectory.resolve("source").also(Path::createDirectories)
+        val buildRoot = sourceDirectory.resolve("app").also(Path::createDirectories)
+        val lockfile = buildRoot.resolve("gradle.lockfile")
+        Files.writeString(lockfile, "example:library:1.0=runtimeClasspath\n")
+        val verifier = DependencyLockfileVerifier()
+
+        val preHash = verifier.preBuildHash(sourceDirectory, buildRoot)
+        assertEquals(preHash, verifier.postBuildHash(sourceDirectory, buildRoot))
+
+        Files.writeString(lockfile, "example:library:2.0=runtimeClasspath\n")
+        val postHash = verifier.postBuildHash(sourceDirectory, buildRoot)
+        assertFalse(preHash == postHash)
+    }
+
+    @Test
+    fun `dependency lockfile rejects missing directory symlink and oversized files`() {
+        val sourceDirectory = stateDirectory.resolve("source").also(Path::createDirectories)
+        val buildRoot = sourceDirectory.resolve("app").also(Path::createDirectories)
+        val verifier = DependencyLockfileVerifier(maxBytes = 4)
+        val lockfile = buildRoot.resolve("gradle.lockfile")
+
+        assertEquals("DEPENDENCY_LOCKFILE_MISSING", lockFailure {
+            verifier.preBuildHash(sourceDirectory, buildRoot)
+        }.code)
+
+        Files.createDirectory(lockfile)
+        assertEquals("DEPENDENCY_LOCKFILE_INVALID", lockFailure {
+            verifier.preBuildHash(sourceDirectory, buildRoot)
+        }.code)
+        Files.delete(lockfile)
+
+        val target = sourceDirectory.resolve("target.lock")
+        Files.writeString(target, "safe")
+        Files.createSymbolicLink(lockfile, target)
+        assertEquals("DEPENDENCY_LOCKFILE_INVALID", lockFailure {
+            verifier.preBuildHash(sourceDirectory, buildRoot)
+        }.code)
+        Files.delete(lockfile)
+
+        Files.writeString(lockfile, "large")
+        assertEquals("DEPENDENCY_LOCKFILE_TOO_LARGE", lockFailure {
+            verifier.preBuildHash(sourceDirectory, buildRoot)
+        }.code)
+    }
+
+    @Test
+    fun `dependency lockfile post build invalidity is reported as changed`() {
+        val sourceDirectory = stateDirectory.resolve("source").also(Path::createDirectories)
+        val buildRoot = sourceDirectory.resolve("app").also(Path::createDirectories)
+        val lockfile = buildRoot.resolve("gradle.lockfile")
+        Files.writeString(lockfile, "locked")
+        val verifier = DependencyLockfileVerifier()
+        verifier.preBuildHash(sourceDirectory, buildRoot)
+
+        Files.delete(lockfile)
+        assertEquals("DEPENDENCY_LOCKFILE_CHANGED", lockFailure {
+            verifier.postBuildHash(sourceDirectory, buildRoot)
+        }.code)
+    }
+
+    @Test
+    fun `dependency lockfile build root path escape is rejected`() {
+        val sourceDirectory = stateDirectory.resolve("source").also(Path::createDirectories)
+        val outsideBuildRoot = stateDirectory.resolve("outside").also(Path::createDirectories)
+        Files.writeString(outsideBuildRoot.resolve("gradle.lockfile"), "locked")
+
+        val failure = lockFailure {
+            DependencyLockfileVerifier().preBuildHash(sourceDirectory, outsideBuildRoot)
+        }
+
+        assertEquals("DEPENDENCY_LOCKFILE_INVALID", failure.code)
+        assertFalse(failure.message.orEmpty().contains(stateDirectory.toString()))
+    }
+
+    @Test
+    fun `dependency lockfile post build rejects symlink directory and oversized replacement`() {
+        val sourceDirectory = stateDirectory.resolve("source").also(Path::createDirectories)
+        val buildRoot = sourceDirectory.resolve("app").also(Path::createDirectories)
+        val lockfile = buildRoot.resolve("gradle.lockfile")
+        val verifier = DependencyLockfileVerifier(maxBytes = 4)
+
+        Files.writeString(lockfile, "safe")
+        verifier.preBuildHash(sourceDirectory, buildRoot)
+        Files.delete(lockfile)
+        Files.writeString(sourceDirectory.resolve("replacement.lock"), "safe")
+        Files.createSymbolicLink(lockfile, sourceDirectory.resolve("replacement.lock"))
+        assertEquals("DEPENDENCY_LOCKFILE_CHANGED", lockFailure {
+            verifier.postBuildHash(sourceDirectory, buildRoot)
+        }.code)
+
+        Files.delete(lockfile)
+        Files.createDirectory(lockfile)
+        assertEquals("DEPENDENCY_LOCKFILE_CHANGED", lockFailure {
+            verifier.postBuildHash(sourceDirectory, buildRoot)
+        }.code)
+
+        Files.delete(lockfile)
+        Files.writeString(lockfile, "large")
+        assertEquals("DEPENDENCY_LOCKFILE_CHANGED", lockFailure {
+            verifier.postBuildHash(sourceDirectory, buildRoot)
+        }.code)
+    }
+
     private fun realRequest() = CreateJobRequest(
         executionMode = ExecutionMode.REAL_TRUSTED,
         repositoryUrl = "https://github.com/MorpheApp/MicroG-RE.git",
@@ -246,5 +410,12 @@ class TrustedBuildTest {
 
     private fun defaultRecipe(): BuildRecipe = BuildRecipeRegistry.defaultRecipes.single {
         it.revision == RequestedRevision(RevisionType.BRANCH, "main")
+    }
+
+    private fun lockFailure(block: () -> Unit): TrustedBuildFailure = try {
+        block()
+        throw AssertionError("TrustedBuildFailure was expected")
+    } catch (failure: TrustedBuildFailure) {
+        failure
     }
 }

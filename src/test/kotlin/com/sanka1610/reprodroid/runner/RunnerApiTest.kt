@@ -322,17 +322,21 @@ class RunnerApiTest {
             ),
         )
         assertTrue(store.recordBuildManifest(jobId, "manifests/$jobId/reprodroid-build.json", "c".repeat(64)))
+        assertTrue(store.recordDependencyLockPreBuild(jobId, "d".repeat(64)))
+        assertTrue(store.recordDependencyLockPostBuild(jobId, "d".repeat(64)))
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(4, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(5, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
                 statement.executeQuery(
                     """
                     SELECT gradle_version, distribution_sha256, distribution_checksum_source,
-                           wrapper_jar_gradle_version, wrapper_jar_sha256, manifest_path, manifest_sha256
+                           wrapper_jar_gradle_version, wrapper_jar_sha256, manifest_path, manifest_sha256,
+                           effective_dependency_pinning, dependency_lock_pre_sha256,
+                           dependency_lock_post_sha256
                     FROM jobs WHERE job_id = '$jobId'
                     """.trimIndent(),
                 ).use { result ->
@@ -344,6 +348,9 @@ class RunnerApiTest {
                     assertEquals("b".repeat(64), result.getString("wrapper_jar_sha256"))
                     assertEquals("manifests/$jobId/reprodroid-build.json", result.getString("manifest_path"))
                     assertEquals("c".repeat(64), result.getString("manifest_sha256"))
+                    assertEquals("NONE", result.getString("effective_dependency_pinning"))
+                    assertEquals("d".repeat(64), result.getString("dependency_lock_pre_sha256"))
+                    assertEquals("d".repeat(64), result.getString("dependency_lock_post_sha256"))
                 }
                 assertTrue(
                     statement.executeQuery("PRAGMA table_info(artifacts)").use { result ->
@@ -361,7 +368,7 @@ class RunnerApiTest {
         val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute("PRAGMA user_version = 5")
+                statement.execute("PRAGMA user_version = 6")
             }
         }
 
@@ -386,7 +393,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(4, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(5, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })

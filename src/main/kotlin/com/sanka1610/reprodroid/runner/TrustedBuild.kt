@@ -227,12 +227,114 @@ internal class WrapperVerifier(
     }
 }
 
+internal class DependencyLockfileVerifier(
+    private val maxBytes: Long = MAX_DEPENDENCY_LOCKFILE_BYTES,
+) {
+    fun preBuildHash(sourceDirectory: Path, buildRoot: Path): String =
+        inspect(sourceDirectory, buildRoot, postBuild = false)
+
+    fun postBuildHash(sourceDirectory: Path, buildRoot: Path): String =
+        try {
+            inspect(sourceDirectory, buildRoot, postBuild = true)
+        } catch (_: TrustedBuildFailure) {
+            throw TrustedBuildFailure(
+                "DEPENDENCY_LOCKFILE_CHANGED",
+                "The dependency lockfile changed or became invalid during the Gradle build.",
+            )
+        }
+
+    private fun inspect(sourceDirectory: Path, buildRoot: Path, postBuild: Boolean): String {
+        val sourceRoot = try {
+            sourceDirectory.toRealPath()
+        } catch (_: IOException) {
+            throw invalid(postBuild)
+        }
+        val realBuildRoot = try {
+            buildRoot.toRealPath()
+        } catch (_: IOException) {
+            throw invalid(postBuild)
+        }
+        if (!realBuildRoot.startsWith(sourceRoot)) throw invalid(postBuild)
+        val lockfile = realBuildRoot.resolve("gradle.lockfile").normalize()
+        if (!lockfile.startsWith(realBuildRoot)) throw invalid(postBuild)
+        if (!Files.exists(lockfile, LinkOption.NOFOLLOW_LINKS)) {
+            if (postBuild) throw invalid(postBuild)
+            throw TrustedBuildFailure(
+                "DEPENDENCY_LOCKFILE_MISSING",
+                "The fixed build recipe requires a dependency lockfile.",
+            )
+        }
+        if (!Files.isRegularFile(lockfile, LinkOption.NOFOLLOW_LINKS)) throw invalid(postBuild)
+        val declaredSize = try {
+            Files.size(lockfile)
+        } catch (_: IOException) {
+            throw invalid(postBuild)
+        }
+        if (declaredSize > maxBytes) {
+            if (postBuild) throw invalid(postBuild)
+            throw TrustedBuildFailure(
+                "DEPENDENCY_LOCKFILE_TOO_LARGE",
+                "The dependency lockfile exceeds the 8 MiB safety limit.",
+            )
+        }
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            Files.newInputStream(lockfile, LinkOption.NOFOLLOW_LINKS).use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var total = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > maxBytes) {
+                        if (postBuild) throw invalid(postBuild)
+                        throw TrustedBuildFailure(
+                            "DEPENDENCY_LOCKFILE_TOO_LARGE",
+                            "The dependency lockfile exceeds the 8 MiB safety limit.",
+                        )
+                    }
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+        } catch (failure: TrustedBuildFailure) {
+            throw failure
+        } catch (_: Throwable) {
+            throw invalid(postBuild)
+        }
+    }
+
+    private fun invalid(postBuild: Boolean): TrustedBuildFailure =
+        if (postBuild) {
+            TrustedBuildFailure(
+                "DEPENDENCY_LOCKFILE_CHANGED",
+                "The dependency lockfile changed or became invalid during the Gradle build.",
+            )
+        } else {
+            TrustedBuildFailure(
+                "DEPENDENCY_LOCKFILE_INVALID",
+                "The dependency lockfile is not a confined non-symlink regular file.",
+            )
+        }
+
+    private companion object {
+        const val MAX_DEPENDENCY_LOCKFILE_BYTES = 8L * 1024L * 1024L
+    }
+}
+
+internal fun gradleOptions(recipe: BuildRecipe): List<String> = buildList {
+    add("--no-daemon")
+    add("--console=plain")
+    if (recipe.dependencyPinning == DependencyPinning.LOCKFILE_OFFLINE) add("--offline")
+}
+
 internal class TrustedBuildExecutor(
     private val store: SQLiteJobStore,
     private val processExecutor: ProcessExecutor,
     private val wrapperVerifier: WrapperVerifier,
     private val stateDirectory: Path,
     private val clock: Clock = Clock.systemUTC(),
+    private val dependencyLockfileVerifier: DependencyLockfileVerifier = DependencyLockfileVerifier(),
 ) {
     suspend fun execute(job: StoredJob, recipe: BuildRecipe) {
         val resolvedCommit = job.resolvedCommitSha
@@ -298,6 +400,23 @@ internal class TrustedBuildExecutor(
         if (!Files.isDirectory(buildRoot)) {
             throw TrustedBuildFailure("BUILD_ROOT_MISSING", "The fixed build root does not exist.")
         }
+        val dependencyLockPreHash = if (recipe.dependencyPinning == DependencyPinning.NONE) {
+            null
+        } else {
+            dependencyLockfileVerifier.preBuildHash(sourceDirectory, buildRoot).also { hash ->
+                if (!store.recordDependencyLockPreBuild(job.jobId, hash)) {
+                    throw TrustedBuildFailure(
+                        "DEPENDENCY_LOCK_AUDIT_PERSISTENCE_FAILED",
+                        "Runner could not persist the dependency lockfile audit result.",
+                    )
+                }
+                store.appendLog(
+                    job.jobId,
+                    LogLevel.INFO,
+                    "Dependency lockfile pre-build SHA-256 $hash verified for ${recipe.dependencyPinning.name}.",
+                )
+            }
+        }
         val wrapper = wrapperVerifier.verifyAndHarden(buildRoot, recipe)
         if (!store.recordWrapperVerification(job.jobId, wrapper)) {
             throw TrustedBuildFailure(
@@ -315,21 +434,62 @@ internal class TrustedBuildExecutor(
         transition(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks: ${recipe.tasks.joinToString(" ")}.")
         val javaExecutable = buildJava.executable.toString()
         val wrapperJar = confinedPath(buildRoot, "gradle/wrapper/gradle-wrapper.jar")
-        runChecked(
-            jobId = job.jobId,
-            command = listOf(
-                javaExecutable,
-                "-Dgradle.user.home=$gradleUserHome",
-                "-classpath", wrapperJar.toString(),
-                "org.gradle.wrapper.GradleWrapperMain",
-                "--no-daemon", "--console=plain",
-            ) + recipe.tasks,
-            workingDirectory = buildRoot,
-            environment = environment,
-            timeout = recipe.timeout,
-            failureCode = "GRADLE_BUILD_FAILED",
-            outputPrefix = "gradle",
-        )
+        var gradleFailure: Throwable? = null
+        try {
+            runChecked(
+                jobId = job.jobId,
+                command = listOf(
+                    javaExecutable,
+                    "-Dgradle.user.home=$gradleUserHome",
+                    "-classpath", wrapperJar.toString(),
+                    "org.gradle.wrapper.GradleWrapperMain",
+                ) + gradleOptions(recipe) + recipe.tasks,
+                workingDirectory = buildRoot,
+                environment = environment,
+                timeout = recipe.timeout,
+                failureCode = "GRADLE_BUILD_FAILED",
+                outputPrefix = "gradle",
+            )
+        } catch (failure: Throwable) {
+            gradleFailure = failure
+        }
+        var dependencyLockFailure: Throwable? = null
+        if (dependencyLockPreHash != null) {
+            try {
+                val postHash = dependencyLockfileVerifier.postBuildHash(sourceDirectory, buildRoot)
+                if (!store.recordDependencyLockPostBuild(job.jobId, postHash)) {
+                    throw TrustedBuildFailure(
+                        "DEPENDENCY_LOCK_AUDIT_PERSISTENCE_FAILED",
+                        "Runner could not persist the dependency lockfile audit result.",
+                    )
+                }
+                if (postHash != dependencyLockPreHash) {
+                    throw TrustedBuildFailure(
+                        "DEPENDENCY_LOCKFILE_CHANGED",
+                        "The dependency lockfile changed during the Gradle build.",
+                    )
+                }
+                store.appendLog(
+                    job.jobId,
+                    LogLevel.INFO,
+                    "Dependency lockfile post-build SHA-256 $postHash matches the pre-build audit value.",
+                )
+            } catch (failure: Throwable) {
+                dependencyLockFailure = failure
+            }
+        }
+        if (gradleFailure is CancellationException) {
+            if (dependencyLockFailure != null) {
+                store.appendLog(
+                    job.jobId,
+                    LogLevel.WARN,
+                    "Dependency lockfile post-build verification did not complete cleanly after cancellation.",
+                )
+            }
+            throw gradleFailure
+        }
+        dependencyLockFailure?.let { throw it }
+        gradleFailure?.let { throw it }
 
         transition(job.jobId, JobState.DISCOVERING_ARTIFACTS, 90, "Discovering APKs using the fixed artifact recipe.")
         val artifactPaths = discoverArtifacts(buildRoot, recipe)

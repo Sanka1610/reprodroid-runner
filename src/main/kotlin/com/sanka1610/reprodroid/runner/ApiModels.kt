@@ -49,6 +49,13 @@ enum class LogLevel {
 }
 
 @Serializable
+enum class DependencyPinning {
+    NONE,
+    LOCKFILE,
+    LOCKFILE_OFFLINE,
+}
+
+@Serializable
 data class RequestedRevision(
     val type: RevisionType,
     val value: String,
@@ -81,6 +88,7 @@ data class EffectiveBuild(
     val buildRoot: String,
     val javaMajor: Int? = null,
     val tasks: List<String>,
+    val dependencyPinning: DependencyPinning,
 )
 
 @Serializable

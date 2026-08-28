@@ -4,9 +4,9 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v4 のままです。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v5 です。
 
-Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Android側のRoom v10・取得・表示は別リポジトリで実装済みです。3Bはrecipe pinning、lockfile integrity、offline、SQLite v5、API additive fieldの契約までAcceptedですが、Runner codeは未実装です。3C〜3E の determinism、static scan、Docker sandbox feasibility も未実装です。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE 確認境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md) です。
+Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。`lockfile_offline`だけがGradle task前へ`--offline`を追加し、effective modeをpublic Job response、modeとprivate pre/post hashをSQLite v5へ保存します。既存MicroG-RE recipeは後方互換のため明示的な`none`です。3C〜3E の determinism、static scan、Docker sandbox feasibility は未実装です。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE 確認境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md) です。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -24,6 +24,9 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 - repositoryとrevisionを組にしたexact recipe allowlist
 - API／SQLiteへ永続化するrecipe ID、variant、Java major
 - recipe別build JDKのpath／major検査と固定Java executableによるWrapper起動
+- recipe固定のdependency pinning modeとSQLite v5監査保存
+- lockfileのcheckout confinement、non-symlink regular file、8 MiB上限、pre/post SHA-256一致検査
+- `LOCKFILE_OFFLINE`に限定したGradle `--offline`固定option
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 
@@ -147,7 +150,7 @@ INTERRUPTED
 
 Phase 3A の `GET /v1/jobs/{jobId}/build-environment-manifest` は、成功した`REAL_TRUSTED` Jobのprivate Manifestをpath confinement、non-symlink regular file、32 MiB、監査SHA-256、strict JSON、schema / field integrity、redaction上限で検査し、public projectionだけを返します。private Manifest fileは配信しません。
 
-Phase 3B実装後は、`GET /v1/jobs/{jobId}`の`effectiveBuild`へ`dependencyPinning`をadditiveに追加します。許可値は`NONE`、`LOCKFILE`、`LOCKFILE_OFFLINE`で、Android requestから指定できません。現在のRunnerはまだfieldを返しません。planned API、error code、legacy互換性は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
+Phase 3Bの`GET /v1/jobs/{jobId}`は、`effectiveBuild.dependencyPinning`を常に明示します。許可値は`NONE`、`LOCKFILE`、`LOCKFILE_OFFLINE`で、Android requestからは指定できません。lockfile path／contentとprivate pre/post SHA-256はpublic APIへ返しません。error codeとlegacy互換性は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
 
 ## 初期テスト対象
 
@@ -214,11 +217,10 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 3A実装・Phase 3B契約Accepted後の未実装・対象外
+## Phase 3A・3B実装後の未実装・対象外
 
 ### Phase 3 で予定するが、まだ実装していないもの
 
-- ADR-0014に従うrecipe dependency pinning、lockfile integrity verification、SQLite v5、API `dependencyPinning`、`--offline`
 - recipe determinism options、static source scanner、scan summary API field
 - Docker engine feasibility調査とopt-in sandbox mode
 

@@ -21,6 +21,7 @@ internal data class BuildRecipe(
     val requireSingleApk: Boolean,
     val timeout: Duration,
     val allowRunnerSuppliedDistributionChecksum: Boolean,
+    val dependencyPinning: DependencyPinning = DependencyPinning.LOCKFILE_OFFLINE,
 )
 
 internal class BuildRecipeRegistry(
@@ -65,6 +66,7 @@ internal class BuildRecipeRegistry(
                 requireSingleApk = true,
                 timeout = Duration.ofMinutes(30),
                 allowRunnerSuppliedDistributionChecksum = true,
+                dependencyPinning = DependencyPinning.NONE,
             ),
             BuildRecipe(
                 id = "morpheapp-microg-re-6.1.4-default-release",
@@ -86,6 +88,7 @@ internal class BuildRecipeRegistry(
                 requireSingleApk = true,
                 timeout = Duration.ofMinutes(30),
                 allowRunnerSuppliedDistributionChecksum = true,
+                dependencyPinning = DependencyPinning.NONE,
             ),
         )
 

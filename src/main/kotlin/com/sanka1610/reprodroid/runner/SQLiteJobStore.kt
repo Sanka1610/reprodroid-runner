@@ -173,7 +173,7 @@ class SQLiteJobStore(
                 UPDATE jobs
                 SET state = ?, progress_percent = 5, effective_recipe_id = ?,
                     effective_variant_name = ?, effective_build_root = ?, effective_java_major = ?,
-                    effective_build_tasks = ?, updated_at = ?
+                    effective_build_tasks = ?, effective_dependency_pinning = ?, updated_at = ?
                 WHERE job_id = ? AND state = ?
                 """.trimIndent(),
             ).use { statement ->
@@ -183,9 +183,32 @@ class SQLiteJobStore(
                 statement.setString(4, recipe.buildRoot)
                 statement.setInt(5, recipe.javaMajor)
                 statement.setString(6, recipe.tasks.joinToString("\n"))
-                statement.setString(7, Instant.now(clock).toString())
-                statement.setString(8, jobId)
-                statement.setString(9, JobState.CREATED.name)
+                statement.setString(7, recipe.dependencyPinning.name)
+                statement.setString(8, Instant.now(clock).toString())
+                statement.setString(9, jobId)
+                statement.setString(10, JobState.CREATED.name)
+                statement.executeUpdate() == 1
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun recordDependencyLockPreBuild(jobId: String, sha256: String): Boolean =
+        recordDependencyLockHash(jobId, "dependency_lock_pre_sha256", sha256)
+
+    @Synchronized
+    internal fun recordDependencyLockPostBuild(jobId: String, sha256: String): Boolean =
+        recordDependencyLockHash(jobId, "dependency_lock_post_sha256", sha256)
+
+    private fun recordDependencyLockHash(jobId: String, column: String, sha256: String): Boolean {
+        require(column in setOf("dependency_lock_pre_sha256", "dependency_lock_post_sha256"))
+        return connection().use { connection ->
+            connection.prepareStatement(
+                "UPDATE jobs SET $column = ?, updated_at = ? WHERE job_id = ?",
+            ).use { statement ->
+                statement.setString(1, sha256)
+                statement.setString(2, Instant.now(clock).toString())
+                statement.setString(3, jobId)
                 statement.executeUpdate() == 1
             }
         }
@@ -597,6 +620,9 @@ class SQLiteJobStore(
                             effective_build_root TEXT,
                             effective_java_major INTEGER,
                             effective_build_tasks TEXT,
+                            effective_dependency_pinning TEXT NOT NULL DEFAULT 'NONE',
+                            dependency_lock_pre_sha256 TEXT,
+                            dependency_lock_post_sha256 TEXT,
                             error_code TEXT,
                             error_message TEXT,
                             gradle_version TEXT,
@@ -653,6 +679,13 @@ class SQLiteJobStore(
                     }
                     if (schemaVersion in 1..3) {
                         BUILD_PROFILE_COLUMNS.forEach { columnDefinition ->
+                            if (!columnExists(connection, "jobs", columnDefinition.substringBefore(' '))) {
+                                statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
+                            }
+                        }
+                    }
+                    if (schemaVersion in 1..4) {
+                        PINNING_COLUMNS.forEach { columnDefinition ->
                             if (!columnExists(connection, "jobs", columnDefinition.substringBefore(' '))) {
                                 statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
                             }
@@ -811,6 +844,7 @@ class SQLiteJobStore(
                     ?.split('\n')
                     ?.filter(String::isNotBlank)
                     .orEmpty(),
+                dependencyPinning = DependencyPinning.valueOf(getString("effective_dependency_pinning")),
             )
         },
         latestLogSequence = latestLogSequence,
@@ -838,7 +872,7 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 4
+        const val SCHEMA_VERSION = 5
         val AUDIT_COLUMNS = listOf(
             "gradle_version TEXT",
             "distribution_url TEXT",
@@ -853,6 +887,11 @@ class SQLiteJobStore(
             "effective_recipe_id TEXT",
             "effective_variant_name TEXT",
             "effective_java_major INTEGER",
+        )
+        val PINNING_COLUMNS = listOf(
+            "effective_dependency_pinning TEXT NOT NULL DEFAULT 'NONE'",
+            "dependency_lock_pre_sha256 TEXT",
+            "dependency_lock_post_sha256 TEXT",
         )
     }
 }

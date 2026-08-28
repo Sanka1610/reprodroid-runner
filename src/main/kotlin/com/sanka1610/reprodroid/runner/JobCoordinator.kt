@@ -279,7 +279,15 @@ internal class JobCoordinator(
             ?: throw TrustedBuildFailure("RECIPE_NOT_FOUND", "The persisted repository no longer has an allowlisted recipe.")
         when (job.state) {
             JobState.CREATED -> {
-                if (!store.beginResolvingRealJob(job.jobId, recipe)) return
+                val beganResolving = try {
+                    store.beginResolvingRealJob(job.jobId, recipe)
+                } catch (_: Throwable) {
+                    throw TrustedBuildFailure(
+                        "DEPENDENCY_LOCK_AUDIT_PERSISTENCE_FAILED",
+                        "Runner could not persist the effective dependency pinning policy.",
+                    )
+                }
+                if (!beganResolving) return
                 val resolvedCommit = sourceResolver.resolve(recipe, job.revision, job.jobId)
                 store.awaitRealConfirmation(job.jobId, resolvedCommit)
             }
