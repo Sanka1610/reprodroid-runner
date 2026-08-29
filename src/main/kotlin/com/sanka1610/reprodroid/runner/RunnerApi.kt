@@ -37,6 +37,8 @@ class ApiException(
         fun artifactNotFound() =
             ApiException(HttpStatusCode.NotFound, "ARTIFACT_NOT_FOUND", "The requested artifact does not exist.")
         fun conflict(code: String, message: String) = ApiException(HttpStatusCode.Conflict, code, message)
+        fun internalServerError(code: String, message: String) =
+            ApiException(HttpStatusCode.InternalServerError, code, message)
     }
 }
 
@@ -134,6 +136,14 @@ fun Application.runnerModule(config: RunnerConfig) {
             }
             get("/jobs/{jobId}/build-environment-manifest") {
                 call.respond(coordinator.buildEnvironmentManifest(call.requiredJobId()))
+            }
+            get("/jobs/{jobId}/source-scan") {
+                call.respond(coordinator.sourceScan(call.requiredJobId()))
+            }
+            post("/jobs/{jobId}/source-scan/continue") {
+                val request = call.receive<ContinueSourceScanRequest>()
+                coordinator.continueSourceScan(call.requiredJobId(), request)
+                call.respond(HttpStatusCode.NoContent)
             }
             get("/jobs/{jobId}/artifacts/{artifactId}/content") {
                 val artifactId = call.parameters["artifactId"]?.takeIf(String::isNotBlank)

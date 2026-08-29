@@ -106,6 +106,9 @@ internal class JobCoordinator(
 
     init {
         store.markRunningJobsInterrupted()
+        store.listResumableSourceScanJobIds().forEach { jobId ->
+            check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting resumed work." }
+        }
         scope.launch {
             for (jobId in queuedJobIds) {
                 val worker = launch(start = CoroutineStart.LAZY) { runJob(jobId) }
@@ -145,6 +148,59 @@ internal class JobCoordinator(
 
     fun buildEnvironmentManifest(jobId: String): BuildEnvironmentManifestResponse =
         buildManifestPublisher.publicManifest(jobId)
+
+    fun sourceScan(jobId: String): SourceScanDetailResponse {
+        store.getStoredJob(jobId) ?: throw ApiException.notFound()
+        return store.getSourceScan(jobId) ?: throw ApiException.conflict(
+            code = "SOURCE_SCAN_NOT_AVAILABLE",
+            message = "Source scan evidence is not available for this job.",
+        )
+    }
+
+    fun continueSourceScan(jobId: String, request: ContinueSourceScanRequest) {
+        if (!request.riskAcknowledged) {
+            throw ApiException.forbidden(
+                code = "SOURCE_SCAN_RISK_ACKNOWLEDGEMENT_REQUIRED",
+                message = "Explicit acknowledgement of the reported source indicators is required.",
+            )
+        }
+        if (!request.scanResultSha256.matches(Regex("[0-9a-f]{64}"))) {
+            throw ApiException.conflict(
+                code = "SOURCE_SCAN_REVIEW_DIGEST_MISMATCH",
+                message = "The source scan review digest does not match the stored result.",
+            )
+        }
+        val result = try {
+            store.reviewSourceScan(jobId, request.scanResultSha256)
+        } catch (_: Throwable) {
+            store.failIfActive(
+                jobId = jobId,
+                error = JobError("SOURCE_SCAN_PERSISTENCE_FAILED", "The source scan review could not be persisted."),
+                logMessage = "Source scan review persistence failed; the build was not started.",
+            )
+            throw ApiException.internalServerError(
+                code = "SOURCE_SCAN_PERSISTENCE_FAILED",
+                message = "The source scan review could not be persisted.",
+            )
+        }
+        when (result) {
+            ReviewSourceScanResult.NOT_FOUND -> throw ApiException.notFound()
+            ReviewSourceScanResult.DIGEST_MISMATCH -> throw ApiException.conflict(
+                code = "SOURCE_SCAN_REVIEW_DIGEST_MISMATCH",
+                message = "The source scan review digest does not match the stored result.",
+            )
+            ReviewSourceScanResult.NOT_REQUIRED,
+            ReviewSourceScanResult.RACE,
+            -> throw ApiException.conflict(
+                code = "SOURCE_SCAN_REVIEW_NOT_REQUIRED",
+                message = "This job is not awaiting source scan review.",
+            )
+            ReviewSourceScanResult.SUCCESS -> {
+                store.appendLog(jobId, LogLevel.WARN, "Client acknowledged the source scan findings for the stored result digest.")
+                check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting resumed work." }
+            }
+        }
+    }
 
     fun confirm(jobId: String, request: ConfirmJobRequest) {
         val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()

@@ -32,6 +32,21 @@ internal data class StoredBuildManifestAudit(
     val sha256: String,
 )
 
+internal data class StoredSourceScan(
+    val detail: SourceScanDetailResponse,
+    val canonicalBytes: ByteArray,
+    val requiresReview: Boolean,
+    val reviewed: Boolean,
+)
+
+internal enum class ReviewSourceScanResult {
+    SUCCESS,
+    NOT_FOUND,
+    NOT_REQUIRED,
+    DIGEST_MISMATCH,
+    RACE,
+}
+
 internal enum class CancelJobResult {
     CANCELLED,
     NOT_FOUND,
@@ -114,6 +129,7 @@ class SQLiteJobStore(
                 result.toJobResponse(
                     latestLogSequence = latestLogSequence(connection, jobId),
                     artifacts = listArtifacts(connection, jobId),
+                    sourceScan = sourceScanSummary(connection, jobId, result),
                 )
             }
         }
@@ -325,6 +341,195 @@ class SQLiteJobStore(
                 val sha256 = result.getString("manifest_sha256") ?: return@use null
                 StoredBuildManifestAudit(relativePath, sha256)
             }
+        }
+    }
+
+    @Synchronized
+    internal fun recordSourceScanResult(result: SourceScanResult): Boolean = connection().use { connection ->
+        connection.autoCommit = false
+        try {
+            val jobId = result.detail.jobId
+            val currentState = connection.prepareStatement("SELECT state FROM jobs WHERE job_id = ?").use { statement ->
+                statement.setString(1, jobId)
+                statement.executeQuery().use { rows ->
+                    if (!rows.next()) return@use null
+                    JobState.valueOf(rows.getString(1))
+                }
+            }
+            if (currentState != JobState.SCANNING_SOURCE) {
+                connection.rollback()
+                return@use false
+            }
+            connection.prepareStatement("DELETE FROM source_scan_results WHERE job_id = ?").use { statement ->
+                statement.setString(1, jobId)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                """
+                INSERT INTO source_scan_results (
+                    job_id, schema_version, resolved_commit_sha, scanner_version, result_sha256,
+                    canonical_json, scanned_files, scanned_bytes, skipped_binary_files,
+                    skipped_symlinks, finding_count, requires_review, reviewed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, jobId)
+                statement.setInt(2, result.detail.schemaVersion)
+                statement.setString(3, result.detail.resolvedCommitSha)
+                statement.setString(4, result.detail.scannerVersion)
+                statement.setString(5, result.detail.resultSha256)
+                statement.setBytes(6, result.canonicalBytes)
+                statement.setInt(7, result.detail.summary.scannedFiles)
+                statement.setLong(8, result.detail.summary.scannedBytes)
+                statement.setInt(9, result.detail.summary.skippedBinaryFiles)
+                statement.setInt(10, result.detail.summary.skippedSymlinks)
+                statement.setInt(11, result.detail.summary.findingCount)
+                statement.setInt(12, if (result.requiresReview) 1 else 0)
+                statement.executeUpdate()
+            }
+            result.detail.detectorCounts.forEach { count ->
+                connection.prepareStatement(
+                    "INSERT INTO source_scan_detector_counts (job_id, detector_id, finding_count) VALUES (?, ?, ?)",
+                ).use { statement ->
+                    statement.setString(1, jobId)
+                    statement.setString(2, count.detectorId.name)
+                    statement.setInt(3, count.count)
+                    statement.executeUpdate()
+                }
+            }
+            result.detail.findings.forEachIndexed { ordinal, finding ->
+                connection.prepareStatement(
+                    """
+                    INSERT INTO source_scan_findings (job_id, ordinal, detector_id, display_path, line, column_number)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """.trimIndent(),
+                ).use { statement ->
+                    statement.setString(1, jobId)
+                    statement.setInt(2, ordinal)
+                    statement.setString(3, finding.detectorId.name)
+                    statement.setString(4, finding.displayPath)
+                    finding.line?.let { statement.setInt(5, it) } ?: statement.setNull(5, java.sql.Types.INTEGER)
+                    finding.column?.let { statement.setInt(6, it) } ?: statement.setNull(6, java.sql.Types.INTEGER)
+                    statement.executeUpdate()
+                }
+            }
+            val nextState = if (result.requiresReview) JobState.AWAITING_SCAN_REVIEW else JobState.VERIFYING_WRAPPER
+            val nextProgress = if (result.requiresReview) 35 else 40
+            val updated = connection.prepareStatement(
+                """
+                UPDATE jobs SET state = ?, progress_percent = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, nextState.name)
+                statement.setInt(2, nextProgress)
+                statement.setString(3, Instant.now(clock).toString())
+                statement.setString(4, jobId)
+                statement.setString(5, JobState.SCANNING_SOURCE.name)
+                statement.executeUpdate() == 1
+            }
+            if (!updated) {
+                connection.rollback()
+                return@use false
+            }
+            connection.commit()
+            true
+        } catch (failure: Throwable) {
+            connection.rollback()
+            throw failure
+        }
+    }
+
+    @Synchronized
+    internal fun getStoredSourceScan(jobId: String): StoredSourceScan? = connection().use { connection ->
+        loadSourceScan(connection, jobId)
+    }
+
+    @Synchronized
+    fun getSourceScan(jobId: String): SourceScanDetailResponse? = getStoredSourceScan(jobId)?.detail
+
+    @Synchronized
+    internal fun reviewSourceScan(jobId: String, resultSha256: String): ReviewSourceScanResult = connection().use { connection ->
+        connection.autoCommit = false
+        try {
+            val row = connection.prepareStatement(
+                """
+                SELECT j.state, s.result_sha256, s.requires_review, s.reviewed
+                FROM jobs j LEFT JOIN source_scan_results s ON s.job_id = j.job_id
+                WHERE j.job_id = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, jobId)
+                statement.executeQuery().use { rows ->
+                    if (!rows.next()) return@use null
+                    ReviewRow(
+                        state = JobState.valueOf(rows.getString("state")),
+                        resultSha256 = rows.getString("result_sha256"),
+                        requiresReview = rows.getInt("requires_review") != 0,
+                        reviewed = rows.getInt("reviewed") != 0,
+                    )
+                }
+            } ?: run {
+                connection.rollback()
+                return@use ReviewSourceScanResult.NOT_FOUND
+            }
+            if (row.state != JobState.AWAITING_SCAN_REVIEW || row.resultSha256 == null || !row.requiresReview || row.reviewed) {
+                connection.rollback()
+                return@use ReviewSourceScanResult.NOT_REQUIRED
+            }
+            if (row.resultSha256 != resultSha256) {
+                connection.rollback()
+                return@use ReviewSourceScanResult.DIGEST_MISMATCH
+            }
+            val now = Instant.now(clock).toString()
+            val reviewed = connection.prepareStatement(
+                """
+                UPDATE source_scan_results SET reviewed = 1, reviewed_digest = ?, reviewed_at = ?
+                WHERE job_id = ? AND reviewed = 0 AND result_sha256 = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, resultSha256)
+                statement.setString(2, now)
+                statement.setString(3, jobId)
+                statement.setString(4, resultSha256)
+                statement.executeUpdate() == 1
+            }
+            val queued = reviewed && connection.prepareStatement(
+                """
+                UPDATE jobs SET state = ?, progress_percent = 38, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, JobState.QUEUED.name)
+                statement.setString(2, now)
+                statement.setString(3, jobId)
+                statement.setString(4, JobState.AWAITING_SCAN_REVIEW.name)
+                statement.executeUpdate() == 1
+            }
+            if (!queued) {
+                connection.rollback()
+                return@use ReviewSourceScanResult.RACE
+            }
+            connection.commit()
+            ReviewSourceScanResult.SUCCESS
+        } catch (failure: Throwable) {
+            connection.rollback()
+            throw failure
+        }
+    }
+
+    @Synchronized
+    internal fun listResumableSourceScanJobIds(): List<String> = connection().use { connection ->
+        connection.prepareStatement(
+            """
+            SELECT j.job_id FROM jobs j
+            JOIN source_scan_results s ON s.job_id = j.job_id
+            WHERE j.state = ? AND s.requires_review = 1 AND s.reviewed = 1
+            ORDER BY j.created_at
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, JobState.QUEUED.name)
+            statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
         }
     }
 
@@ -552,10 +757,12 @@ class SQLiteJobStore(
             JobState.RESOLVING_SOURCE,
             JobState.QUEUED,
             JobState.CLONING,
+            JobState.SCANNING_SOURCE,
             JobState.VERIFYING_WRAPPER,
             JobState.BUILDING,
             JobState.DISCOVERING_ARTIFACTS,
         )
+        val resumable = listResumableSourceScanJobIds().toSet()
         val interrupted = connection().use { connection ->
             val placeholders = interruptibleStates.joinToString(",") { "?" }
             connection.prepareStatement(
@@ -566,7 +773,9 @@ class SQLiteJobStore(
                 }
                 statement.executeQuery().use { result ->
                     buildList {
-                        while (result.next()) add(result.getString("job_id"))
+                        while (result.next()) {
+                            result.getString("job_id").takeUnless(resumable::contains)?.let(::add)
+                        }
                     }
                 }
             }
@@ -644,6 +853,50 @@ class SQLiteJobStore(
                             manifest_sha256 TEXT,
                             created_at TEXT NOT NULL,
                             updated_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS source_scan_results (
+                            job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+                            schema_version INTEGER NOT NULL,
+                            resolved_commit_sha TEXT NOT NULL,
+                            scanner_version TEXT NOT NULL,
+                            result_sha256 TEXT NOT NULL,
+                            canonical_json BLOB NOT NULL,
+                            scanned_files INTEGER NOT NULL,
+                            scanned_bytes INTEGER NOT NULL,
+                            skipped_binary_files INTEGER NOT NULL,
+                            skipped_symlinks INTEGER NOT NULL,
+                            finding_count INTEGER NOT NULL,
+                            requires_review INTEGER NOT NULL,
+                            reviewed INTEGER NOT NULL,
+                            reviewed_digest TEXT,
+                            reviewed_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS source_scan_detector_counts (
+                            job_id TEXT NOT NULL REFERENCES source_scan_results(job_id) ON DELETE CASCADE,
+                            detector_id TEXT NOT NULL,
+                            finding_count INTEGER NOT NULL,
+                            PRIMARY KEY (job_id, detector_id)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS source_scan_findings (
+                            job_id TEXT NOT NULL REFERENCES source_scan_results(job_id) ON DELETE CASCADE,
+                            ordinal INTEGER NOT NULL,
+                            detector_id TEXT NOT NULL,
+                            display_path TEXT NOT NULL,
+                            line INTEGER,
+                            column_number INTEGER,
+                            PRIMARY KEY (job_id, ordinal)
                         )
                         """.trimIndent(),
                     )
@@ -812,6 +1065,131 @@ class SQLiteJobStore(
             }
         }
 
+    private fun sourceScanSummary(connection: Connection, jobId: String, jobRow: ResultSet): SourceScanSummaryResponse? {
+        val stored = loadSourceScan(connection, jobId)
+        if (stored != null) {
+            return SourceScanSummaryResponse(
+                status = SourceScanStatus.COMPLETED,
+                scannerVersion = stored.detail.scannerVersion,
+                resultSha256 = stored.detail.resultSha256,
+                scannedFiles = stored.detail.summary.scannedFiles,
+                scannedBytes = stored.detail.summary.scannedBytes,
+                findingCount = stored.detail.summary.findingCount,
+                requiresReview = stored.requiresReview,
+                reviewed = stored.reviewed,
+            )
+        }
+        val state = JobState.valueOf(jobRow.getString("state"))
+        if (state == JobState.SCANNING_SOURCE) {
+            return SourceScanSummaryResponse(SourceScanStatus.SCANNING, SOURCE_SCANNER_VERSION)
+        }
+        val errorCode = jobRow.getString("error_code")
+        if (state == JobState.FAILED && errorCode?.startsWith("SOURCE_SCAN_") == true) {
+            return SourceScanSummaryResponse(SourceScanStatus.FAILED, SOURCE_SCANNER_VERSION)
+        }
+        return null
+    }
+
+    private fun loadSourceScan(connection: Connection, jobId: String): StoredSourceScan? {
+        val header = connection.prepareStatement(
+            """
+            SELECT schema_version, resolved_commit_sha, scanner_version, result_sha256, canonical_json,
+                   scanned_files, scanned_bytes, skipped_binary_files, skipped_symlinks, finding_count,
+                   requires_review, reviewed
+            FROM source_scan_results WHERE job_id = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { rows ->
+                if (!rows.next()) return null
+                SourceScanHeader(
+                    schemaVersion = rows.getInt("schema_version"),
+                    resolvedCommitSha = rows.getString("resolved_commit_sha"),
+                    scannerVersion = rows.getString("scanner_version"),
+                    resultSha256 = rows.getString("result_sha256"),
+                    canonicalBytes = rows.getBytes("canonical_json"),
+                    summary = SourceScanStatistics(
+                        scannedFiles = rows.getInt("scanned_files"),
+                        scannedBytes = rows.getLong("scanned_bytes"),
+                        skippedBinaryFiles = rows.getInt("skipped_binary_files"),
+                        skippedSymlinks = rows.getInt("skipped_symlinks"),
+                        findingCount = rows.getInt("finding_count"),
+                    ),
+                    requiresReview = rows.getInt("requires_review") != 0,
+                    reviewed = rows.getInt("reviewed") != 0,
+                )
+            }
+        }
+        val counts = connection.prepareStatement(
+            "SELECT detector_id, finding_count FROM source_scan_detector_counts WHERE job_id = ? ORDER BY detector_id",
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { rows ->
+                buildList {
+                    while (rows.next()) {
+                        add(SourceScanDetectorCount(SourceScanDetectorId.valueOf(rows.getString(1)), rows.getInt(2)))
+                    }
+                }
+            }
+        }
+        val findings = connection.prepareStatement(
+            """
+            SELECT detector_id, display_path, line, column_number
+            FROM source_scan_findings WHERE job_id = ? ORDER BY ordinal
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { rows ->
+                buildList {
+                    while (rows.next()) {
+                        val line = rows.getInt("line").takeUnless { rows.wasNull() }
+                        val column = rows.getInt("column_number").takeUnless { rows.wasNull() }
+                        add(
+                            SourceScanFinding(
+                                SourceScanDetectorId.valueOf(rows.getString("detector_id")),
+                                rows.getString("display_path"),
+                                line,
+                                column,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        val reconstructedCanonicalBytes = canonicalSourceScanBytes(
+            schemaVersion = header.schemaVersion,
+            resolvedCommitSha = header.resolvedCommitSha,
+            scannerVersion = header.scannerVersion,
+            summary = header.summary,
+            detectorCounts = counts,
+            findings = findings,
+        )
+        if (
+            !header.canonicalBytes.contentEquals(reconstructedCanonicalBytes) ||
+            sourceScanSha256(header.canonicalBytes) != header.resultSha256
+        ) {
+            throw TrustedBuildFailure(
+                "SOURCE_SCAN_INVALID",
+                "Stored source scan evidence failed integrity verification.",
+            )
+        }
+        return StoredSourceScan(
+            detail = SourceScanDetailResponse(
+                schemaVersion = header.schemaVersion,
+                jobId = jobId,
+                resolvedCommitSha = header.resolvedCommitSha,
+                scannerVersion = header.scannerVersion,
+                resultSha256 = header.resultSha256,
+                summary = header.summary,
+                detectorCounts = counts,
+                findings = findings,
+            ),
+            canonicalBytes = header.canonicalBytes,
+            requiresReview = header.requiresReview,
+            reviewed = header.reviewed,
+        )
+    }
+
     private fun ResultSet.toStoredJob(): StoredJob = StoredJob(
         jobId = getString("job_id"),
         executionMode = ExecutionMode.valueOf(getString("execution_mode")),
@@ -838,6 +1216,7 @@ class SQLiteJobStore(
     private fun ResultSet.toJobResponse(
         latestLogSequence: Long,
         artifacts: List<ArtifactMetadata>,
+        sourceScan: SourceScanSummaryResponse?,
     ): JobResponse = JobResponse(
         jobId = getString("job_id"),
         executionMode = ExecutionMode.valueOf(getString("execution_mode")),
@@ -868,6 +1247,7 @@ class SQLiteJobStore(
                 ),
             )
         },
+        sourceScan = sourceScan,
         latestLogSequence = latestLogSequence,
         artifacts = artifacts,
         error = getString("error_code")?.let { code ->
@@ -892,8 +1272,27 @@ class SQLiteJobStore(
         val progressPercent: Int,
     )
 
+    private data class ReviewRow(
+        val state: JobState,
+        val resultSha256: String?,
+        val requiresReview: Boolean,
+        val reviewed: Boolean,
+    )
+
+    private data class SourceScanHeader(
+        val schemaVersion: Int,
+        val resolvedCommitSha: String,
+        val scannerVersion: String,
+        val resultSha256: String,
+        val canonicalBytes: ByteArray,
+        val summary: SourceScanStatistics,
+        val requiresReview: Boolean,
+        val reviewed: Boolean,
+    )
+
     private companion object {
-        const val SCHEMA_VERSION = 6
+        const val SCHEMA_VERSION = 7
+        const val SOURCE_SCANNER_VERSION = "reprodroid-static-v1"
         val AUDIT_COLUMNS = listOf(
             "gradle_version TEXT",
             "distribution_url TEXT",

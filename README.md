@@ -4,9 +4,9 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v6 です。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v7 です。
 
-Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。Phase 3Cではfixed recipeへtyped determinism blockを追加し、recipe literalの`SOURCE_DATE_EPOCH`、Gradleの`--no-build-cache`、`C.UTF-8`の`LANG`／`LC_ALL`をGradle processと子processだけへ適用します。effective値はSQLite v6、Job API、private Manifest v3／public v2へ保存し、historical private v2／public v1を未設定値に限って読み取ります。既存MicroG-RE recipeはpinning `none`、determinism未設定のままです。3D／3E のstatic scanとDocker sandbox feasibilityは未実装です。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE 確認境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md)、[ADR-0015](../reprodroid-project/docs/adr/0015-recipe-determinism-options.md)です。
+Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。Phase 3Cではfixed recipeへtyped determinism blockを追加し、recipe literalの`SOURCE_DATE_EPOCH`、Gradleの`--no-build-cache`、`C.UTF-8`の`LANG`／`LC_ALL`をGradle processと子processだけへ適用します。effective値はSQLite v6、Job API、private Manifest v3／public v2へ保存し、historical private v2／public v1を未設定値に限って読み取ります。Phase 3Dではdetached checkout後・Wrapper／Gradle前のin-process static source scan、条件付きreview gate、SQLite v7、bounded detail／continue APIを実装しました。既存MicroG-RE recipeはpinning `none`、determinism未設定のままです。3EのDocker sandbox feasibilityは未実装です。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE／scan review境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md)、[ADR-0015](../reprodroid-project/docs/adr/0015-recipe-determinism-options.md)、[ADR-0016](../reprodroid-project/docs/adr/0016-pre-build-static-source-scan.md)です。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -29,6 +29,10 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 - `LOCKFILE_OFFLINE`に限定したGradle `--offline`固定option
 - recipe固定のepoch／Gradle Build Cache policy／`C.UTF-8` localeとSQLite v6監査保存
 - Gradle processと子processだけへの決定性option適用、locale availability preflight
+- detached checkout後・SDK／Wrapper／Gradle前のfixed in-process source scanner
+- `.git`除外、symlink非追跡、strict UTF-8／Unicode path integrity、resource／timeout上限のfail-closed検査
+- finding 1件以上で停止する`AWAITING_SCAN_REVIEW`とJob／digest単位のcontinue gate
+- canonical scan result、detector count、finding、review bindを保存するSQLite v7
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 
@@ -115,7 +119,7 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 
 ## Jobと永続化
 
-SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、dependency pinning、effective determinism、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。これは private audit record であり、現行 API から直接配信しません。既存schemaは起動時にv6へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
+SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、dependency pinning、effective determinism、scan result／review、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。これは private audit record であり、現行 API から直接配信しません。既存schemaは起動時にv7へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
 
 Runner再起動時、実行途中だったJobは自動再実行せず`INTERRUPTED`へ移します。
 
@@ -127,6 +131,8 @@ RESOLVING_SOURCE
 AWAITING_CONFIRMATION
 QUEUED
 CLONING
+SCANNING_SOURCE
+AWAITING_SCAN_REVIEW
 VERIFYING_WRAPPER
 BUILDING
 DISCOVERING_ARTIFACTS
@@ -142,6 +148,7 @@ INTERRUPTED
 
 - Job作成・取得
 - 実ビルド確認
+- source scan detail取得とreview済みdigestへのcontinue
 - ログ差分取得
 - cancel・retry
 - APK候補一覧
@@ -155,6 +162,10 @@ Phase 3A の `GET /v1/jobs/{jobId}/build-environment-manifest` は、成功し�
 Phase 3Bの`GET /v1/jobs/{jobId}`は、`effectiveBuild.dependencyPinning`を常に明示します。許可値は`NONE`、`LOCKFILE`、`LOCKFILE_OFFLINE`で、Android requestからは指定できません。lockfile path／contentとprivate pre/post SHA-256はpublic APIへ返しません。error codeとlegacy互換性は[Runner API v1](../reprodroid-project/docs/api/runner-api.md)を参照してください。
 
 Phase 3Cの同endpointは`effectiveBuild.determinism`を常に明示します。epochはnullable非負Unix seconds、`noBuildCache`はboolean、localeはnullableの`C.UTF-8`だけです。新規private Manifest v3は同じeffective objectを必須とし、public schema v2へ投影します。SQLite値との不一致、v3 object欠落、設定済みJobに対する旧private v2は`BUILD_MANIFEST_INVALID`です。`SOURCE_DATE_EPOCH`の存在は全build toolによる利用を、`--no-build-cache`はGradle Build Cache以外のcache無効化を、locale固定は再現性を保証しません。
+
+Phase 3Dは`GET /v1/jobs/{jobId}`へcompact `sourceScan` summaryを加え、`GET /v1/jobs/{jobId}/source-scan`で最大5,000件のdetector count／findingを返します。`POST /v1/jobs/{jobId}/source-scan/continue`は保存済みresult digestへreviewをbindし、同じclean workspaceのJobだけを再開します。source本文、snippet、absolute path、workspace、HOME、environmentは公開しません。SQLiteからの復元時はcanonical bytesを再構成し、保存bytesとSHA-256の両方が一致しなければ`SOURCE_SCAN_INVALID`でfail closedにします。
+
+2026-08-29のPhase 3D fresh-state E2Eでは、MicroG-RE `6.1.4`のBuild A／Bを別Job・別workspace・別RCE確認・別scan reviewで実行しました。両scanは1,071 files／3,318,959 bytes、binary skip 0、symlink skip 1、121 findings、同一result SHA-256 `a2ac7ddd78fbb17fcbb716b6076459368bad404a5f985cf6cbcf24ca9fa5c92c`でした。両Jobはreview後に成功し、13,258,872 byte／SHA-256 `30de03caea3da52c9febbeebb5d7f0d3246811d288d81b522bb456da19e7b033`のAPKを生成しました。scan findingはraw comparison、trust、update、install policyを変更していません。
 
 ## 初期テスト対象
 
@@ -221,11 +232,10 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 3A〜3C実装後の未実装・対象外
+## Phase 3A〜3D実装後の未実装・対象外
 
 ### Phase 3 で予定するが、まだ実装していないもの
 
-- static source scanner、scan summary API field
 - Docker engine feasibility調査とopt-in sandbox mode
 
 ### Phase 3 の対象外

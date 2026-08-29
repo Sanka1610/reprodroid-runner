@@ -350,6 +350,7 @@ internal class TrustedBuildExecutor(
     private val stateDirectory: Path,
     private val clock: Clock = Clock.systemUTC(),
     private val dependencyLockfileVerifier: DependencyLockfileVerifier = DependencyLockfileVerifier(),
+    private val sourceScanner: SourceScanner = SourceScanner(),
 ) {
     suspend fun execute(job: StoredJob, recipe: BuildRecipe) {
         val resolvedCommit = job.resolvedCommitSha
@@ -359,50 +360,77 @@ internal class TrustedBuildExecutor(
         val homeDirectory = confinedPath(workspace, "home").also(Path::createDirectories)
         val gradleUserHome = confinedPath(workspace, "gradle-user-home").also(Path::createDirectories)
         workspace.createDirectories()
-        if (Files.exists(sourceDirectory)) {
-            throw TrustedBuildFailure("WORKSPACE_ALREADY_EXISTS", "The job workspace already contains a source checkout.")
-        }
         val buildJava = resolveBuildJavaRuntime(recipe)
         val environment = restrictedEnvironment(homeDirectory, gradleUserHome, buildJava.home)
-
-        transition(job.jobId, JobState.CLONING, 25, "Cloning the allowlisted repository without submodules or Git LFS smudging.")
-        runChecked(
-            jobId = job.jobId,
-            command = listOf(
-                "git", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false",
-                "clone", "--no-checkout", "--no-recurse-submodules", "--", recipe.repositoryUrl,
-                sourceDirectory.toString(),
-            ),
-            workingDirectory = workspace,
-            environment = environment,
-            timeout = minOf(recipe.timeout, Duration.ofMinutes(10)),
-            failureCode = "GIT_CLONE_FAILED",
-            outputPrefix = "git",
-        )
-        runChecked(
-            jobId = job.jobId,
-            command = listOf(
-                "git", "-c", "advice.detachedHead=false", "-c", "filter.lfs.smudge=",
-                "-c", "filter.lfs.required=false", "-C", sourceDirectory.toString(),
-                "checkout", "--detach", resolvedCommit,
-            ),
-            workingDirectory = workspace,
-            environment = environment,
-            timeout = Duration.ofMinutes(5),
-            failureCode = "GIT_CHECKOUT_FAILED",
-            outputPrefix = "git",
-        )
-        val actualCommit = captureChecked(
-            command = listOf("git", "-C", sourceDirectory.toString(), "rev-parse", "HEAD"),
-            workingDirectory = workspace,
-            environment = environment,
-            timeout = Duration.ofMinutes(1),
-            failureCode = "CHECKOUT_VERIFICATION_FAILED",
-        ).singleOrNull()?.trim()?.lowercase()
-        if (actualCommit != resolvedCommit) {
-            throw TrustedBuildFailure("CHECKOUT_COMMIT_MISMATCH", "Detached checkout does not match the confirmed commit.")
+        val storedScan = store.getStoredSourceScan(job.jobId)
+        if (storedScan?.reviewed == true) {
+            if (!Files.isDirectory(sourceDirectory, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(sourceDirectory)) {
+                throw TrustedBuildFailure("SOURCE_SCAN_INVALID", "The reviewed source checkout is no longer available.")
+            }
+            verifyCheckout(sourceDirectory, workspace, environment, resolvedCommit, requireClean = true)
+            if (storedScan.detail.resolvedCommitSha != resolvedCommit) {
+                throw TrustedBuildFailure("SOURCE_SCAN_INVALID", "The stored source scan is not bound to the confirmed commit.")
+            }
+            store.appendLog(job.jobId, LogLevel.INFO, "Reviewed source scan restored for the unchanged detached checkout.")
+        } else {
+            if (storedScan != null || Files.exists(sourceDirectory, LinkOption.NOFOLLOW_LINKS)) {
+                throw TrustedBuildFailure("WORKSPACE_ALREADY_EXISTS", "The job workspace already contains unexpected source state.")
+            }
+            transition(job.jobId, JobState.CLONING, 25, "Cloning the allowlisted repository without submodules or Git LFS smudging.")
+            runChecked(
+                jobId = job.jobId,
+                command = listOf(
+                    "git", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false",
+                    "clone", "--no-checkout", "--no-recurse-submodules", "--", recipe.repositoryUrl,
+                    sourceDirectory.toString(),
+                ),
+                workingDirectory = workspace,
+                environment = environment,
+                timeout = minOf(recipe.timeout, Duration.ofMinutes(10)),
+                failureCode = "GIT_CLONE_FAILED",
+                outputPrefix = "git",
+            )
+            runChecked(
+                jobId = job.jobId,
+                command = listOf(
+                    "git", "-c", "advice.detachedHead=false", "-c", "filter.lfs.smudge=",
+                    "-c", "filter.lfs.required=false", "-C", sourceDirectory.toString(),
+                    "checkout", "--detach", resolvedCommit,
+                ),
+                workingDirectory = workspace,
+                environment = environment,
+                timeout = Duration.ofMinutes(5),
+                failureCode = "GIT_CHECKOUT_FAILED",
+                outputPrefix = "git",
+            )
+            verifyCheckout(sourceDirectory, workspace, environment, resolvedCommit, requireClean = false)
+            store.appendLog(job.jobId, LogLevel.INFO, "Detached checkout verified at commit $resolvedCommit.")
+            transition(job.jobId, JobState.SCANNING_SOURCE, 32, "Scanning the detached checkout with reprodroid-static-v1 before SDK and Wrapper verification.")
+            val scanResult = sourceScanner.scan(job.jobId, sourceDirectory, resolvedCommit)
+            val persisted = try {
+                store.recordSourceScanResult(scanResult)
+            } catch (_: Throwable) {
+                throw TrustedBuildFailure(
+                    "SOURCE_SCAN_PERSISTENCE_FAILED",
+                    "Runner could not persist the source scan result atomically.",
+                )
+            }
+            if (!persisted) throw CancellationException("Job changed state before the source scan result was persisted.")
+            store.appendLog(
+                job.jobId,
+                LogLevel.INFO,
+                "Source scan completed: ${scanResult.detail.summary.scannedFiles} files, " +
+                    "${scanResult.detail.summary.findingCount} finding(s), result SHA-256 ${scanResult.detail.resultSha256}.",
+            )
+            if (scanResult.requiresReview) {
+                store.appendLog(
+                    job.jobId,
+                    LogLevel.WARN,
+                    "Build paused before SDK and Wrapper verification until the client reviews the source scan findings.",
+                )
+                return
+            }
         }
-        store.appendLog(job.jobId, LogLevel.INFO, "Detached checkout verified at commit $resolvedCommit.")
         val validatedAndroidSdk = validateAndroidSdkEnvironment(environment, recipe)
         store.appendLog(
             job.jobId,
@@ -597,6 +625,40 @@ internal class TrustedBuildExecutor(
         if (!registered) {
             deleteStoredArtifacts(storedArtifacts)
             throw CancellationException("Job became terminal before APK artifacts were registered.")
+        }
+    }
+
+    private suspend fun verifyCheckout(
+        sourceDirectory: Path,
+        workspace: Path,
+        environment: Map<String, String>,
+        resolvedCommit: String,
+        requireClean: Boolean,
+    ) {
+        val actualCommit = captureChecked(
+            command = listOf("git", "-C", sourceDirectory.toString(), "rev-parse", "HEAD"),
+            workingDirectory = workspace,
+            environment = environment,
+            timeout = Duration.ofMinutes(1),
+            failureCode = "CHECKOUT_VERIFICATION_FAILED",
+        ).singleOrNull()?.trim()?.lowercase()
+        if (actualCommit != resolvedCommit) {
+            throw TrustedBuildFailure("CHECKOUT_COMMIT_MISMATCH", "Detached checkout does not match the confirmed commit.")
+        }
+        if (requireClean) {
+            val changes = captureChecked(
+                command = listOf(
+                    "git", "-C", sourceDirectory.toString(), "status", "--porcelain=v1",
+                    "--untracked-files=all", "--ignored=matching",
+                ),
+                workingDirectory = workspace,
+                environment = environment,
+                timeout = Duration.ofMinutes(1),
+                failureCode = "SOURCE_SCAN_INVALID",
+            )
+            if (changes.isNotEmpty()) {
+                throw TrustedBuildFailure("SOURCE_SCAN_INVALID", "The reviewed source checkout changed before build resume.")
+            }
         }
     }
 

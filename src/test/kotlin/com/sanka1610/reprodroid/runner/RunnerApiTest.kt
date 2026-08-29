@@ -24,10 +24,55 @@ import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Path
 import java.nio.file.Files
 import java.sql.DriverManager
+import kotlin.io.path.createDirectories
+import kotlin.io.path.writeText
 
 class RunnerApiTest {
     @TempDir
     lateinit var stateDirectory: Path
+
+    @Test
+    fun `source scan raw json is complete and review is digest bound`() = testApplication {
+        val store = SQLiteJobStore(stateDirectory)
+        val created = store.createJob(
+            CreateJobRequest(
+                executionMode = ExecutionMode.REAL_TRUSTED,
+                repositoryUrl = "https://github.com/MorpheApp/MicroG-RE.git",
+                revision = RequestedRevision(RevisionType.COMMIT, SOURCE_SCAN_COMMIT),
+            ),
+        )
+        assertTrue(store.updateState(created.jobId, JobState.SCANNING_SOURCE, 32))
+        val checkout = stateDirectory.resolve("scan-fixture").also(Path::createDirectories)
+        checkout.resolve("build.gradle.kts").writeText("val process = ProcessBuilder(\"true\")")
+        val scan = SourceScanner().scan(created.jobId, checkout, SOURCE_SCAN_COMMIT)
+        assertTrue(store.recordSourceScanResult(scan))
+        application { runnerModule(testConfig()) }
+        val client = createClient {
+            install(ContentNegotiation) { json(Json { ignoreUnknownKeys = false; explicitNulls = false }) }
+        }
+
+        val rawJob = client.get("/v1/jobs/${created.jobId}")
+        assertEquals(HttpStatusCode.OK, rawJob.status)
+        val rawJobText = rawJob.bodyAsBytes().toString(Charsets.UTF_8)
+        assertTrue(rawJobText.contains("\"sourceScan\":{"))
+        assertTrue(rawJobText.contains("\"status\":\"COMPLETED\""))
+        assertTrue(rawJobText.contains("\"resultSha256\":\"${scan.detail.resultSha256}\""))
+
+        val detail = client.get("/v1/jobs/${created.jobId}/source-scan")
+        assertEquals(HttpStatusCode.OK, detail.status)
+        val rawDetail = detail.bodyAsBytes().toString(Charsets.UTF_8)
+        assertTrue(rawDetail.contains("\"schemaVersion\":1"))
+        assertTrue(rawDetail.contains("\"scannerVersion\":\"reprodroid-static-v1\""))
+        assertFalse(rawDetail.contains("ProcessBuilder"))
+        assertFalse(rawDetail.contains(stateDirectory.toString()))
+
+        val rejected = client.post("/v1/jobs/${created.jobId}/source-scan/continue") {
+            contentType(ContentType.Application.Json)
+            setBody(ContinueSourceScanRequest(scan.detail.resultSha256, riskAcknowledged = false))
+        }
+        assertEquals(HttpStatusCode.Forbidden, rejected.status)
+        assertEquals("SOURCE_SCAN_RISK_ACKNOWLEDGEMENT_REQUIRED", rejected.body<ApiErrorResponse>().code)
+    }
 
     @Test
     fun `simulated success persists progress logs and artifact metadata`() = testApplication {
@@ -327,7 +372,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(6, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(7, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
@@ -372,7 +417,7 @@ class RunnerApiTest {
         val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute("PRAGMA user_version = 7")
+                statement.execute("PRAGMA user_version = 8")
             }
         }
 
@@ -397,7 +442,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(6, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(7, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
@@ -409,6 +454,10 @@ class RunnerApiTest {
                 )
             }
         }
+    }
+
+    private companion object {
+        const val SOURCE_SCAN_COMMIT = "0123456789abcdef0123456789abcdef01234567"
     }
 
     private fun testConfig() = RunnerConfig(
