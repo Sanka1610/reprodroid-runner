@@ -6,6 +6,8 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -85,38 +87,58 @@ internal class JobCoordinator(
     processExecutor: ProcessExecutor = SystemProcessExecutor(),
     sourceResolver: SourceResolver? = null,
     wrapperVerifier: WrapperVerifier = WrapperVerifier(),
+    private val buildSandbox: BuildSandboxMode = BuildSandboxMode.HOST,
+    recoveryEngine: SandboxRecoveryEngine? = null,
+    dockerControl: DockerControl? = null,
 ) : Closeable {
     internal data class ArtifactContent(
         val metadata: ArtifactMetadata,
         val path: Path,
     )
 
-    private val scope = CoroutineScope(coroutineContext + SupervisorJob())
+    private val stateLease: SandboxStateLease
+    private val supervisor = SupervisorJob()
+    private val scope = CoroutineScope(coroutineContext + supervisor)
+    private val dockerControl = dockerControl ?: LocalDockerControl(stateDirectory)
+    private val sandboxLifecycle: SandboxLifecycle
     private val queuedJobIds = Channel<String>(Channel.UNLIMITED)
     private val runningJobs = ConcurrentHashMap<String, Job>()
     private val simulatedExecutor = SimulatedBuildExecutor(store, simulationStepDelayMillis)
     private val sourceResolver = sourceResolver ?: GitSourceResolver(processExecutor, store, stateDirectory)
-    private val trustedBuildExecutor = TrustedBuildExecutor(
-        store = store,
-        processExecutor = processExecutor,
-        wrapperVerifier = wrapperVerifier,
-        stateDirectory = stateDirectory,
-    )
+    private val trustedBuildExecutor: TrustedBuildExecutor
     private val buildManifestPublisher = BuildManifestPublisher(store, stateDirectory)
 
     init {
-        store.markRunningJobsInterrupted()
-        store.listResumableSourceScanJobIds().forEach { jobId ->
-            check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting resumed work." }
-        }
-        scope.launch {
-            for (jobId in queuedJobIds) {
-                val worker = launch(start = CoroutineStart.LAZY) { runJob(jobId) }
-                runningJobs[jobId] = worker
-                worker.start()
-                worker.join()
-                runningJobs.remove(jobId, worker)
+        stateLease = SandboxStateLease(stateDirectory)
+        try {
+            sandboxLifecycle = SandboxLifecycle(store, recoveryEngine ?: DockerRecoveryEngine(this.dockerControl), store.sandboxOwnerId())
+            trustedBuildExecutor = TrustedBuildExecutor(
+                store = store,
+                processExecutor = processExecutor,
+                wrapperVerifier = wrapperVerifier,
+                stateDirectory = stateDirectory,
+                dockerExecutor = DockerBuildExecutor(store, sandboxLifecycle, this.dockerControl, processExecutor, stateDirectory),
+            )
+            runBlocking { sandboxLifecycle.recover() }
+            store.markRunningJobsInterrupted(clearArtifactMetadata = !sandboxLifecycle.cleanupPending)
+            store.listResumableSourceScanJobIds().forEach { jobId ->
+                check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting resumed work." }
             }
+            scope.launch {
+                for (jobId in queuedJobIds) {
+                    val worker = launch(start = CoroutineStart.LAZY) { runJob(jobId) }
+                    runningJobs[jobId] = worker
+                    worker.start()
+                    worker.join()
+                    runningJobs.remove(jobId, worker)
+                }
+            }
+        } catch (failure: Throwable) {
+            // A failed constructor has no caller that can close it; release its lease explicitly.
+            queuedJobIds.close()
+            scope.cancel()
+            runCatching { stateLease.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+            throw failure
         }
     }
 
@@ -124,6 +146,9 @@ internal class JobCoordinator(
     fun create(request: CreateJobRequest): CreateJobResponse {
         validate(request)
         if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
+            if (sandboxLifecycle.cleanupPending) {
+                throw ApiException.serviceUnavailable("SANDBOX_CLEANUP_PENDING", "Owned sandbox resources require recovery before real builds can be accepted.")
+            }
             if (!realBuildEnabled) {
                 throw ApiException.forbidden(
                     code = "REAL_BUILD_DISABLED",
@@ -132,7 +157,7 @@ internal class JobCoordinator(
             }
             recipeRegistry.requireAllowed(request.repositoryUrl, request.revision)
         }
-        val response = store.createJob(request)
+        val response = store.createJob(request, buildSandbox)
         check(queuedJobIds.trySend(response.jobId).isSuccess) { "The job queue is not accepting work." }
         return response
     }
@@ -304,8 +329,8 @@ internal class JobCoordinator(
     }
 
     private suspend fun runJob(jobId: String) {
-        val job = store.getStoredJob(jobId) ?: return
         try {
+            val job = store.getStoredJob(jobId) ?: return
             when (job.executionMode) {
                 ExecutionMode.SIMULATED -> {
                     if (!store.markQueuedIfCreated(jobId)) return
@@ -325,12 +350,13 @@ internal class JobCoordinator(
             store.failIfActive(
                 jobId = jobId,
                 error = JobError("INTERNAL_EXECUTION_ERROR", "The job executor failed unexpectedly."),
-                logMessage = failure.message ?: failure::class.simpleName.orEmpty(),
+                logMessage = "The job executor failed unexpectedly; private diagnostics are required.",
             )
         }
     }
 
     private suspend fun runRealJob(job: StoredJob) {
+        if (sandboxLifecycle.cleanupPending) return
         val recipe = recipeRegistry.find(job.repositoryUrl, job.revision)
             ?: throw TrustedBuildFailure("RECIPE_NOT_FOUND", "The persisted repository no longer has an allowlisted recipe.")
         when (job.state) {
@@ -396,7 +422,11 @@ internal class JobCoordinator(
 
     override fun close() {
         queuedJobIds.close()
-        scope.cancel()
+        try {
+            runBlocking { supervisor.cancelAndJoin() }
+        } finally {
+            stateLease.close()
+        }
     }
 
     private companion object {

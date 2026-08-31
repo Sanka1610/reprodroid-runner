@@ -13,6 +13,7 @@ data class RunnerConfig(
     val stateDirectory: Path,
     val simulationStepDelayMillis: Long = 350,
     val realBuildEnabled: Boolean = false,
+    val buildSandbox: BuildSandboxMode = BuildSandboxMode.HOST,
 ) {
     companion object {
         fun fromEnvironment(environment: Map<String, String> = System.getenv()): RunnerConfig {
@@ -46,7 +47,11 @@ data class RunnerConfig(
             val stateDirectory = configuredStateDirectory?.let(::Path) ?: defaultStateDirectory
             val realBuildEnabled = environment["REPRODROID_ENABLE_REAL_BUILDS"]
                 ?.equals("true", ignoreCase = true) == true
-            return RunnerConfig(host, port, stateDirectory, realBuildEnabled = realBuildEnabled)
+            val sandbox = environment["REPRODROID_BUILD_SANDBOX"]?.let { value ->
+                BuildSandboxMode.entries.singleOrNull { it.name == value }
+                    ?: throw IllegalArgumentException("SANDBOX_CONFIG_INVALID: REPRODROID_BUILD_SANDBOX must be HOST or DOCKER.")
+            } ?: BuildSandboxMode.HOST
+            return RunnerConfig(host, port, stateDirectory, realBuildEnabled = realBuildEnabled, buildSandbox = sandbox)
         }
     }
 }
@@ -61,7 +66,8 @@ fun main() {
     }
     if (config.realBuildEnabled) {
         LoggerFactory.getLogger("ReproDroidRunner").warn(
-            "REAL_TRUSTED host execution is enabled. Allowlisted Gradle builds can execute arbitrary code.",
+            "REAL_TRUSTED execution is enabled (sandbox={}). Allowlisted Gradle builds can execute arbitrary code.",
+            config.buildSandbox,
         )
     }
     embeddedServer(

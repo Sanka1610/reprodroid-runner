@@ -37,10 +37,11 @@ class BuildManifestApiTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         val rawResponse = response.bodyAsText()
-        assertTrue(rawResponse.contains("\"schemaVersion\":2"))
+        assertTrue(rawResponse.contains("\"schemaVersion\":3"))
+        assertTrue(rawResponse.contains("\"sandbox\":{\"mode\":\"HOST\"}"))
         assertTrue(rawResponse.contains("\"determinism\":{\"noBuildCache\":false}"))
         val projection = API_JSON.decodeFromString<BuildEnvironmentManifestResponse>(rawResponse)
-        assertEquals(2, projection.schemaVersion)
+        assertEquals(3, projection.schemaVersion)
         assertEquals(DeterminismOptions(noBuildCache = false), projection.determinism)
         assertEquals(COMMIT, projection.commit)
         assertEquals(36, projection.androidSdk)
@@ -76,7 +77,7 @@ class BuildManifestApiTest {
 
     @Test
     fun `returns 410 for internal schema v1`() = testApplication {
-        val seeded = seedManifest { it.copy(schemaVersion = 1) }
+        val seeded = seedManifest(legacy = true) { it.copy(schemaVersion = 1) }
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
         assertEquals(HttpStatusCode.Gone, response.status)
@@ -85,7 +86,7 @@ class BuildManifestApiTest {
 
     @Test
     fun `keeps private schema two compatibility as public schema one`() = testApplication {
-        val seeded = seedManifest { it.copy(schemaVersion = 2, determinism = null) }
+        val seeded = seedManifest(legacy = true) { it.copy(schemaVersion = 2, determinism = null, sandbox = null, controllerJava = null, controllerOperatingSystem = null) }
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
 
@@ -110,7 +111,7 @@ class BuildManifestApiTest {
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
 
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -128,7 +129,7 @@ class BuildManifestApiTest {
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
 
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -163,7 +164,7 @@ class BuildManifestApiTest {
         Files.writeString(seeded.path, "tampered")
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -172,7 +173,7 @@ class BuildManifestApiTest {
         val seeded = seedManifest(rawJson = "{not-json")
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -181,7 +182,7 @@ class BuildManifestApiTest {
         val seeded = seedManifest(relativePath = "outside.json")
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -193,7 +194,7 @@ class BuildManifestApiTest {
         Files.createSymbolicLink(seeded.path, original)
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -204,7 +205,7 @@ class BuildManifestApiTest {
         }
         application { runnerModule(testConfig()) }
         val response = client.get("/v1/jobs/${seeded.jobId}/build-environment-manifest")
-        assertEquals(HttpStatusCode.InternalServerError, response.status)
+        assertEquals(HttpStatusCode.Conflict, response.status)
         assertEquals("BUILD_MANIFEST_INVALID", response.decode<ApiErrorResponse>().code)
     }
 
@@ -256,10 +257,19 @@ class BuildManifestApiTest {
         rawJson: String? = null,
         relativePath: String? = null,
         recipe: BuildRecipe = releaseRecipe(),
+        legacy: Boolean = false,
         transform: (BuildEnvironmentManifest) -> BuildEnvironmentManifest = { it },
     ): SeededManifest {
         val store = SQLiteJobStore(stateDirectory)
         val jobId = store.createJob(realRequest()).jobId
+        if (legacy) {
+            java.sql.DriverManager.getConnection("jdbc:sqlite:${stateDirectory.resolve("reprodroid-runner.sqlite3")}").use { connection ->
+                connection.prepareStatement("UPDATE jobs SET sandbox_origin = 'LEGACY_HOST', manifest_format = 'LEGACY_ALLOWED' WHERE job_id = ?").use {
+                    it.setString(1, jobId)
+                    it.executeUpdate()
+                }
+            }
+        }
         assertTrue(store.beginResolvingRealJob(jobId, recipe))
         assertTrue(store.awaitRealConfirmation(jobId, COMMIT))
         assertTrue(store.confirmRealJob(jobId, COMMIT))
@@ -291,6 +301,9 @@ class BuildManifestApiTest {
                 androidSdkApiLevel = recipe.androidSdkApiLevel,
                 buildToolsVersion = recipe.buildToolsVersion,
                 determinism = recipe.determinism,
+                sandbox = SandboxEvidence(BuildSandboxMode.HOST),
+                controllerJava = PublicJavaRuntime("21.0.12", "Eclipse Adoptium"),
+                controllerOperatingSystem = "private controller OS",
                 wrapper = WrapperVerification(
                     gradleVersion = recipe.gradleVersion,
                     distributionUrl = "https://services.gradle.org/distributions/gradle-8.14.3-bin.zip",
@@ -334,6 +347,7 @@ class BuildManifestApiTest {
         val PRIVATE_JSON = Json {
             prettyPrint = true
             encodeDefaults = true
+            explicitNulls = false
         }
         val API_JSON = Json { ignoreUnknownKeys = false }
     }

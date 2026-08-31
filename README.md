@@ -4,9 +4,9 @@ ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlis
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行 Runner は API v1 と SQLite schema v7 です。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。現行はAPI v1／SQLite v8、Phase 3Eの新規buildはprivate Manifest v4／public v3です。
 
-Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。Phase 3Cではfixed recipeへtyped determinism blockを追加し、recipe literalの`SOURCE_DATE_EPOCH`、Gradleの`--no-build-cache`、`C.UTF-8`の`LANG`／`LC_ALL`をGradle processと子processだけへ適用します。effective値はSQLite v6、Job API、private Manifest v3／public v2へ保存し、historical private v2／public v1を未設定値に限って読み取ります。Phase 3Dではdetached checkout後・Wrapper／Gradle前のin-process static source scan、条件付きreview gate、SQLite v7、bounded detail／continue APIを実装しました。既存MicroG-RE recipeはpinning `none`、determinism未設定のままです。3EのDocker sandbox feasibilityは未実装です。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE／scan review境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md)、[ADR-0015](../reprodroid-project/docs/adr/0015-recipe-determinism-options.md)、[ADR-0016](../reprodroid-project/docs/adr/0016-pre-build-static-source-scan.md)です。
+Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。Phase 3Cではfixed recipeへtyped determinism blockを追加し、recipe literalの`SOURCE_DATE_EPOCH`、Gradleの`--no-build-cache`、`C.UTF-8`の`LANG`／`LC_ALL`をGradle processと子processだけへ適用します。effective値はSQLite v6、Job API、private Manifest v3／public v2へ保存し、historical private v2／public v1を未設定値に限って読み取ります。Phase 3Dではdetached checkout後・Wrapper／Gradle前のin-process static source scan、条件付きreview gate、SQLite v7、bounded detail／continue APIを実装しました。既存MicroG-RE recipeはpinning `none`、determinism未設定のままです。3Eは固定profileのopt-in Docker executor、SQLite v8、private v4／public v3を実装しました。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE／scan review境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md)、[ADR-0015](../reprodroid-project/docs/adr/0015-recipe-determinism-options.md)、[ADR-0016](../reprodroid-project/docs/adr/0016-pre-build-static-source-scan.md)です。
 
 - `127.0.0.1:8080`へbindするKtor HTTP API v1
 - SQLiteへ永続化する単一workerの非同期Jobキュー
@@ -35,6 +35,14 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 - canonical scan result、detector count、finding、review bindを保存するSQLite v7
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
+
+## Phase 3E（固定profileのopt-in実装）
+
+Phase 3Eは[実測](../reprodroid-project/reports/2026/08/2026-08-30-phase-3e-feasibility.md)後に[ADR-0017](../reprodroid-project/docs/adr/0017-docker-build-sandbox-feasibility.md)と[実装契約](../reprodroid-project/reports/2026/08/2026-08-30-phase-3e-contract.md)をAcceptedとしました。検証範囲と制約は[最終受入記録](../reprodroid-project/reports/2026/08/2026-08-31-phase-3e-closeout.md)を参照してください。`REPRODROID_BUILD_SANDBOX=HOST|DOCKER`は実装済みで、未指定はHOST、空／未知値は起動時拒否です。`REPRODROID_ENABLE_REAL_BUILDS`は別gateです。DOCKERはMicroG-RE 6.1.4固定recipeだけをサポートし、imageの事前preloadと16 GiB以上の空きdiskが必要です。
+
+Runner自体はhostで動作し、Job専用containerへDocker socketを渡しません。DinD／privileged／host network／host fallback／shared Gradle cacheはありません。bridgeはhost/LAN隔離の証明ではなく、hard Job disk quotaもありません。Job作成時のsnapshot、owner intent、実container inspectと回収、回収後のbounded safe importを使用します。回収未確認ならHOSTを含む新規REALは503で拒否し、SIMULATED／readを維持します。任意repositoryや別platformへの一般化、第三者attestationは行いません。
+
+追加のruntime受入試験はoperator opt-inです。`REPRODROID_TEST_DOCKER=true`は固定imageを使用する無害なJava fixtureを起動し、そのfixture所有containerだけを回収します。`REPRODROID_TEST_DEVICE_DIRECTORY`は`null.apk`という実character deviceを持つ専用fixture directoryを指定し、読込み前拒否を試験します。これらが未指定のskipを実runtime検証済みと扱わないでください。
 
 ## Phase 2のRunner境界
 
@@ -119,7 +127,7 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 
 ## Jobと永続化
 
-SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、dependency pinning、effective determinism、scan result／review、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。これは private audit record であり、現行 API から直接配信しません。既存schemaは起動時にv7へtransactionalに移行します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
+SQLiteへJob、request、resolved commit、recipe ID、variant、Java major、dependency pinning、effective determinism、scan result／review、状態、進捗、確認、エラー、ログ索引、artifactメタデータとcontent相対path、distribution/Wrapper検証結果、Manifestの相対pathとSHA-256を保存します。cloneしたソース、配信用に固定コピーしたAPK、ログ本体、Wrapper検査・環境・依存ファイルhashを含む`reprodroid-build.json`は専用state directoryへ保存します。これは private audit record であり、現行 API から直接配信しません。既存schemaを起動時にv8へtransactionalに移行し、旧REAL JobはHOST／LEGACY_HOSTとして保存します。Phase 1C以前のcontent pathを持たないartifactは自動推測せず、Jobのretryで再生成します。
 
 Runner再起動時、実行途中だったJobは自動再実行せず`INTERRUPTED`へ移します。
 

@@ -80,9 +80,17 @@ internal class SystemProcessExecutor : ProcessExecutor {
     }
 
     private fun readOutput(reader: BufferedReader, consume: (String) -> Unit) {
+        val line = StringBuilder()
         while (true) {
-            val line = reader.readLine() ?: return
-            consume(line)
+            val character = reader.read()
+            if (character < 0) {
+                if (line.isNotEmpty()) consume(line.toString().trimEnd('\r'))
+                return
+            }
+            if (character == '\n'.code) {
+                consume(line.toString().trimEnd('\r'))
+                line.setLength(0)
+            } else if (line.length < MAX_LOG_LINE_CHARACTERS) line.append(character.toChar())
         }
     }
 

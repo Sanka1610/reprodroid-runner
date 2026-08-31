@@ -8,6 +8,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.JsonObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -24,7 +26,8 @@ internal class BuildManifestPublisher(
     private val limits: BuildManifestPublicationLimits = BuildManifestPublicationLimits(),
 ) {
     fun publicManifest(jobId: String): BuildEnvironmentManifestResponse {
-        val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+        val job = try { store.getStoredJob(jobId) } catch (_: TrustedBuildFailure) { throw manifestInvalid() }
+            ?: throw ApiException.notFound()
         if (job.executionMode != ExecutionMode.REAL_TRUSTED || job.state != JobState.SUCCEEDED) {
             throw manifestNotReady()
         }
@@ -47,7 +50,10 @@ internal class BuildManifestPublisher(
         } catch (_: IllegalArgumentException) {
             throw manifestInvalid()
         }
-        if (schemaVersion == null || schemaVersion == 1) throw redactedEmpty()
+        if (schemaVersion == null || schemaVersion == 1) {
+            if (job.sandbox?.manifestFormat != SandboxManifestFormat.LEGACY_ALLOWED) throw manifestInvalid()
+            throw redactedEmpty()
+        }
         if (schemaVersion !in SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS) throw manifestInvalid()
         val manifest = try {
             PRIVATE_JSON.decodeFromString<BuildEnvironmentManifest>(privateJson)
@@ -56,13 +62,74 @@ internal class BuildManifestPublisher(
         } catch (_: IllegalArgumentException) {
             throw manifestInvalid()
         }
-        if ((schemaVersion == 2 && manifest.determinism != null) || (schemaVersion == 3 && manifest.determinism == null)) {
+        if ((schemaVersion == 2 && manifest.determinism != null) || (schemaVersion >= 3 && manifest.determinism == null)) {
             throw manifestInvalid()
+        }
+        val snapshot = job.sandbox ?: throw manifestInvalid()
+        if (schemaVersion < 4) {
+            if (snapshot.manifestFormat != SandboxManifestFormat.LEGACY_ALLOWED ||
+                snapshot.jobSandbox.origin != SandboxOrigin.LEGACY_HOST || manifest.sandbox != null ||
+                manifest.controllerJava != null || manifest.controllerOperatingSystem != null || manifest.dockerAudit != null) throw manifestInvalid()
+        } else {
+            val sandbox = manifest.sandbox ?: throw manifestInvalid()
+            try { sandbox.validate() } catch (_: Exception) { throw manifestInvalid() }
+            if (sandbox.mode != snapshot.jobSandbox.mode || manifest.controllerJava == null ||
+                manifest.controllerOperatingSystem.isNullOrBlank()) throw manifestInvalid()
+            val sandboxJson = PRIVATE_JSON.parseToJsonElement(privateJson).jsonObject.getValue("sandbox").jsonObject
+            if (sandbox.mode == BuildSandboxMode.HOST) {
+                if (sandboxJson.keys != setOf("mode") || manifest.dockerAudit != null) throw manifestInvalid()
+            } else {
+                if (sandboxJson.keys != setOf("mode", "profileId", "imageDigest", "platform", "engineVersion", "networkMode", "limits", "isolation")) throw manifestInvalid()
+                validateDockerAudit(job, manifest)
+            }
         }
         val response = project(job, manifest, schemaVersion)
         val responseBytes = PUBLIC_JSON.encodeToString(response).toByteArray(StandardCharsets.UTF_8).size
         if (responseBytes > limits.maxPublicResponseBytes) throw publicationLimitExceeded()
         return response
+    }
+
+    private fun validateDockerAudit(job: StoredJob, manifest: BuildEnvironmentManifest) {
+        try {
+            val snapshot = requireNotNull(job.sandbox)
+            val profile = requireNotNull(snapshot.validatedProfile())
+            require(snapshot.jobSandbox.cleanupStatus == SandboxCleanupStatus.COMPLETE)
+            require(manifest.gradleVersion == profile.gradleVersion &&
+                manifest.wrapper.wrapperJarGradleVersion == profile.wrapperJarGradleVersion &&
+                manifest.androidSdkApiLevel == profile.androidSdkApiLevel && manifest.buildToolsVersion == profile.buildToolsVersion)
+            val audit = requireNotNull(manifest.dockerAudit)
+            // This private field is the controller's verified SDK source, not the container target or public SDK API level.
+            require(manifest.androidSdk == audit.mounts.single { it.destination == profile.sdk && it.readOnly }.source)
+            require(audit.snapshotSha256 == snapshot.profileSha256 && audit.exitCode == 0 && !audit.oomKilled)
+            require(audit.sandbox == manifest.sandbox && audit.java == PublicJavaRuntime(manifest.javaVersion, manifest.javaVendor))
+            require(audit.operatingSystem == manifest.operatingSystem)
+            val resources = store.sandboxResources().filter { it.jobId == job.jobId }
+            require(resources.size == 2 && resources.all { it.removed && it.ownerId == audit.ownerId && it.engineId == audit.engineId && it.cleanupFailureCode == null && it.buildFailureCode == null })
+            val build = resources.single { it.attemptId == audit.buildAttemptId && it.role == SandboxResourceRole.BUILD }
+            val preflight = resources.single { it.attemptId == audit.preflightAttemptId && it.role == SandboxResourceRole.PREFLIGHT }
+            require(build.containerId == audit.buildContainerId && preflight.containerId == audit.preflightContainerId)
+            require(PRIVATE_JSON.decodeFromString<DockerExecutionAudit>(requireNotNull(build.observationJson)) == audit)
+            require(preflight.observationJson == audit.preflightInspection)
+            val engine = PRIVATE_JSON.parseToJsonElement(audit.engineInfo).jsonObject
+            require(engine.string("ID") == audit.engineId && engine.string("ServerVersion") == audit.sandbox.engineVersion)
+            require(engine.string("OSType") == "linux" && engine.string("Architecture") in setOf("x86_64", "amd64"))
+            val image = PRIVATE_JSON.parseToJsonElement(audit.imageInspection).jsonObject
+            require(image.string("Id") == audit.imageId && image.string("Os") == "linux" && image.string("Architecture") == "amd64")
+            require(image.getValue("RepoDigests").jsonArray.any { it.jsonPrimitive.content == profile.image })
+            val environment = mapOf(
+                "PATH" to "${profile.jdk}/bin:/usr/bin:/bin", "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
+                "GRADLE_USER_HOME" to profile.gradleHome, "ANDROID_HOME" to profile.sdk, "ANDROID_SDK_ROOT" to profile.sdk,
+            )
+            val recipe = BuildRecipeRegistry.defaultRecipes.single { it.id == manifest.recipeId }
+            profile.requireSupported(recipe)
+            val command = listOf(
+                "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+                "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
+            ) + gradleOptions(recipe) + recipe.tasks
+            DockerBuildSpec(profile, audit.mounts, environment).validateInspection(
+                PRIVATE_JSON.parseToJsonElement(audit.buildInspection).jsonObject, build, audit.imageId, command,
+            )
+        } catch (_: Exception) { throw manifestInvalid() }
     }
 
     private fun readManifestBytes(manifestPath: Path): ByteArray {
@@ -111,7 +178,8 @@ internal class BuildManifestPublisher(
         internalSchemaVersion: Int,
     ): BuildEnvironmentManifestResponse {
         val resolvedCommit = job.resolvedCommitSha
-        val effectiveDeterminism = store.getJob(job.jobId)?.effectiveBuild?.determinism
+        val effectiveBuild = store.getJob(job.jobId)?.effectiveBuild
+        val effectiveDeterminism = effectiveBuild?.determinism
         val unconfiguredDeterminism = DeterminismOptions(noBuildCache = false)
         if (
             !LOWERCASE_COMMIT_SHA.matches(manifest.resolvedCommitSha) ||
@@ -127,7 +195,10 @@ internal class BuildManifestPublisher(
             !isSafePublicText(manifest.javaVersion) ||
             !isSafePublicText(manifest.javaVendor) ||
             (internalSchemaVersion == 2 && effectiveDeterminism != unconfiguredDeterminism) ||
-            (internalSchemaVersion == 3 && manifest.determinism != effectiveDeterminism)
+            (internalSchemaVersion >= 3 && manifest.determinism != effectiveDeterminism) ||
+            (internalSchemaVersion >= 4 && (effectiveBuild == null || manifest.recipeId != effectiveBuild.recipeId ||
+                manifest.buildRoot != effectiveBuild.buildRoot || manifest.tasks != effectiveBuild.tasks ||
+                manifest.javaVersion.substringBefore('.').toIntOrNull() != effectiveBuild.javaMajor))
         ) {
             throw manifestInvalid()
         }
@@ -148,12 +219,13 @@ internal class BuildManifestPublisher(
         if (
             !isConfinedInternalRelativePath(manifestArtifact.path) ||
             !LOWERCASE_SHA256.matches(manifestArtifact.sha256) ||
-            manifestArtifact.sha256 != storedArtifact.sha256
+            manifestArtifact.sha256 != storedArtifact.sha256 ||
+            (internalSchemaVersion >= 4 && manifestArtifact.sizeBytes != storedArtifact.sizeBytes)
         ) {
             throw manifestInvalid()
         }
         return BuildEnvironmentManifestResponse(
-            schemaVersion = if (internalSchemaVersion == 3) 2 else 1,
+            schemaVersion = internalSchemaVersion - 1,
             commit = manifest.resolvedCommitSha,
             java = PublicJavaRuntime(manifest.javaVersion, manifest.javaVendor),
             gradle = manifest.gradleVersion,
@@ -162,6 +234,7 @@ internal class BuildManifestPublisher(
             dependencies = dependencies,
             apkHash = manifestArtifact.sha256,
             determinism = manifest.determinism,
+            sandbox = manifest.sandbox,
         )
     }
 
@@ -213,13 +286,13 @@ internal class BuildManifestPublisher(
     )
 
     private fun manifestInvalid() = ApiException(
-        HttpStatusCode.InternalServerError,
+        HttpStatusCode.Conflict,
         "BUILD_MANIFEST_INVALID",
         "The stored build environment manifest failed integrity validation.",
     )
 
     private companion object {
-        val SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS = setOf(2, 3)
+        val SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS = setOf(2, 3, 4)
         const val MAX_PUBLIC_TEXT_BYTES = 255
         val LOWERCASE_COMMIT_SHA = Regex("[0-9a-f]{40}")
         val LOWERCASE_SHA256 = Regex("[0-9a-f]{64}")

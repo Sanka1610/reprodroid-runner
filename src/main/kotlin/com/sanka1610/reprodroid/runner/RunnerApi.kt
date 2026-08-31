@@ -37,6 +37,7 @@ class ApiException(
         fun artifactNotFound() =
             ApiException(HttpStatusCode.NotFound, "ARTIFACT_NOT_FOUND", "The requested artifact does not exist.")
         fun conflict(code: String, message: String) = ApiException(HttpStatusCode.Conflict, code, message)
+        fun serviceUnavailable(code: String, message: String) = ApiException(HttpStatusCode.ServiceUnavailable, code, message)
         fun internalServerError(code: String, message: String) =
             ApiException(HttpStatusCode.InternalServerError, code, message)
     }
@@ -51,6 +52,7 @@ fun Application.runnerModule(config: RunnerConfig) {
         simulationStepDelayMillis = config.simulationStepDelayMillis,
         realBuildEnabled = config.realBuildEnabled,
         stateDirectory = config.stateDirectory,
+        buildSandbox = config.buildSandbox,
     )
     monitor.subscribe(ApplicationStopped) { coordinator.close() }
 

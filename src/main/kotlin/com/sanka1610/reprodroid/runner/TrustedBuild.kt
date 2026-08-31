@@ -351,8 +351,16 @@ internal class TrustedBuildExecutor(
     private val clock: Clock = Clock.systemUTC(),
     private val dependencyLockfileVerifier: DependencyLockfileVerifier = DependencyLockfileVerifier(),
     private val sourceScanner: SourceScanner = SourceScanner(),
+    private val dockerExecutor: DockerBuildExecutor? = null,
 ) {
     suspend fun execute(job: StoredJob, recipe: BuildRecipe) {
+        val snapshot = job.sandbox ?: throw invalidSandboxSnapshot()
+        snapshot.validatedProfile()
+        val dockerMode = snapshot.jobSandbox.mode == BuildSandboxMode.DOCKER
+        if (dockerMode && dockerExecutor == null) {
+            throw TrustedBuildFailure("SANDBOX_START_FAILED", "The Docker build executor is not available.")
+        }
+        snapshot.validatedProfile()?.requireSupported(recipe)
         val resolvedCommit = job.resolvedCommitSha
             ?: throw TrustedBuildFailure("RESOLVED_COMMIT_MISSING", "The confirmed job has no resolved commit.")
         val workspace = stateDirectory.resolve("workspaces").resolve(job.jobId).normalize()
@@ -475,6 +483,7 @@ internal class TrustedBuildExecutor(
                 "${wrapper.wrapperJarSha256}.",
         )
         val gradleEnvironment = deterministicGradleEnvironment(environment, recipe.determinism)
+        store.requireCurrentManifest(job.jobId)
         recipe.determinism.fixedLocale?.let {
             val charmap = captureChecked(
                 command = listOf("locale", "charmap"),
@@ -491,11 +500,22 @@ internal class TrustedBuildExecutor(
             }
             store.appendLog(job.jobId, LogLevel.INFO, "Validated fixed Gradle process locale C.UTF-8.")
         }
-        transition(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks: ${recipe.tasks.joinToString(" ")}.")
         val javaExecutable = buildJava.executable.toString()
         val wrapperJar = confinedPath(buildRoot, "gradle/wrapper/gradle-wrapper.jar")
         var gradleFailure: Throwable? = null
-        try {
+        var dockerResult: DockerBuildResult? = null
+        if (dockerMode) {
+            dockerResult = requireNotNull(dockerExecutor).execute(
+                job, recipe, sourceDirectory.toAbsolutePath(), homeDirectory.toAbsolutePath(), gradleUserHome.toAbsolutePath(), buildJava,
+                Path.of(requireNotNull(environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"])).toAbsolutePath(),
+            )
+            // No mutable output may be inspected until execute() has completed its removal proof.
+            listOf(sourceDirectory, homeDirectory, gradleUserHome).forEach {
+                SandboxOutputImport(it, SandboxImportLimits.DEPENDENCIES).validateDirectory()
+            }
+            gradleFailure = dockerResult.failure
+        } else try {
+            transition(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks: ${recipe.tasks.joinToString(" ")}.")
             runChecked(
                 jobId = job.jobId,
                 command = listOf(
@@ -552,11 +572,19 @@ internal class TrustedBuildExecutor(
         gradleFailure?.let { throw it }
 
         transition(job.jobId, JobState.DISCOVERING_ARTIFACTS, 90, "Discovering APKs using the fixed artifact recipe.")
-        val artifactPaths = discoverArtifacts(buildRoot, recipe)
+        val dockerOutputRoot = buildRoot.resolve("play-services-core/build/outputs/apk/default/release")
+        val apkImport = if (dockerMode) SandboxOutputImport(dockerOutputRoot, SandboxImportLimits.APK) else null
+        val importedApks = apkImport?.importApks(
+            stateDirectory.resolve("sandbox-imports").resolve(job.jobId).also(Path::createDirectories),
+        )
+        if (importedApks != null && importedApks.size != 1) {
+            throw TrustedBuildFailure(if (importedApks.isEmpty()) "APK_NOT_FOUND" else "UNEXPECTED_APK_COUNT", "The sandbox recipe requires exactly one APK.")
+        }
+        val artifactPaths = importedApks?.map { it.first } ?: discoverArtifacts(buildRoot, recipe)
         val discoveredArtifacts = artifactPaths.map { artifactPath ->
             ArtifactMetadata(
                 artifactId = UUID.randomUUID().toString(),
-                fileName = artifactPath.name,
+                fileName = importedApks?.single { it.first == artifactPath }?.second?.path?.substringAfterLast('/') ?: artifactPath.name,
                 sizeBytes = Files.size(artifactPath),
                 sha256 = sha256(artifactPath),
                 packageName = "",
@@ -575,17 +603,26 @@ internal class TrustedBuildExecutor(
             buildRoot = recipe.buildRoot,
             tasks = recipe.tasks,
             gradleVersion = wrapper.gradleVersion,
-            javaVersion = buildJava.version,
-            javaVendor = buildJava.vendor,
-            operatingSystem = "${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}",
+            javaVersion = dockerResult?.audit?.java?.version ?: buildJava.version,
+            javaVendor = dockerResult?.audit?.java?.vendor ?: buildJava.vendor,
+            operatingSystem = dockerResult?.audit?.operatingSystem ?: "${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}",
             androidSdk = environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"],
             androidSdkApiLevel = validatedAndroidSdk.apiLevel,
             buildToolsVersion = validatedAndroidSdk.buildToolsVersion,
+            sandbox = dockerResult?.audit?.sandbox ?: SandboxEvidence(BuildSandboxMode.HOST),
+            dockerAudit = dockerResult?.audit,
+            controllerJava = PublicJavaRuntime(System.getProperty("java.version"), System.getProperty("java.vendor")),
+            controllerOperatingSystem = "${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}",
             determinism = recipe.determinism,
             wrapper = wrapper,
-            dependencies = captureDependencies(gradleUserHome),
+            dependencies = if (dockerMode) SandboxOutputImport(
+                gradleUserHome.resolve("caches/modules-2/files-2.1"), SandboxImportLimits.DEPENDENCIES,
+            ).dependencies() else captureDependencies(gradleUserHome),
             artifacts = artifactPaths.zip(discoveredArtifacts).map { (path, metadata) ->
-                ManifestFile(buildRoot.relativize(path).toString().replace('\\', '/'), metadata.sizeBytes, metadata.sha256)
+                ManifestFile(
+                    if (dockerMode) "play-services-core/build/outputs/apk/default/release/${metadata.fileName}"
+                    else buildRoot.relativize(path).toString().replace('\\', '/'), metadata.sizeBytes, metadata.sha256,
+                )
             },
         )
         val manifestDirectory = stateDirectory.resolve("manifests").resolve(job.jobId).also(Path::createDirectories)
@@ -608,6 +645,7 @@ internal class TrustedBuildExecutor(
         try {
             artifactPaths.zip(discoveredArtifacts).forEach { (sourcePath, metadata) ->
                 storedArtifacts += persistArtifact(job.jobId, sourcePath, metadata)
+                apkImport?.checkDeadline()
             }
         } catch (failure: Throwable) {
             deleteStoredArtifacts(storedArtifacts)
@@ -842,7 +880,7 @@ internal data class BuildJavaRuntime(
 
 @Serializable
 internal data class BuildEnvironmentManifest(
-    val schemaVersion: Int = 3,
+    val schemaVersion: Int = 4,
     val generatedAt: String,
     val jobId: String,
     val recipeId: String,
@@ -862,6 +900,10 @@ internal data class BuildEnvironmentManifest(
     val wrapper: WrapperVerification,
     val dependencies: List<ManifestFile>,
     val artifacts: List<ManifestFile>,
+    val sandbox: SandboxEvidence? = null,
+    val controllerJava: PublicJavaRuntime? = null,
+    val controllerOperatingSystem: String? = null,
+    val dockerAudit: DockerExecutionAudit? = null,
 )
 
 @Serializable
@@ -972,4 +1014,5 @@ private val SHA256 = Regex("[0-9a-f]{64}")
 private val MANIFEST_JSON = Json {
     prettyPrint = true
     encodeDefaults = true
+    explicitNulls = false
 }

@@ -20,6 +20,7 @@ internal data class StoredJob(
     val simulationOutcome: SimulationOutcome?,
     val resolvedCommitSha: String?,
     val state: JobState,
+    val sandbox: SandboxSnapshot? = null,
 )
 
 internal data class StoredArtifact(
@@ -68,17 +69,19 @@ class SQLiteJobStore(
     }
 
     @Synchronized
-    fun createJob(request: CreateJobRequest): CreateJobResponse {
+    fun createJob(request: CreateJobRequest, sandboxMode: BuildSandboxMode = BuildSandboxMode.HOST): CreateJobResponse {
         val jobId = UUID.randomUUID().toString()
         val now = Instant.now(clock).toString()
+        val snapshot = if (request.executionMode == ExecutionMode.REAL_TRUSTED) SandboxSnapshot.newJob(sandboxMode) else null
         connection().use { connection ->
             connection.prepareStatement(
                 """
                 INSERT INTO jobs (
                     job_id, execution_mode, repository_url, revision_type, revision_value,
                     simulation_outcome, state, progress_percent, requires_confirmation,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                    created_at, updated_at, sandbox_mode, sandbox_origin, sandbox_profile_id,
+                    sandbox_snapshot, sandbox_snapshot_sha256, sandbox_cleanup_status, manifest_format
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """.trimIndent(),
             ).use { statement ->
                 statement.setString(1, jobId)
@@ -90,6 +93,13 @@ class SQLiteJobStore(
                 statement.setString(7, JobState.CREATED.name)
                 statement.setString(8, now)
                 statement.setString(9, now)
+                statement.setString(10, snapshot?.jobSandbox?.mode?.name)
+                statement.setString(11, snapshot?.jobSandbox?.origin?.name)
+                statement.setString(12, snapshot?.jobSandbox?.profileId)
+                statement.setString(13, snapshot?.canonicalProfile)
+                statement.setString(14, snapshot?.profileSha256)
+                statement.setString(15, snapshot?.jobSandbox?.cleanupStatus?.name)
+                statement.setString(16, snapshot?.manifestFormat?.name)
                 statement.executeUpdate()
             }
         }
@@ -107,8 +117,7 @@ class SQLiteJobStore(
     internal fun getStoredJob(jobId: String): StoredJob? = connection().use { connection ->
         connection.prepareStatement(
             """
-            SELECT job_id, execution_mode, repository_url, revision_type, revision_value,
-                   simulation_outcome, resolved_commit_sha, state
+            SELECT *
             FROM jobs WHERE job_id = ?
             """.trimIndent(),
         ).use { statement ->
@@ -133,6 +142,155 @@ class SQLiteJobStore(
                 )
             }
         }
+    }
+
+    /** One-way upgrade before any external build, including an unfinished migrated HOST job. */
+    @Synchronized
+    internal fun requireCurrentManifest(jobId: String) {
+        val snapshot = getStoredJob(jobId)?.sandbox ?: throw invalidSandboxSnapshot()
+        snapshot.validatedProfile()
+        sandboxTransaction { connection ->
+            connection.prepareStatement("UPDATE jobs SET manifest_format = 'REQUIRED_V4' WHERE job_id = ?").use { statement ->
+                statement.setString(1, jobId)
+                check(statement.executeUpdate() == 1)
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun sandboxOwnerId(): String = sandboxTransaction { connection ->
+        connection.prepareStatement("INSERT OR IGNORE INTO sandbox_owner(singleton, owner_id) VALUES(1, ?)").use {
+            it.setString(1, UUID.randomUUID().toString())
+            it.executeUpdate()
+        }
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT owner_id FROM sandbox_owner WHERE singleton = 1").use {
+                check(it.next())
+                it.getString(1).also { id -> require(UUID.fromString(id).toString() == id) }
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun recordSandboxIntent(resource: SandboxResource) = sandboxTransaction { connection ->
+        resource.validate()
+        require(resource.containerId == null && !resource.removed && resource.observationJson == null)
+        val snapshot = getStoredJob(resource.jobId)?.sandbox ?: throw invalidSandboxSnapshot()
+        require(snapshot.jobSandbox.mode == BuildSandboxMode.DOCKER)
+        require(getStoredJob(resource.jobId)?.state == JobState.VERIFYING_WRAPPER)
+        require(snapshot.validatedProfile()?.endpoint == resource.endpoint)
+        connection.prepareStatement("SELECT owner_id FROM sandbox_owner WHERE singleton = 1").use { statement ->
+            statement.executeQuery().use { require(it.next() && it.getString(1) == resource.ownerId) }
+        }
+        connection.prepareStatement(
+            "INSERT INTO sandbox_resources(attempt_id, job_id, owner_id, role, expected_name, engine_id, endpoint) " +
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+        ).use {
+            it.setString(1, resource.attemptId)
+            it.setString(2, resource.jobId)
+            it.setString(3, resource.ownerId)
+            it.setString(4, resource.role.name)
+            it.setString(5, resource.expectedName)
+            it.setString(6, resource.engineId)
+            it.setString(7, resource.endpoint)
+            check(it.executeUpdate() == 1)
+        }
+        connection.prepareStatement("UPDATE jobs SET sandbox_cleanup_status = 'PENDING' WHERE job_id = ?").use {
+            it.setString(1, resource.jobId)
+            check(it.executeUpdate() == 1)
+        }
+    }
+
+    @Synchronized
+    internal fun recordSandboxContainerId(attemptId: String, containerId: String) = sandboxTransaction { connection ->
+        require(containerId.matches(Regex("[0-9a-f]{64}")))
+        connection.prepareStatement(
+            "UPDATE sandbox_resources SET container_id = ? WHERE attempt_id = ? AND removed = 0 " +
+                "AND (container_id IS NULL OR container_id = ?)",
+        ).use {
+            it.setString(1, containerId)
+            it.setString(2, attemptId)
+            it.setString(3, containerId)
+            check(it.executeUpdate() == 1)
+        }
+    }
+
+    @Synchronized
+    internal fun recordSandboxObservation(attemptId: String, observationJson: String) = sandboxTransaction { connection ->
+        require(observationJson.toByteArray(Charsets.UTF_8).size <= 65_536)
+        connection.prepareStatement(
+            "UPDATE sandbox_resources SET observation_json = ? WHERE attempt_id = ? AND container_id IS NOT NULL AND removed = 0",
+        ).use {
+            it.setString(1, observationJson)
+            it.setString(2, attemptId)
+            check(it.executeUpdate() == 1)
+        }
+    }
+
+    /** Caller must prove absence on the recorded engine first; no engine calls inside a transaction. */
+    @Synchronized
+    internal fun recordSandboxRemoved(attemptId: String) = sandboxTransaction { connection ->
+        connection.prepareStatement("UPDATE sandbox_resources SET removed = 1, cleanup_failure_code = NULL WHERE attempt_id = ?").use {
+            it.setString(1, attemptId)
+            check(it.executeUpdate() == 1)
+        }
+        connection.prepareStatement(
+            "UPDATE jobs SET sandbox_cleanup_status = 'COMPLETE' " +
+                "WHERE job_id = (SELECT job_id FROM sandbox_resources WHERE attempt_id = ?) " +
+                "AND NOT EXISTS (SELECT 1 FROM sandbox_resources r WHERE r.job_id = jobs.job_id AND r.removed = 0)",
+        ).use {
+            it.setString(1, attemptId)
+            it.executeUpdate()
+        }
+    }
+
+    @Synchronized
+    internal fun recordSandboxFailure(attemptId: String, buildCode: String?, cleanupCode: String?) = sandboxTransaction { connection ->
+        connection.prepareStatement(
+            "UPDATE sandbox_resources SET build_failure_code = COALESCE(build_failure_code, ?), " +
+                "cleanup_failure_code = COALESCE(?, cleanup_failure_code) WHERE attempt_id = ?",
+        ).use {
+            it.setString(1, buildCode)
+            it.setString(2, cleanupCode)
+            it.setString(3, attemptId)
+            check(it.executeUpdate() == 1)
+        }
+    }
+
+    @Synchronized
+    internal fun sandboxResources(): List<SandboxResource> = sandboxTransaction { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT * FROM sandbox_resources ORDER BY rowid").use { rows ->
+                buildList {
+                    while (rows.next()) add(
+                        SandboxResource(
+                            attemptId = rows.getString("attempt_id"), jobId = rows.getString("job_id"),
+                            ownerId = rows.getString("owner_id"), role = SandboxResourceRole.valueOf(rows.getString("role")),
+                            expectedName = rows.getString("expected_name"), engineId = rows.getString("engine_id"),
+                            endpoint = rows.getString("endpoint"), containerId = rows.getString("container_id"),
+                            removed = rows.getInt("removed") == 1, observationJson = rows.getString("observation_json"),
+                            buildFailureCode = rows.getString("build_failure_code"), cleanupFailureCode = rows.getString("cleanup_failure_code"),
+                        ).also { it.validate() },
+                    )
+                }
+            }
+        }
+    }
+
+    private fun <T> sandboxTransaction(block: (Connection) -> T): T = try {
+        connection().use { connection ->
+            connection.autoCommit = false
+            try {
+                block(connection).also { connection.commit() }
+            } catch (failure: Throwable) {
+                runCatching { connection.rollback() }
+                throw failure
+            }
+        }
+    } catch (failure: TrustedBuildFailure) {
+        throw failure
+    } catch (_: Exception) {
+        throw TrustedBuildFailure("SANDBOX_AUDIT_PERSISTENCE_FAILED", "The sandbox audit could not be persisted or restored.")
     }
 
     @Synchronized
@@ -560,6 +718,12 @@ class SQLiteJobStore(
     internal fun completeRealSuccessIfActive(jobId: String, artifacts: List<StoredArtifact>): Boolean {
         val current = getStateAndProgress(jobId) ?: return false
         if (current.state.isTerminal) return false
+        if (getStoredJob(jobId)?.sandbox?.jobSandbox?.mode == BuildSandboxMode.DOCKER) {
+            require(getStoredJob(jobId)?.sandbox?.jobSandbox?.cleanupStatus == SandboxCleanupStatus.COMPLETE)
+            val resources = sandboxResources().filter { it.jobId == jobId }
+            require(resources.size == 2 && resources.all { it.removed })
+            require(resources.map { it.role }.toSet() == SandboxResourceRole.entries.toSet())
+        }
         artifacts.forEach { addArtifact(jobId, it) }
         appendLog(jobId, LogLevel.INFO, "Trusted real build succeeded; ${artifacts.size} APK artifact(s) registered.")
         return updateState(jobId, JobState.SUCCEEDED, 100)
@@ -751,7 +915,7 @@ class SQLiteJobStore(
     }
 
     @Synchronized
-    fun markRunningJobsInterrupted(): List<String> {
+    fun markRunningJobsInterrupted(clearArtifactMetadata: Boolean = true): List<String> {
         val interruptibleStates = setOf(
             JobState.CREATED,
             JobState.RESOLVING_SOURCE,
@@ -781,12 +945,12 @@ class SQLiteJobStore(
             }
         }
         interrupted.forEach { jobId ->
-            deleteArtifacts(jobId)
+            if (clearArtifactMetadata) deleteArtifacts(jobId)
             appendLog(jobId, LogLevel.WARN, "Job marked INTERRUPTED during Runner startup.")
             updateState(
                 jobId = jobId,
                 state = JobState.INTERRUPTED,
-                progressPercent = getJob(jobId)?.progressPercent ?: 0,
+                progressPercent = getStateAndProgress(jobId)?.progressPercent ?: 0,
                 error = JobError(
                     code = "RUNNER_RESTARTED",
                     message = "The Runner stopped before this job completed.",
@@ -960,6 +1124,36 @@ class SQLiteJobStore(
                             }
                         }
                     }
+                    if (schemaVersion < 8) {
+                        SANDBOX_COLUMNS.forEach { definition ->
+                            if (!columnExists(connection, "jobs", definition.substringBefore(' '))) {
+                                statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $definition")
+                            }
+                        }
+                        // Do not overwrite a valid snapshot in an already-upgraded fixture or restored database.
+                        statement.executeUpdate(
+                            "UPDATE jobs SET sandbox_mode = 'HOST', sandbox_origin = 'LEGACY_HOST', " +
+                                "manifest_format = 'LEGACY_ALLOWED' WHERE execution_mode = 'REAL_TRUSTED' AND sandbox_mode IS NULL",
+                        )
+                    }
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS sandbox_owner (
+                            singleton INTEGER PRIMARY KEY CHECK(singleton = 1), owner_id TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS sandbox_resources (
+                            attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                            owner_id TEXT NOT NULL, role TEXT NOT NULL, expected_name TEXT NOT NULL UNIQUE,
+                            engine_id TEXT NOT NULL, endpoint TEXT NOT NULL, container_id TEXT,
+                            removed INTEGER NOT NULL DEFAULT 0, observation_json TEXT,
+                            build_failure_code TEXT, cleanup_failure_code TEXT
+                        )
+                        """.trimIndent(),
+                    )
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
                 connection.commit()
@@ -1201,7 +1395,31 @@ class SQLiteJobStore(
         simulationOutcome = getString("simulation_outcome")?.let(SimulationOutcome::valueOf),
         resolvedCommitSha = getString("resolved_commit_sha"),
         state = JobState.valueOf(getString("state")),
+        sandbox = toSandboxSnapshot(),
     )
+
+    private fun ResultSet.toSandboxSnapshot(): SandboxSnapshot? {
+        try {
+            val columns = SANDBOX_COLUMNS.map { it.substringBefore(' ') }
+            if (ExecutionMode.valueOf(getString("execution_mode")) == ExecutionMode.SIMULATED) {
+                require(columns.all { getString(it) == null })
+                return null
+            }
+            val sandbox = JobSandbox(
+                mode = BuildSandboxMode.valueOf(getString("sandbox_mode")),
+                origin = SandboxOrigin.valueOf(getString("sandbox_origin")),
+                profileId = getString("sandbox_profile_id"),
+                cleanupStatus = getString("sandbox_cleanup_status")?.let(SandboxCleanupStatus::valueOf),
+            )
+            sandbox.validateState(JobState.valueOf(getString("state")))
+            return SandboxSnapshot(
+                sandbox, getString("sandbox_snapshot"), getString("sandbox_snapshot_sha256"),
+                SandboxManifestFormat.valueOf(getString("manifest_format")),
+            ).also { it.validatedProfile() }
+        } catch (_: Exception) {
+            throw invalidSandboxSnapshot()
+        }
+    }
 
     private fun ResultSet.toArtifactMetadata(): ArtifactMetadata = ArtifactMetadata(
         artifactId = getString("artifact_id"),
@@ -1255,6 +1473,7 @@ class SQLiteJobStore(
         },
         createdAt = getString("created_at"),
         updatedAt = getString("updated_at"),
+        sandbox = toSandboxSnapshot()?.jobSandbox,
     )
 
     private fun logPath(jobId: String): Path = logDirectory.resolve("$jobId.log")
@@ -1291,7 +1510,11 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 7
+        const val SCHEMA_VERSION = 8
+        val SANDBOX_COLUMNS = listOf(
+            "sandbox_mode TEXT", "sandbox_origin TEXT", "sandbox_profile_id TEXT", "sandbox_snapshot TEXT",
+            "sandbox_snapshot_sha256 TEXT", "sandbox_cleanup_status TEXT", "manifest_format TEXT",
+        )
         const val SOURCE_SCANNER_VERSION = "reprodroid-static-v1"
         val AUDIT_COLUMNS = listOf(
             "gradle_version TEXT",
