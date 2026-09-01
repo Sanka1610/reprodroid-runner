@@ -14,6 +14,7 @@ data class RunnerConfig(
     val simulationStepDelayMillis: Long = 350,
     val realBuildEnabled: Boolean = false,
     val buildSandbox: BuildSandboxMode = BuildSandboxMode.HOST,
+    val apiV2Enabled: Boolean = false,
 ) {
     companion object {
         fun fromEnvironment(environment: Map<String, String> = System.getenv()): RunnerConfig {
@@ -51,7 +52,19 @@ data class RunnerConfig(
                 BuildSandboxMode.entries.singleOrNull { it.name == value }
                     ?: throw IllegalArgumentException("SANDBOX_CONFIG_INVALID: REPRODROID_BUILD_SANDBOX must be HOST or DOCKER.")
             } ?: BuildSandboxMode.HOST
-            return RunnerConfig(host, port, stateDirectory, realBuildEnabled = realBuildEnabled, buildSandbox = sandbox)
+            val apiV2Enabled = environment["REPRODROID_ENABLE_API_V2"]
+                ?.equals("true", ignoreCase = true) == true
+            require(!apiV2Enabled || host in setOf("127.0.0.1", "::1")) {
+                "REPRODROID_ENABLE_API_V2 is development-only until pairing is implemented and requires loopback bind."
+            }
+            return RunnerConfig(
+                host,
+                port,
+                stateDirectory,
+                realBuildEnabled = realBuildEnabled,
+                buildSandbox = sandbox,
+                apiV2Enabled = apiV2Enabled,
+            )
         }
     }
 }

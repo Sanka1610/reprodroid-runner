@@ -372,7 +372,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(8, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(9, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
@@ -417,7 +417,7 @@ class RunnerApiTest {
         val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute("PRAGMA user_version = 9")
+                statement.execute("PRAGMA user_version = 10")
             }
         }
 
@@ -442,7 +442,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(8, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(9, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })

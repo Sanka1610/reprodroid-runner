@@ -1154,6 +1154,155 @@ class SQLiteJobStore(
                         )
                         """.trimIndent(),
                     )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS runner_identity (
+                            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                            runner_id TEXT NOT NULL UNIQUE,
+                            created_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS storage_settings (
+                            area TEXT PRIMARY KEY,
+                            budget_bytes INTEGER NOT NULL CHECK(budget_bytes > 0),
+                            warning_percent INTEGER NOT NULL CHECK(warning_percent BETWEEN 0 AND 100),
+                            updated_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS operations (
+                            operation_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL,
+                            operation_kind TEXT NOT NULL,
+                            idempotency_key TEXT NOT NULL,
+                            request_sha256 TEXT NOT NULL,
+                            contract_id TEXT NOT NULL,
+                            contract_version INTEGER NOT NULL,
+                            state TEXT NOT NULL,
+                            result_type TEXT,
+                            result_id TEXT,
+                            result_json TEXT,
+                            reason_code TEXT,
+                            reason_message TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            UNIQUE(principal_id, operation_kind, idempotency_key)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS retention_holds (
+                            hold_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL,
+                            resource_kind TEXT NOT NULL,
+                            resource_id TEXT NOT NULL,
+                            reason TEXT NOT NULL,
+                            client_reference_type TEXT NOT NULL,
+                            client_reference_id TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            created_operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                            released_operation_id TEXT REFERENCES operations(operation_id),
+                            created_at TEXT NOT NULL,
+                            released_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS retention_holds_active_identity
+                        ON retention_holds(
+                            principal_id, resource_kind, resource_id, reason,
+                            client_reference_type, client_reference_id
+                        ) WHERE state = 'ACTIVE'
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS storage_reservations (
+                            reservation_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL,
+                            area TEXT NOT NULL,
+                            purpose TEXT NOT NULL,
+                            resource_kind TEXT NOT NULL,
+                            resource_id TEXT NOT NULL,
+                            requested_bytes INTEGER NOT NULL CHECK(requested_bytes > 0),
+                            state TEXT NOT NULL,
+                            created_operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                            released_operation_id TEXT REFERENCES operations(operation_id),
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS storage_reservations_active_identity
+                        ON storage_reservations(principal_id, area, purpose, resource_kind, resource_id)
+                        WHERE state = 'ACTIVE'
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS resource_availability (
+                            resource_kind TEXT NOT NULL,
+                            resource_id TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            observed_bytes INTEGER,
+                            known_sha256 TEXT,
+                            last_used_at TEXT,
+                            checked_at TEXT NOT NULL,
+                            deletion_run_id TEXT,
+                            deletion_reason TEXT,
+                            PRIMARY KEY(resource_kind, resource_id)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS cleanup_runs (
+                            cleanup_run_id TEXT PRIMARY KEY,
+                            preview_id TEXT NOT NULL UNIQUE,
+                            principal_id TEXT NOT NULL,
+                            area TEXT NOT NULL,
+                            filter_sha256 TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            truncated INTEGER NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            released_bytes INTEGER NOT NULL DEFAULT 0,
+                            created_operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                            execute_operation_id TEXT REFERENCES operations(operation_id),
+                            started_at TEXT,
+                            finished_at TEXT,
+                            created_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS cleanup_items (
+                            cleanup_run_id TEXT NOT NULL REFERENCES cleanup_runs(cleanup_run_id) ON DELETE CASCADE,
+                            item_id TEXT NOT NULL UNIQUE,
+                            resource_kind TEXT NOT NULL,
+                            resource_id TEXT NOT NULL,
+                            observed_bytes INTEGER NOT NULL,
+                            observed_token TEXT NOT NULL,
+                            eligible_at TEXT NOT NULL,
+                            protection_reasons TEXT NOT NULL,
+                            selected INTEGER NOT NULL DEFAULT 0 CHECK(selected IN (0, 1)),
+                            result TEXT,
+                            released_bytes INTEGER NOT NULL DEFAULT 0,
+                            reason_code TEXT,
+                            reason_message TEXT,
+                            PRIMARY KEY(cleanup_run_id, item_id)
+                        )
+                        """.trimIndent(),
+                    )
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
                 connection.commit()
@@ -1510,7 +1659,7 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 8
+        const val SCHEMA_VERSION = 9
         val SANDBOX_COLUMNS = listOf(
             "sandbox_mode TEXT", "sandbox_origin TEXT", "sandbox_profile_id TEXT", "sandbox_snapshot TEXT",
             "sandbox_snapshot_sha256 TEXT", "sandbox_cleanup_status TEXT", "manifest_format TEXT",

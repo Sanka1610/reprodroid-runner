@@ -54,6 +54,7 @@ fun Application.runnerModule(config: RunnerConfig) {
         stateDirectory = config.stateDirectory,
         buildSandbox = config.buildSandbox,
     )
+    val storageRetention = StorageRetentionStore(config.stateDirectory)
     monitor.subscribe(ApplicationStopped) { coordinator.close() }
 
     install(CallLogging)
@@ -103,6 +104,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                 )
             }
             post("/jobs") {
+                if (config.apiV2Enabled) apiUpgradeRequired()
                 val request = call.receive<CreateJobRequest>()
                 call.respond(HttpStatusCode.Accepted, coordinator.create(request))
             }
@@ -110,6 +112,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.respond(coordinator.get(call.requiredJobId()))
             }
             post("/jobs/{jobId}/confirm") {
+                if (config.apiV2Enabled) apiUpgradeRequired()
                 val request = call.receive<ConfirmJobRequest>()
                 coordinator.confirm(call.requiredJobId(), request)
                 call.respond(HttpStatusCode.NoContent)
@@ -119,6 +122,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.respond(HttpStatusCode.NoContent)
             }
             post("/jobs/{jobId}/retry") {
+                if (config.apiV2Enabled) apiUpgradeRequired()
                 call.respond(HttpStatusCode.Accepted, coordinator.retry(call.requiredJobId()))
             }
             get("/jobs/{jobId}/logs") {
@@ -143,6 +147,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.respond(coordinator.sourceScan(call.requiredJobId()))
             }
             post("/jobs/{jobId}/source-scan/continue") {
+                if (config.apiV2Enabled) apiUpgradeRequired()
                 val request = call.receive<ContinueSourceScanRequest>()
                 coordinator.continueSourceScan(call.requiredJobId(), request)
                 call.respond(HttpStatusCode.NoContent)
@@ -157,8 +162,15 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.respondFile(artifact.path.toFile())
             }
         }
+        if (config.apiV2Enabled) storageRetentionV2Routes(storageRetention)
     }
 }
+
+private fun apiUpgradeRequired(): Nothing = throw ApiException(
+    HttpStatusCode.UpgradeRequired,
+    "API_UPGRADE_REQUIRED",
+    "This Runner does not accept v1 execution mutations.",
+)
 
 private fun io.ktor.server.application.ApplicationCall.requiredJobId(): String =
     parameters["jobId"]?.takeIf(String::isNotBlank)

@@ -25,6 +25,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.sqlite.jdbc)
+    implementation(libs.jcs)
     runtimeOnly(libs.logback.classic)
 
     testImplementation(platform(libs.junit.bom))
