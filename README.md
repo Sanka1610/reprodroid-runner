@@ -1,5 +1,7 @@
 # ReproDroid Runner
 
+**Phase 4 現在地（2026-09-01）:** [4.0基礎契約](../reprodroid-project/docs/design/phase-4-foundation-contract.md)と[API v2基礎](../reprodroid-project/docs/api/runner-api-v2.md)を文書化しました。v2 endpoint／汎用buildは未実装で、現行はAPI v1／SQLite8です。[開始監査・cleanup範囲](../reprodroid-project/reports/2026/09/2026-09-01-phase-4-foundation.md)の環境gateを完了しました。4.1はAndroid側の登録実装で、RunnerはAPI v1／SQLite8のままです。
+
 ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlist登録済みAndroid OSSの実ビルドを実行するPC側常駐プロセスです。
 
 ## 現在の状態
@@ -240,11 +242,13 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 3A〜3D実装後の未実装・対象外
+## Phase 3E完了後の計画・対象外
 
-### Phase 3 で予定するが、まだ実装していないもの
+Phase 3Eの固定profileによるopt-in Docker実装・受入は完了しています。Phase 4は要件合意、4.0基礎契約、4.1登録契約、開始時の証拠archive／cleanupまで完了し、Android側の4.1実装へ移行しました。[Phase 4 roadmap](../reprodroid-project/docs/design/phase-4-roadmap.md)と[計画合意事項](../reprodroid-project/docs/design/phase-4-planning-decisions.md)を正本とします。Runnerは現行API v1／SQLite v8／Manifest private v4・public v3を維持し、v2 endpoint／汎用buildをまだ提供しません。
 
-- Docker engine feasibility調査とopt-in sandbox mode
+汎用buildはDocker必須、許可先限定通信・全書込み領域quota・独立A／Bを要求し、HOSTへfallbackしません。Jobの計画既定は4 CPU相当quota、memory 8 GiB・swapなし、disk 16 GiB、PID 1,024、inode 500,000、tmpfs 1 GiB、詳細log 64 MiB、Gradle workers最大2、Runner実行枠1、各build60分です。これらは現行固定profileの値ではなく、実装・実環境検証が必要です。現行bridge・起動前guardを汎用隔離や強制quotaの証明にしません。
+
+不足JDK／Gradle／Android toolsの専用store導入、history／予約・hold／手動cleanup、API v2、HTTPS／pairing／認証、Runner／Job log export、WSL／Linux向け配布準備を含めます。資源不足再試行は既定OFF・限定許可付きで新A／Bを作り、scan review・全体budget・cleanup確認を省略しません。定期release確認からbuildを始めず、参照APK取得と比較はAndroidが所有します。Phase 4開始前の保持環境cleanupは証拠archive後に完了しました。4.1はAndroid codeへ着手し、Runnerのcode変更はありません。merge／push／公開は行いません。
 
 ### Phase 3 の対象外
 
