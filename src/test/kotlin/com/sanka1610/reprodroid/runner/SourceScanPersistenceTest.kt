@@ -126,7 +126,7 @@ class SourceScanPersistenceTest {
         assertEquals(null, migrated.getJob(jobId)?.sourceScan)
         java.sql.DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(9, statement.executeQuery("PRAGMA user_version").use { rows -> rows.next(); rows.getInt(1) })
+                assertEquals(10, statement.executeQuery("PRAGMA user_version").use { rows -> rows.next(); rows.getInt(1) })
             }
         }
     }

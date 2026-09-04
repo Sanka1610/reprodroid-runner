@@ -30,6 +30,7 @@ internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore) {
                     capabilities = listOf(
                         V2Capability("foundation", 1),
                         V2Capability("storage-retention", 1),
+                        V2Capability("toolchain-install", 1),
                     ),
                 ),
             )

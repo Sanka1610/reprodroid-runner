@@ -1303,6 +1303,83 @@ class SQLiteJobStore(
                         )
                         """.trimIndent(),
                     )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS toolchain_installations (
+                            installation_id TEXT PRIMARY KEY,
+                            operation_id TEXT NOT NULL UNIQUE REFERENCES operations(operation_id),
+                            principal_id TEXT NOT NULL,
+                            plan_sha256 TEXT NOT NULL,
+                            catalog_sha256 TEXT NOT NULL,
+                            request_json TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            progress_percent INTEGER NOT NULL,
+                            cancel_requested INTEGER NOT NULL DEFAULT 0,
+                            reason_code TEXT,
+                            reason_message TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS toolchain_installation_items (
+                            installation_id TEXT NOT NULL REFERENCES toolchain_installations(installation_id) ON DELETE CASCADE,
+                            ordinal INTEGER NOT NULL,
+                            artifact_id TEXT NOT NULL,
+                            component TEXT NOT NULL,
+                            version TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                            PRIMARY KEY(installation_id, ordinal),
+                            UNIQUE(installation_id, artifact_id)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS toolchain_inventory (
+                            artifact_id TEXT PRIMARY KEY,
+                            component TEXT NOT NULL,
+                            version TEXT NOT NULL,
+                            archive_sha256 TEXT NOT NULL,
+                            content_manifest_sha256 TEXT NOT NULL,
+                            installed_bytes INTEGER NOT NULL,
+                            relative_path TEXT NOT NULL UNIQUE,
+                            state TEXT NOT NULL,
+                            installed_at TEXT NOT NULL,
+                            checked_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS toolchain_license_acceptances (
+                            runner_id TEXT NOT NULL,
+                            principal_id TEXT NOT NULL,
+                            license_id TEXT NOT NULL,
+                            license_text_sha256 TEXT NOT NULL,
+                            accepted_at TEXT NOT NULL,
+                            PRIMARY KEY(runner_id, principal_id, license_id, license_text_sha256)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS toolchain_removal_previews (
+                            preview_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL,
+                            artifact_ids_json TEXT NOT NULL,
+                            releasable_bytes INTEGER NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            idempotency_key TEXT NOT NULL,
+                            request_sha256 TEXT NOT NULL,
+                            UNIQUE(principal_id, idempotency_key)
+                        )
+                        """.trimIndent(),
+                    )
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
                 connection.commit()
@@ -1659,7 +1736,7 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 9
+        const val SCHEMA_VERSION = 10
         val SANDBOX_COLUMNS = listOf(
             "sandbox_mode TEXT", "sandbox_origin TEXT", "sandbox_profile_id TEXT", "sandbox_snapshot TEXT",
             "sandbox_snapshot_sha256 TEXT", "sandbox_cleanup_status TEXT", "manifest_format TEXT",

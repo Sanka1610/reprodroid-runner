@@ -53,7 +53,11 @@ class StorageRetentionApiTest {
         val second = client.get("/v2/capabilities").body<V2CapabilitiesResponse>()
         assertEquals(first.runnerId, second.runnerId)
         assertEquals(
-            listOf(V2Capability("foundation", 1), V2Capability("storage-retention", 1)),
+            listOf(
+                V2Capability("foundation", 1),
+                V2Capability("storage-retention", 1),
+                V2Capability("toolchain-install", 1),
+            ),
             first.capabilities,
         )
         val wire = client.get("/v2/capabilities").bodyAsText()
@@ -423,10 +427,10 @@ class StorageRetentionApiTest {
     }
 
     @Test
-    fun `SQLite nine migration creates durable storage tables without changing old job`() {
+    fun `SQLite ten migration creates durable storage and toolchain tables without changing old job`() {
         val jobId = seedTerminalJob()
         val runnerId = StorageRetentionStore(stateDirectory).runnerId()
-        assertEquals(9, sqlLong("PRAGMA user_version"))
+        assertEquals(10, sqlLong("PRAGMA user_version"))
         assertEquals(JobState.SUCCEEDED, requireNotNull(SQLiteJobStore(stateDirectory).getJob(jobId)).state)
         assertEquals(runnerId, StorageRetentionStore(stateDirectory).runnerId())
         val tables = setOf(

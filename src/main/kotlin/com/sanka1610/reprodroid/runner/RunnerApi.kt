@@ -34,6 +34,7 @@ class ApiException(
         fun badRequest(code: String, message: String) = ApiException(HttpStatusCode.BadRequest, code, message)
         fun forbidden(code: String, message: String) = ApiException(HttpStatusCode.Forbidden, code, message)
         fun notFound() = ApiException(HttpStatusCode.NotFound, "JOB_NOT_FOUND", "The requested job does not exist.")
+        fun notFound(code: String, message: String) = ApiException(HttpStatusCode.NotFound, code, message)
         fun artifactNotFound() =
             ApiException(HttpStatusCode.NotFound, "ARTIFACT_NOT_FOUND", "The requested artifact does not exist.")
         fun conflict(code: String, message: String) = ApiException(HttpStatusCode.Conflict, code, message)
@@ -55,7 +56,15 @@ fun Application.runnerModule(config: RunnerConfig) {
         buildSandbox = config.buildSandbox,
     )
     val storageRetention = StorageRetentionStore(config.stateDirectory)
-    monitor.subscribe(ApplicationStopped) { coordinator.close() }
+    val toolchains = if (config.apiV2Enabled) {
+        ToolchainStore(config.stateDirectory, storageRetention.runnerId(), ToolchainCatalog.load()).also { it.startRecovery() }
+    } else {
+        null
+    }
+    monitor.subscribe(ApplicationStopped) {
+        coordinator.close()
+        toolchains?.close()
+    }
 
     install(CallLogging)
     install(ContentNegotiation) {
@@ -163,7 +172,10 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.respondFile(artifact.path.toFile())
             }
         }
-        if (config.apiV2Enabled) storageRetentionV2Routes(storageRetention)
+        if (config.apiV2Enabled) {
+            storageRetentionV2Routes(storageRetention)
+            toolchainV2Routes(requireNotNull(toolchains))
+        }
     }
 }
 

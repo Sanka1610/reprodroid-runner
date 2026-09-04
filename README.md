@@ -1,12 +1,12 @@
 # ReproDroid Runner
 
-**Phase 4 現在地（2026-09-04）:** 4.1のAndroid登録実装に続き、4.2のRunner storage-retention基盤を実装しました。RunnerはSQLite9へ移行し、development opt-inのAPI v2でcapability、durable operation、storage summary、retention hold、reservation、manual cleanup preview／executeを提供します。Android 16製品UIからloopback接続し、2 storage areaのsummaryと空のmanual cleanup previewを確認しました。全114 testはfailure 0、環境依存の16件は明示的opt-in skipです。汎用build、toolchain操作、pairing、LAN向けv2は未実装です。正本は[4.2実装契約](../reprodroid-project/docs/design/phase-4-storage-contract.md)と[API v2基礎](../reprodroid-project/docs/api/runner-api-v2.md)です。
+**Phase 4 現在地（2026-09-05）:** 4.2のstorage-retention基盤に続き、4.3のtrusted toolchain installerをSQLite10とdevelopment opt-in API v2 `toolchain-install@1`へ実装しました。bundled catalog、exact license consent、容量予約、HTTPS allowlist、SHA-256／Temurin OpenPGP検証、bounded safe extraction、content manifest、atomic publish、restart reconciliation、cancel、二段階manual removalを含みます。Runner JVM testは125件（pass 109、明示opt-in skip 16、failure 0）です。専用storeを使う汎用Docker build／comparisonは4.4であり、4.3 code成功へ読み替えません。正本は[ADR-0020](../reprodroid-project/docs/adr/0020-phase-4-trusted-toolchain-installation.md)と[4.3実装契約](../reprodroid-project/docs/design/phase-4-toolchain-contract.md)です。
 
 ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlist登録済みAndroid OSSの実ビルドを実行するPC側常駐プロセスです。
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。永続schemaはSQLite v9、Phase 3Eの新規buildはprivate Manifest v4／public v3です。API v1は既定で維持し、API v2はloopback上のdevelopment opt-inです。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。永続schemaはSQLite v10、Phase 3Eの新規buildはprivate Manifest v4／public v3です。API v1は既定で維持し、API v2はloopback上のdevelopment opt-inです。
 
 Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。Phase 3Cではfixed recipeへtyped determinism blockを追加し、recipe literalの`SOURCE_DATE_EPOCH`、Gradleの`--no-build-cache`、`C.UTF-8`の`LANG`／`LC_ALL`をGradle processと子processだけへ適用します。effective値はSQLite v6、Job API、private Manifest v3／public v2へ保存し、historical private v2／public v1を未設定値に限って読み取ります。Phase 3Dではdetached checkout後・Wrapper／Gradle前のin-process static source scan、条件付きreview gate、SQLite v7、bounded detail／continue APIを実装しました。既存MicroG-RE recipeはpinning `none`、determinism未設定のままです。3Eは固定profileのopt-in Docker executor、SQLite v8、private v4／public v3を実装しました。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE／scan review境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md)、[ADR-0015](../reprodroid-project/docs/adr/0015-recipe-determinism-options.md)、[ADR-0016](../reprodroid-project/docs/adr/0016-pre-build-static-source-scan.md)です。
 
@@ -35,7 +35,7 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 - `.git`除外、symlink非追跡、strict UTF-8／Unicode path integrity、resource／timeout上限のfail-closed検査
 - finding 1件以上で停止する`AWAITING_SCAN_REVIEW`とJob／digest単位のcontinue gate
 - canonical scan result、detector count、finding、review bindを保存するSQLite v7
-- durable operation、retention hold、storage reservation、availability、manual cleanupを保存するSQLite v9
+- durable operation、retention hold、storage reservation、availability、manual cleanup、toolchain installation／inventory／license／removal intentを保存するSQLite v10
 - NOFOLLOW実測、64 GiB Job／32 GiB toolchain budget、80% warning、64 MiB recovery reserve
 - strict JSON、JCS request hash、preview token再検証、item単位のpartial cleanup結果
 - cleanup中断時の再起動照合と`RECONCILIATION_REQUIRED`による新規storage副作用停止
@@ -44,7 +44,13 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 
 `REPRODROID_ENABLE_API_V2=true`を指定したloopback bindで、`foundation@1`と`storage-retention@1`を有効化します。pairing／認証が未実装のため非loopbackでは起動を拒否します。このgateを有効にしたRunnerはv1のJob create、confirm、retry、source-scan continueを426 `API_UPGRADE_REQUIRED`で停止し、v1 readとcancelは移行・安全経路として維持します。v2 generic Job createへ暗黙変換しません。
 
-4.2のRunner endpointはcapability／operation read、storage summary、JOB／ARTIFACT hold、限定reservation、manual cleanup preview／executeです。cleanup requestはpathを受け取らず、Runnerがowner root内の候補を列挙します。symlink、path escape、active／review待ちJob、sandbox cleanup `PENDING`、ACTIVE hold／reservation、preview後に変化したresourceを削除しません。toolchain cleanup、automatic cleanup、log export、共有送信は含みません。
+4.2のRunner endpointはcapability／operation read、storage summary、JOB／ARTIFACT hold、限定reservation、manual cleanup preview／executeです。cleanup requestはpathを受け取らず、Runnerがowner root内の候補を列挙します。symlink、path escape、active／review待ちJob、sandbox cleanup `PENDING`、ACTIVE hold／reservation、preview後に変化したresourceを削除しません。automatic cleanup、log export、共有送信は含みません。
+
+## Phase 4.3（trusted toolchain installation）
+
+`toolchain-install@1`はLinux x86_64専用です。初期catalogはTemurin 21、Gradle 8.14.3／9.6.1／9.7.1、Android command-line tools 15859902、platform 36／37、build-tools 36.0.0／37.0.0の9 artifactを固定します。runtime remote catalog、repository指定URL、downloadしたinstaller実行、`sdkmanager`実行、HOST buildへの接続はありません。
+
+導入物は`REPRODROID_STATE_DIR/toolchains`、途中物はinstallation ID単位の`toolchain-staging`だけへ置きます。archive size、展開bytes、entry count、path／link、component metadata、content manifestを検査し、同一filesystemのatomic move後にread-only化します。起動時はmanifestを実ファイルから再計算し、不一致を`RECONCILIATION_REQUIRED`にします。削除はinventory IDの期限付きpreviewと別の確定操作を必須とし、共有`JAVA_HOME`／`ANDROID_HOME`やcatalog外pathを受け取りません。
 
 wire responseはdefault値を含む契約fieldを常に明示します。`apiVersion`、`foundationContractVersion`、`runnerVersion`、`capabilities`、各storage／cleanup responseの`schemaVersion`を省略しません。Android側は未知field、重複key、必須field欠落、別runnerIdをfail closedで拒否します。
 
@@ -257,7 +263,7 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 ## Phase 3E完了後の計画・対象外
 
-Phase 3Eの固定profileによるopt-in Docker実装・受入は完了しています。Phase 4は4.1のAndroid登録実装を完了し、4.2を実装中です。[Phase 4 roadmap](../reprodroid-project/docs/design/phase-4-roadmap.md)、[計画合意事項](../reprodroid-project/docs/design/phase-4-planning-decisions.md)、[4.2実装契約](../reprodroid-project/docs/design/phase-4-storage-contract.md)を正本とします。RunnerのSQLite9／development API v2 storage-retentionは実装済みですが、Android側のRoom16、Runner v2接続、製品UI、audit export、実環境受入は未完了です。
+Phase 3Eの固定profileによるopt-in Docker実装・受入、Phase 4.1のAndroid登録、4.2のhistory／storage、4.3のtoolchain codeは完了しています。[Phase 4 roadmap](../reprodroid-project/docs/design/phase-4-roadmap.md)、[計画合意事項](../reprodroid-project/docs/design/phase-4-planning-decisions.md)、[4.3実装契約](../reprodroid-project/docs/design/phase-4-toolchain-contract.md)を正本とします。4.3の全9 artifactを空storeからAndroid操作で導入しrestart／manual removalまで行う製品E2Eと、toolchainをread-only mountする汎用Docker buildは未実施です。後者は4.4の別工程です。
 
 汎用buildはDocker必須、許可先限定通信・全書込み領域quota・独立A／Bを要求し、HOSTへfallbackしません。Jobの計画既定は4 CPU相当quota、memory 8 GiB・swapなし、disk 16 GiB、PID 1,024、inode 500,000、tmpfs 1 GiB、詳細log 64 MiB、Gradle workers最大2、Runner実行枠1、各build60分です。これらは現行固定profileの値ではなく、実装・実環境検証が必要です。現行bridge・起動前guardを汎用隔離や強制quotaの証明にしません。
 
