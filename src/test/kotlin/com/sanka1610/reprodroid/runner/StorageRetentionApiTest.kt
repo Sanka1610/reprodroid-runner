@@ -14,6 +14,9 @@ import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.Json
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -142,6 +145,10 @@ class StorageRetentionApiTest {
         assertEquals(V2OperationState.COMPLETED, first.state)
         val holdId = requireNotNull(first.result).resourceId
 
+        val restarted = StorageRetentionStore(stateDirectory)
+        assertEquals(first.operationId, restarted.operation(first.operationId, "local-development").operationId)
+        assertEquals("ACTIVE", sqlString("SELECT state FROM retention_holds WHERE hold_id = '$holdId'"))
+
         val replay = client.post("/v2/retention/holds") { mutationHeaders(key); setBody(body) }
         assertEquals(HttpStatusCode.OK, replay.status)
         assertEquals(first.operationId, replay.body<V2OperationResponse>().operationId)
@@ -198,6 +205,49 @@ class StorageRetentionApiTest {
     }
 
     @Test
+    fun `concurrent reservation converges and partial bytes fail closed across restart`() = testApplication {
+        val jobId = seedTerminalJob()
+        application { runnerModule(testConfig()) }
+        val client = jsonClient()
+        val body = reservationBody(jobId, 1024)
+
+        val statuses = coroutineScope {
+            listOf(UUID.randomUUID().toString(), UUID.randomUUID().toString()).map { key ->
+                async {
+                    client.post("/v2/storage/reservations") {
+                        mutationHeaders(key)
+                        setBody(body)
+                    }.status
+                }
+            }.awaitAll()
+        }
+        assertEquals(listOf(HttpStatusCode.Accepted, HttpStatusCode.Conflict), statuses.sortedBy(HttpStatusCode::value))
+        assertEquals(1, sqlLong("SELECT COUNT(*) FROM storage_reservations WHERE state = 'ACTIVE'"))
+        val reservationId = sqlString("SELECT reservation_id FROM storage_reservations WHERE state = 'ACTIVE'")
+
+        val restarted = StorageRetentionStore(stateDirectory)
+        assertEquals(1, sqlLong("SELECT COUNT(*) FROM storage_reservations WHERE state = 'ACTIVE'"))
+        assertEquals(
+            1024L,
+            restarted.storageSummary().areas.single { it.area == StorageArea.RUNNER_JOB }.reservedBytes.toLong(),
+        )
+
+        val partial = stateDirectory.resolve("workspaces").resolve(jobId).resolve("download.part")
+        Files.createDirectories(partial.parent)
+        Files.writeString(partial, "unconfirmed")
+        val release = client.post("/v2/storage/reservations/$reservationId/release") {
+            mutationHeaders(UUID.randomUUID().toString())
+            setBody("""{"reason":"OPERATION_CANCELLED"}""")
+        }
+        assertEquals(HttpStatusCode.Accepted, release.status)
+        val operation = release.body<V2OperationResponse>()
+        assertEquals(V2OperationState.RECONCILIATION_REQUIRED, operation.state)
+        assertEquals("UNCONFIRMED_PART_BYTES", operation.reason?.code)
+        assertEquals("RECONCILIATION_REQUIRED", sqlString("SELECT state FROM storage_reservations WHERE reservation_id = '$reservationId'"))
+        assertTrue(Files.exists(partial))
+    }
+
+    @Test
     fun `cleanup preview preserves held workspace then deletes it after explicit release`() = testApplication {
         val jobId = seedTerminalJob(old = true)
         val workspace = stateDirectory.resolve("workspaces").resolve(jobId)
@@ -234,6 +284,42 @@ class StorageRetentionApiTest {
         assertEquals("DELETED", completed.items.single().result)
         assertFalse(Files.exists(workspace))
         assertEquals("DELETED", sqlString("SELECT state FROM resource_availability WHERE resource_id = '$jobId'"))
+    }
+
+    @Test
+    fun `cleanup exposes and preserves active review and sandbox pending workspaces`() = testApplication {
+        val activeJob = seedTerminalJob(old = true)
+        val reviewJob = seedTerminalJob(old = true)
+        val pendingJob = seedTerminalJob(old = true)
+        listOf(activeJob, reviewJob, pendingJob).forEach { jobId ->
+            val workspace = stateDirectory.resolve("workspaces").resolve(jobId)
+            Files.createDirectories(workspace)
+            Files.writeString(workspace.resolve("payload.bin"), jobId)
+        }
+        application { runnerModule(testConfig()) }
+        val client = jsonClient()
+        client.get("/v2/capabilities")
+        sqlUpdate("UPDATE jobs SET state = 'BUILDING' WHERE job_id = '$activeJob'")
+        sqlUpdate("UPDATE jobs SET state = 'AWAITING_SCAN_REVIEW' WHERE job_id = '$reviewJob'")
+        sqlUpdate("UPDATE jobs SET sandbox_cleanup_status = 'PENDING' WHERE job_id = '$pendingJob'")
+
+        val previewId = createWorkspacePreview(client).result!!.resourceId
+        val preview = client.get("/v2/cleanup/previews/$previewId").body<CleanupPreviewResponse>()
+        val protections = preview.items.associate { it.resourceId to it.protectionReasons.toSet() }
+        assertTrue("ACTIVE_JOB" in protections.getValue(activeJob))
+        assertEquals(setOf("ACTIVE_JOB", "AWAITING_REVIEW"), protections.getValue(reviewJob))
+        assertEquals(setOf("SANDBOX_CLEANUP_PENDING"), protections.getValue(pendingJob))
+
+        val execute = client.post("/v2/cleanup/previews/$previewId/execute") {
+            mutationHeaders(UUID.randomUUID().toString())
+            setBody("""{"itemIds":[${preview.items.joinToString(",") { "\"${it.itemId}\"" }}]}""")
+        }.body<V2OperationResponse>()
+        val run = client.get("/v2/cleanup/runs/${execute.result!!.resourceId}").body<CleanupRunResponse>()
+        assertEquals("PARTIAL", run.state)
+        assertTrue(run.items.all { it.result == "SKIPPED_PROTECTED" })
+        listOf(activeJob, reviewJob, pendingJob).forEach { jobId ->
+            assertTrue(Files.exists(stateDirectory.resolve("workspaces").resolve(jobId).resolve("payload.bin")))
+        }
     }
 
     @Test

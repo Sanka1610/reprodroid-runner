@@ -244,6 +244,26 @@ internal class StorageRetentionStore(
         val reserved = reserveOperation(principalId, OP_RESERVATION_RELEASE, idempotencyKey, request)
         if (reserved.existing) return reserved
         transitionOperation(reserved.response.operationId, V2OperationState.APPLYING)
+        if (reservationHasUnconfirmedPartBytes(reservationId)) {
+            transaction { connection ->
+                connection.prepareStatement(
+                    "UPDATE storage_reservations SET state = 'RECONCILIATION_REQUIRED', updated_at = ? " +
+                        "WHERE reservation_id = ? AND principal_id = ? AND state = 'ACTIVE'",
+                ).use { statement ->
+                    statement.setString(1, now())
+                    statement.setString(2, reservationId)
+                    statement.setString(3, principalId)
+                    check(statement.executeUpdate() == 1)
+                }
+                requireReconciliation(
+                    connection,
+                    reserved.response.operationId,
+                    "UNCONFIRMED_PART_BYTES",
+                    "The reservation still has unconfirmed partial bytes and cannot be released.",
+                )
+            }
+            return OperationReceipt(false, operation(reserved.response.operationId, principalId))
+        }
         transaction { connection ->
             connection.prepareStatement(
                 """
@@ -261,6 +281,63 @@ internal class StorageRetentionStore(
         }
         completeOperation(reserved.response.operationId, "STORAGE_RESERVATION", reservationId, null)
         return OperationReceipt(false, operation(reserved.response.operationId, principalId))
+    }
+
+    private fun reservationHasUnconfirmedPartBytes(reservationId: String): Boolean {
+        val targets = connection().use { connection ->
+            connection.prepareStatement(
+                "SELECT resource_kind, resource_id FROM storage_reservations WHERE reservation_id = ?",
+            ).use { statement ->
+                statement.setString(1, reservationId)
+                statement.executeQuery().use { rows ->
+                    check(rows.next())
+                    val kind = RetentionResourceKind.valueOf(rows.getString(1))
+                    val resourceId = rows.getString(2)
+                    when (kind) {
+                        RetentionResourceKind.JOB -> listOf(
+                            stateDirectory.resolve("workspaces").resolve(resourceId),
+                            stateDirectory.resolve("artifacts").resolve(resourceId),
+                            stateDirectory.resolve("sandbox-imports").resolve(resourceId),
+                        )
+                        RetentionResourceKind.ARTIFACT -> {
+                            val jobId = connection.prepareStatement(
+                                "SELECT job_id FROM artifacts WHERE artifact_id = ?",
+                            ).use { artifactStatement ->
+                                artifactStatement.setString(1, resourceId)
+                                artifactStatement.executeQuery().use { artifactRows ->
+                                    check(artifactRows.next())
+                                    artifactRows.getString(1)
+                                }
+                            }
+                            listOf(stateDirectory.resolve("artifacts").resolve(jobId))
+                        }
+                    }
+                }
+            }
+        }
+        return targets.any(::containsUnconfirmedPartBytes)
+    }
+
+    private fun containsUnconfirmedPartBytes(target: Path): Boolean {
+        val root = stateDirectory.toAbsolutePath().normalize()
+        val normalized = target.toAbsolutePath().normalize()
+        if (!normalized.startsWith(root)) return true
+        if (!Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)) return false
+        return runCatching {
+            Files.walk(normalized, MAX_PART_SCAN_DEPTH).use { paths ->
+                val iterator = paths.iterator()
+                var visited = 0
+                while (iterator.hasNext()) {
+                    if (++visited > MAX_PART_SCAN_ENTRIES) return@use true
+                    val path = iterator.next()
+                    if (Files.isSymbolicLink(path)) return@use true
+                    if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) continue
+                    val name = path.fileName.toString()
+                    if (name.endsWith(".part") || name.endsWith(".partial")) return@use true
+                }
+                false
+            }
+        }.getOrDefault(true)
     }
 
     @Synchronized
@@ -1478,6 +1555,8 @@ internal class StorageRetentionStore(
         const val WARNING_PERCENT = 80
         const val MAX_WALK_ENTRIES = 100_000
         const val MAX_WALK_DEPTH = 16
+        const val MAX_PART_SCAN_ENTRIES = 100_000
+        const val MAX_PART_SCAN_DEPTH = 16
         const val MAX_PREVIEW_ITEMS = 1_000
     }
 
