@@ -1,6 +1,6 @@
 # ReproDroid Runner
 
-**Phase 4 現在地（2026-09-02）:** 4.1のAndroid登録実装を完了し、4.2のRunner storage-retention基盤を実装しています。RunnerはSQLite9へ移行し、development opt-inのAPI v2でcapability、durable operation、storage summary、retention hold、reservation、manual cleanup preview／executeを提供します。汎用build、toolchain操作、pairing、LAN向けv2は未実装です。正本は[4.2実装契約](../reprodroid-project/docs/design/phase-4-storage-contract.md)と[API v2基礎](../reprodroid-project/docs/api/runner-api-v2.md)です。
+**Phase 4 現在地（2026-09-04）:** 4.1のAndroid登録実装に続き、4.2のRunner storage-retention基盤を実装しました。RunnerはSQLite9へ移行し、development opt-inのAPI v2でcapability、durable operation、storage summary、retention hold、reservation、manual cleanup preview／executeを提供します。Android 16製品UIからloopback接続し、2 storage areaのsummaryと空のmanual cleanup previewを確認しました。全114 testはfailure 0、環境依存の16件は明示的opt-in skipです。汎用build、toolchain操作、pairing、LAN向けv2は未実装です。正本は[4.2実装契約](../reprodroid-project/docs/design/phase-4-storage-contract.md)と[API v2基礎](../reprodroid-project/docs/api/runner-api-v2.md)です。
 
 ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlist登録済みAndroid OSSの実ビルドを実行するPC側常駐プロセスです。
 
@@ -45,6 +45,8 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 `REPRODROID_ENABLE_API_V2=true`を指定したloopback bindで、`foundation@1`と`storage-retention@1`を有効化します。pairing／認証が未実装のため非loopbackでは起動を拒否します。このgateを有効にしたRunnerはv1のJob create、confirm、retry、source-scan continueを426 `API_UPGRADE_REQUIRED`で停止し、v1 readとcancelは移行・安全経路として維持します。v2 generic Job createへ暗黙変換しません。
 
 4.2のRunner endpointはcapability／operation read、storage summary、JOB／ARTIFACT hold、限定reservation、manual cleanup preview／executeです。cleanup requestはpathを受け取らず、Runnerがowner root内の候補を列挙します。symlink、path escape、active／review待ちJob、sandbox cleanup `PENDING`、ACTIVE hold／reservation、preview後に変化したresourceを削除しません。toolchain cleanup、automatic cleanup、log export、共有送信は含みません。
+
+wire responseはdefault値を含む契約fieldを常に明示します。`apiVersion`、`foundationContractVersion`、`runnerVersion`、`capabilities`、各storage／cleanup responseの`schemaVersion`を省略しません。Android側は未知field、重複key、必須field欠落、別runnerIdをfail closedで拒否します。
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 

@@ -11,14 +11,11 @@ data class V2Capability(
 
 @Serializable
 data class V2CapabilitiesResponse(
-    val apiVersion: String = "v2",
-    val foundationContractVersion: Int = 1,
+    val apiVersion: String,
+    val foundationContractVersion: Int,
     val runnerId: String,
-    val runnerVersion: String = "0.1.0-alpha01",
-    val capabilities: List<V2Capability> = listOf(
-        V2Capability("foundation", 1),
-        V2Capability("storage-retention", 1),
-    ),
+    val runnerVersion: String,
+    val capabilities: List<V2Capability>,
 )
 
 @Serializable

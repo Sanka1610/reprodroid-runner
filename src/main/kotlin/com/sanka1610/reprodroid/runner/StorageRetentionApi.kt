@@ -21,7 +21,18 @@ import java.time.Instant
 internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore) {
     route("/v2") {
         get("/capabilities") {
-            call.respond(V2CapabilitiesResponse(runnerId = store.runnerId()))
+            call.respond(
+                V2CapabilitiesResponse(
+                    apiVersion = "v2",
+                    foundationContractVersion = 1,
+                    runnerId = store.runnerId(),
+                    runnerVersion = "0.1.0-alpha01",
+                    capabilities = listOf(
+                        V2Capability("foundation", 1),
+                        V2Capability("storage-retention", 1),
+                    ),
+                ),
+            )
         }
         get("/operations/{operationId}") {
             call.respond(store.operation(call.requiredCanonicalUuid("operationId"), LOCAL_PRINCIPAL))

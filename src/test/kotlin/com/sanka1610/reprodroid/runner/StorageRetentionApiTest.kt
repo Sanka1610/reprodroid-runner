@@ -1,6 +1,7 @@
 package com.sanka1610.reprodroid.runner
 
 import io.ktor.client.call.body
+import io.ktor.client.statement.bodyAsText
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -52,6 +53,16 @@ class StorageRetentionApiTest {
             listOf(V2Capability("foundation", 1), V2Capability("storage-retention", 1)),
             first.capabilities,
         )
+        val wire = client.get("/v2/capabilities").bodyAsText()
+        assertTrue(wire.contains("\"apiVersion\":\"v2\""))
+        assertTrue(wire.contains("\"foundationContractVersion\":1"))
+        assertTrue(wire.contains("\"runnerVersion\":\"0.1.0-alpha01\""))
+        assertTrue(wire.contains("\"capabilities\":["))
+
+        val storageWire = client.get("/v2/storage/summary") {
+            header("X-ReproDroid-Contract", "storage-retention@1")
+        }.bodyAsText()
+        assertTrue(storageWire.contains("\"schemaVersion\":1"))
 
         val legacy = client.post("/v1/jobs") {
             contentType(ContentType.Application.Json)

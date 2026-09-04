@@ -63,6 +63,7 @@ fun Application.runnerModule(config: RunnerConfig) {
             Json {
                 ignoreUnknownKeys = false
                 explicitNulls = false
+                encodeDefaults = true
             },
         )
     }
