@@ -26,7 +26,7 @@ data class JobSandbox(
         when (state) {
             JobState.CREATED, JobState.RESOLVING_SOURCE, JobState.AWAITING_CONFIRMATION, JobState.QUEUED,
             JobState.CLONING, JobState.SCANNING_SOURCE, JobState.AWAITING_SCAN_REVIEW -> require(cleanupStatus == SandboxCleanupStatus.NOT_CREATED)
-            JobState.BUILDING -> require(cleanupStatus != SandboxCleanupStatus.NOT_CREATED)
+            JobState.VERIFYING_WRAPPER, JobState.DISCOVERING_CONFIGURATION, JobState.BUILDING -> Unit
             JobState.DISCOVERING_ARTIFACTS, JobState.SUCCEEDED -> require(cleanupStatus == SandboxCleanupStatus.COMPLETE)
             else -> Unit
         }
@@ -36,7 +36,7 @@ data class JobSandbox(
         when (mode) {
             BuildSandboxMode.HOST -> require(profileId == null && cleanupStatus == null)
             BuildSandboxMode.DOCKER -> require(
-                origin == SandboxOrigin.NEW_JOB && profileId == DockerSandboxProfile.ID && cleanupStatus != null,
+                origin == SandboxOrigin.NEW_JOB && profileId in setOf(DockerSandboxProfile.ID, GenericDockerSandboxProfile.ID) && cleanupStatus != null,
             )
         }
     }
@@ -44,23 +44,48 @@ data class JobSandbox(
 
 internal enum class SandboxManifestFormat { LEGACY_ALLOWED, REQUIRED_V4 }
 
+internal interface DockerSandboxPolicy {
+    val profileId: String
+    val image: String
+    val platform: String
+    val dockerExecutable: String
+    val endpoint: String
+    val uid: Int
+    val gid: Int
+    val cpuCount: Int
+    val cpuset: String
+    val memoryBytes: Long
+    val memorySwapBytes: Long
+    val pids: Int
+    val tmpfsBytes: Long
+    val networkMode: String
+    val minimumFreeDiskBytes: Long
+    val home: String
+    val source: String
+    val gradleHome: String
+    val jdk: String
+    val sdk: String
+    val gradle: String?
+    val gradleReadOnly: Boolean
+}
+
 /** All policy values are explicit in canonical JSON; changing them requires a new profile version. */
 @Serializable
 internal data class DockerSandboxProfile(
-    val profileId: String = ID,
-    val image: String = "ubuntu@$IMAGE_DIGEST",
-    val platform: String = "linux/amd64",
-    val dockerExecutable: String = "/usr/bin/docker",
-    val endpoint: String = "unix:///var/run/docker.sock",
-    val uid: Int = 1000,
-    val gid: Int = 1000,
-    val cpuCount: Int = 8,
-    val cpuset: String = "0-7",
-    val memoryBytes: Long = 8_589_934_592,
-    val memorySwapBytes: Long = 8_589_934_592,
-    val pids: Int = 1024,
-    val tmpfsBytes: Long = 1_073_741_824,
-    val networkMode: String = "BRIDGE",
+    override val profileId: String = ID,
+    override val image: String = "ubuntu@$IMAGE_DIGEST",
+    override val platform: String = "linux/amd64",
+    override val dockerExecutable: String = "/usr/bin/docker",
+    override val endpoint: String = "unix:///var/run/docker.sock",
+    override val uid: Int = 1000,
+    override val gid: Int = 1000,
+    override val cpuCount: Int = 8,
+    override val cpuset: String = "0-7",
+    override val memoryBytes: Long = 8_589_934_592,
+    override val memorySwapBytes: Long = 8_589_934_592,
+    override val pids: Int = 1024,
+    override val tmpfsBytes: Long = 1_073_741_824,
+    override val networkMode: String = "BRIDGE",
     val readOnlyRoot: Boolean = true,
     val capDropAll: Boolean = true,
     val noNewPrivileges: Boolean = true,
@@ -69,19 +94,22 @@ internal data class DockerSandboxProfile(
     val jdkReadOnly: Boolean = true,
     val dockerSocketMounted: Boolean = false,
     val jobDiskQuotaEnforced: Boolean = false,
-    val minimumFreeDiskBytes: Long = 17_179_869_184,
-    val home: String = "/home/ubuntu",
-    val source: String = "/work/source",
-    val gradleHome: String = "/work/gradle-home",
-    val jdk: String = "/opt/jdk",
-    val sdk: String = "/opt/android-sdk",
+    override val minimumFreeDiskBytes: Long = 17_179_869_184,
+    override val home: String = "/home/ubuntu",
+    override val source: String = "/work/source",
+    override val gradleHome: String = "/work/gradle-home",
+    override val jdk: String = "/opt/jdk",
+    override val sdk: String = "/opt/android-sdk",
     val recipeId: String = "morpheapp-microg-re-6.1.4-default-release",
     val javaMajor: Int = 18,
     val gradleVersion: String = "8.14.3",
     val wrapperJarGradleVersion: String = "8.11.1",
     val androidSdkApiLevel: Int = 36,
     val buildToolsVersion: String = "36.0.0",
-) {
+) : DockerSandboxPolicy {
+    override val gradle: String? get() = null
+    override val gradleReadOnly: Boolean get() = false
+
     fun requireSupported(recipe: BuildRecipe) {
         val fixedRecipe = BuildRecipeRegistry.defaultRecipes.single { it.id == recipeId }
         if (recipe != fixedRecipe) {
@@ -92,6 +120,54 @@ internal data class DockerSandboxProfile(
     companion object {
         const val ID = "docker-microg-v1"
         const val IMAGE_DIGEST = "sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316"
+    }
+}
+
+/** A separate immutable profile for Phase 4.4 generic builds. */
+@Serializable
+internal data class GenericDockerSandboxProfile(
+    override val profileId: String = ID,
+    override val image: String = "ubuntu@${DockerSandboxProfile.IMAGE_DIGEST}",
+    override val platform: String = "linux/amd64",
+    override val dockerExecutable: String = "/usr/bin/docker",
+    override val endpoint: String = "unix:///var/run/docker.sock",
+    override val uid: Int = 1000,
+    override val gid: Int = 1000,
+    override val cpuCount: Int = 4,
+    override val cpuset: String = "0-3",
+    override val memoryBytes: Long = DEFAULT_MEMORY_BYTES,
+    override val memorySwapBytes: Long = DEFAULT_MEMORY_BYTES,
+    override val pids: Int = 1024,
+    override val tmpfsBytes: Long = 1_073_741_824,
+    override val networkMode: String = "BRIDGE",
+    val readOnlyRoot: Boolean = true,
+    val capDropAll: Boolean = true,
+    val noNewPrivileges: Boolean = true,
+    val seccomp: String = "DEFAULT",
+    val sdkReadOnly: Boolean = true,
+    val jdkReadOnly: Boolean = true,
+    override val gradleReadOnly: Boolean = true,
+    val dockerSocketMounted: Boolean = false,
+    val jobDiskQuotaEnforced: Boolean = false,
+    override val minimumFreeDiskBytes: Long = 17_179_869_184,
+    override val home: String = "/home/ubuntu",
+    override val source: String = "/work/source",
+    override val gradleHome: String = "/work/gradle-home",
+    override val jdk: String = "/opt/jdk",
+    override val sdk: String = "/opt/android-sdk",
+    override val gradle: String = "/opt/gradle",
+    val maxGradleWorkers: Int = 2,
+    val detailedLogBytes: Long = 67_108_864,
+) : DockerSandboxPolicy {
+    init {
+        require(memoryBytes in setOf(DEFAULT_MEMORY_BYTES, RETRY_MEMORY_BYTES))
+        require(memorySwapBytes == memoryBytes)
+    }
+
+    companion object {
+        const val ID = "docker-generic-v1"
+        const val DEFAULT_MEMORY_BYTES = 8_589_934_592L
+        const val RETRY_MEMORY_BYTES = 12_884_901_888L
     }
 }
 
@@ -111,6 +187,7 @@ internal data class SandboxSnapshot(
             requireNotNull(canonicalProfile)
             require(canonicalProfile.toByteArray(Charsets.UTF_8).size <= 8192)
             require(profileSha256 == hash(canonicalProfile))
+            require(jobSandbox.profileId == DockerSandboxProfile.ID)
             val decoded = SNAPSHOT_JSON.decodeFromString<DockerSandboxProfile>(canonicalProfile)
             require(decoded == DockerSandboxProfile())
             require(canonicalProfile == SNAPSHOT_JSON.encodeToString(decoded))
@@ -135,9 +212,46 @@ internal data class SandboxSnapshot(
             )
         }
 
+        fun newGenericJob(memoryBytes: Long = GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES): SandboxSnapshot {
+            val profile = GenericDockerSandboxProfile(memoryBytes = memoryBytes, memorySwapBytes = memoryBytes)
+            val canonical = SNAPSHOT_JSON.encodeToString(profile)
+            return SandboxSnapshot(
+                jobSandbox = JobSandbox(
+                    BuildSandboxMode.DOCKER,
+                    SandboxOrigin.NEW_JOB,
+                    profileId = GenericDockerSandboxProfile.ID,
+                    cleanupStatus = SandboxCleanupStatus.NOT_CREATED,
+                ),
+                canonicalProfile = canonical,
+                profileSha256 = hash(canonical),
+                manifestFormat = SandboxManifestFormat.REQUIRED_V4,
+            )
+        }
+
         private val SNAPSHOT_JSON = Json { encodeDefaults = true; ignoreUnknownKeys = false }
+        private val GENERIC_SNAPSHOT_JSON = Json { encodeDefaults = true; ignoreUnknownKeys = false }
         private fun hash(value: String): String = MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    fun validatedGenericProfile(): GenericDockerSandboxProfile? {
+        try {
+            if (jobSandbox.profileId != GenericDockerSandboxProfile.ID) return null
+            require(jobSandbox.mode == BuildSandboxMode.DOCKER && manifestFormat == SandboxManifestFormat.REQUIRED_V4)
+            val canonical = requireNotNull(canonicalProfile)
+            require(canonical.toByteArray(Charsets.UTF_8).size <= 8192)
+            require(profileSha256 == hash(canonical))
+            val decoded = GENERIC_SNAPSHOT_JSON.decodeFromString<GenericDockerSandboxProfile>(canonical)
+            require(decoded.profileId == GenericDockerSandboxProfile.ID)
+            require(canonical == GENERIC_SNAPSHOT_JSON.encodeToString(decoded))
+            return decoded
+        } catch (_: Exception) {
+            throw invalidSandboxSnapshot()
+        }
+    }
+
+    fun validateAnyProfile() {
+        if (jobSandbox.profileId == GenericDockerSandboxProfile.ID) validatedGenericProfile() else validatedProfile()
     }
 }
 
@@ -156,6 +270,7 @@ data class SandboxIsolation(
     val uid: Int, val gid: Int, val readOnlyRoot: Boolean, val capDropAll: Boolean,
     val noNewPrivileges: Boolean, val seccomp: String, val sdkReadOnly: Boolean,
     val jdkReadOnly: Boolean, val dockerSocketMounted: Boolean, val jobDiskQuotaEnforced: Boolean,
+    val gradleReadOnly: Boolean = false,
 )
 
 @Serializable
@@ -173,15 +288,23 @@ data class SandboxEvidence(
         if (mode == BuildSandboxMode.HOST) {
             require(this == SandboxEvidence(BuildSandboxMode.HOST))
         } else {
+            val fixed = profileId == DockerSandboxProfile.ID
             val profile = DockerSandboxProfile()
-            require(profileId == profile.profileId && imageDigest == DockerSandboxProfile.IMAGE_DIGEST)
+            val generic = GenericDockerSandboxProfile()
+            require(profileId in setOf(profile.profileId, generic.profileId) && imageDigest == DockerSandboxProfile.IMAGE_DIGEST)
             require(platform == profile.platform && networkMode == profile.networkMode)
             val version = requireNotNull(engineVersion)
             require(version.isNotBlank() && version.toByteArray(Charsets.UTF_8).size <= 128 &&
                 version.all { it.code in 0x21..0x7e && it != '/' && it != '\\' })
-            require(limits == SandboxLimits(profile.cpuCount, profile.cpuset, profile.memoryBytes,
-                profile.memorySwapBytes, profile.pids, profile.tmpfsBytes))
-            require(isolation == SandboxIsolation(profile.uid, profile.gid, true, true, true, "DEFAULT", true, true, false, false))
+            val expectedLimits = if (fixed) {
+                SandboxLimits(profile.cpuCount, profile.cpuset, profile.memoryBytes, profile.memorySwapBytes, profile.pids, profile.tmpfsBytes)
+            } else {
+                val memory = requireNotNull(limits).memoryBytes
+                require(memory in setOf(GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES, GenericDockerSandboxProfile.RETRY_MEMORY_BYTES))
+                SandboxLimits(generic.cpuCount, generic.cpuset, memory, memory, generic.pids, generic.tmpfsBytes)
+            }
+            require(limits == expectedLimits)
+            require(isolation == SandboxIsolation(profile.uid, profile.gid, true, true, true, "DEFAULT", true, true, false, false, !fixed))
         }
     }
 }

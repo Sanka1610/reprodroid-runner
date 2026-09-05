@@ -92,11 +92,15 @@ internal class BuildManifestPublisher(
     private fun validateDockerAudit(job: StoredJob, manifest: BuildEnvironmentManifest) {
         try {
             val snapshot = requireNotNull(job.sandbox)
-            val profile = requireNotNull(snapshot.validatedProfile())
+            val fixedProfile = if (job.genericBuild == null) snapshot.validatedProfile() else null
+            val genericProfile = if (job.genericBuild != null) snapshot.validatedGenericProfile() else null
+            val profile: DockerSandboxPolicy = fixedProfile ?: genericProfile ?: error("missing profile")
             require(snapshot.jobSandbox.cleanupStatus == SandboxCleanupStatus.COMPLETE)
-            require(manifest.gradleVersion == profile.gradleVersion &&
-                manifest.wrapper.wrapperJarGradleVersion == profile.wrapperJarGradleVersion &&
-                manifest.androidSdkApiLevel == profile.androidSdkApiLevel && manifest.buildToolsVersion == profile.buildToolsVersion)
+            val recipe = job.genericBuild?.let { GenericBuildContract.recipe(job.repositoryUrl, job.revision.value, it) }
+                ?: BuildRecipeRegistry.defaultRecipes.single { it.id == manifest.recipeId }
+            require(manifest.gradleVersion == recipe.gradleVersion &&
+                manifest.wrapper.wrapperJarGradleVersion == recipe.wrapperJarGradleVersion &&
+                manifest.androidSdkApiLevel == recipe.androidSdkApiLevel && manifest.buildToolsVersion == recipe.buildToolsVersion)
             val audit = requireNotNull(manifest.dockerAudit)
             // This private field is the controller's verified SDK source, not the container target or public SDK API level.
             require(manifest.androidSdk == audit.mounts.single { it.destination == profile.sdk && it.readOnly }.source)
@@ -117,16 +121,26 @@ internal class BuildManifestPublisher(
             require(image.string("Id") == audit.imageId && image.string("Os") == "linux" && image.string("Architecture") == "amd64")
             require(image.getValue("RepoDigests").jsonArray.any { it.jsonPrimitive.content == profile.image })
             val environment = mapOf(
-                "PATH" to "${profile.jdk}/bin:/usr/bin:/bin", "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
+                "PATH" to listOfNotNull("${profile.jdk}/bin", profile.gradle?.let { "$it/bin" }, "/usr/bin", "/bin").joinToString(":"),
+                "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
                 "GRADLE_USER_HOME" to profile.gradleHome, "ANDROID_HOME" to profile.sdk, "ANDROID_SDK_ROOT" to profile.sdk,
             )
-            val recipe = BuildRecipeRegistry.defaultRecipes.single { it.id == manifest.recipeId }
-            profile.requireSupported(recipe)
-            val command = listOf(
-                "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
-                "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
-            ) + gradleOptions(recipe) + recipe.tasks
-            DockerBuildSpec(profile, audit.mounts, environment).validateInspection(
+            fixedProfile?.requireSupported(recipe)
+            val launcher = if (job.genericBuild == null) {
+                listOf(
+                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+                    "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
+                )
+            } else {
+                listOf(
+                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+                    "-classpath", "${requireNotNull(profile.gradle)}/lib/*:${profile.gradle}/lib/plugins/*", "org.gradle.launcher.GradleMain",
+                )
+            }
+            val genericOptions = if (job.genericBuild != null) listOf("--rerun-tasks", "--no-configuration-cache", "--max-workers=2") else emptyList()
+            val command = launcher + gradleOptions(recipe) + genericOptions + recipe.tasks
+            val workingDirectory = if (recipe.buildRoot == ".") profile.source else "${profile.source}/${recipe.buildRoot}"
+            DockerBuildSpec(profile, audit.mounts, environment, workingDirectory).validateInspection(
                 PRIVATE_JSON.parseToJsonElement(audit.buildInspection).jsonObject, build, audit.imageId, command,
             )
         } catch (_: Exception) { throw manifestInvalid() }
@@ -198,7 +212,10 @@ internal class BuildManifestPublisher(
             (internalSchemaVersion >= 3 && manifest.determinism != effectiveDeterminism) ||
             (internalSchemaVersion >= 4 && (effectiveBuild == null || manifest.recipeId != effectiveBuild.recipeId ||
                 manifest.buildRoot != effectiveBuild.buildRoot || manifest.tasks != effectiveBuild.tasks ||
-                manifest.javaVersion.substringBefore('.').toIntOrNull() != effectiveBuild.javaMajor))
+                manifest.javaVersion.substringBefore('.').toIntOrNull() != effectiveBuild.javaMajor)) ||
+            (internalSchemaVersion >= 5 && (manifest.genericBuild != job.genericBuild ||
+                manifest.discovery != store.genericDiscovery(job.jobId) ||
+                (job.genericBuild != null && manifest.discovery == null)))
         ) {
             throw manifestInvalid()
         }
@@ -235,6 +252,8 @@ internal class BuildManifestPublisher(
             apkHash = manifestArtifact.sha256,
             determinism = manifest.determinism,
             sandbox = manifest.sandbox,
+            genericBuild = manifest.genericBuild,
+            discoverySha256 = manifest.discovery?.outputSha256,
         )
     }
 
@@ -292,7 +311,7 @@ internal class BuildManifestPublisher(
     )
 
     private companion object {
-        val SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS = setOf(2, 3, 4)
+        val SUPPORTED_INTERNAL_MANIFEST_SCHEMA_VERSIONS = setOf(2, 3, 4, 5)
         const val MAX_PUBLIC_TEXT_BYTES = 255
         val LOWERCASE_COMMIT_SHA = Regex("[0-9a-f]{40}")
         val LOWERCASE_SHA256 = Regex("[0-9a-f]{64}")

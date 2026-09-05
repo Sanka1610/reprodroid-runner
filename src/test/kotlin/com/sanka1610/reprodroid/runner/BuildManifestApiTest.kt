@@ -37,11 +37,11 @@ class BuildManifestApiTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         val rawResponse = response.bodyAsText()
-        assertTrue(rawResponse.contains("\"schemaVersion\":3"))
+        assertTrue(rawResponse.contains("\"schemaVersion\":4"))
         assertTrue(rawResponse.contains("\"sandbox\":{\"mode\":\"HOST\"}"))
         assertTrue(rawResponse.contains("\"determinism\":{\"noBuildCache\":false}"))
         val projection = API_JSON.decodeFromString<BuildEnvironmentManifestResponse>(rawResponse)
-        assertEquals(3, projection.schemaVersion)
+        assertEquals(4, projection.schemaVersion)
         assertEquals(DeterminismOptions(noBuildCache = false), projection.determinism)
         assertEquals(COMMIT, projection.commit)
         assertEquals(36, projection.androidSdk)

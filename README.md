@@ -1,12 +1,12 @@
 # ReproDroid Runner
 
-**Phase 4 現在地（2026-09-05）:** 4.2のstorage-retention基盤に続き、4.3のtrusted toolchain installerをSQLite10とdevelopment opt-in API v2 `toolchain-install@1`へ実装しました。bundled catalog、exact license consent、容量予約、HTTPS allowlist、SHA-256／Temurin OpenPGP検証、bounded safe extraction、content manifest、atomic publish、restart reconciliation、cancel、二段階manual removalを含みます。Runner JVM testは125件（pass 109、明示opt-in skip 16、failure 0）です。専用storeを使う汎用Docker build／comparisonは4.4であり、4.3 code成功へ読み替えません。正本は[ADR-0020](../reprodroid-project/docs/adr/0020-phase-4-trusted-toolchain-installation.md)と[4.3実装契約](../reprodroid-project/docs/design/phase-4-toolchain-contract.md)です。
+**Phase 4 現在地（2026-09-05）:** SQLite11へ4.4のgeneric Docker build／comparisonを実装しました。loopback development opt-inの`generic-build@1`と`apk-comparison@1`は、catalog管理toolchain、Docker必須・HOST fallbackなし、独立A／B、dynamic discovery、raw 3軸保存、memory OOMだけの明示retryを提供します。4.3 installerは正当な相対symbolic linkをconfineして許可し、archiveの実行bitをcontent manifestへ束縛して復元します。空store導入では9 artifactの`VERIFIED`とRunner再起動後のinventory復元を確認しました。JVM testは130件（pass 114、明示opt-in skip 16、failure 0）です。generic Android + Docker Build A/B製品E2Eは利用者指示により実施しておらず、機能成功・Reproducible判定の証拠ではありません。正本は[ADR-0021](../reprodroid-project/docs/adr/0021-phase-4-generic-build-sandbox-and-comparison.md)と[4.4実装記録](../reprodroid-project/reports/2026/09/2026-09-05-phase-4-4-implementation.md)です。
 
 ReproDroid AndroidアプリからJobを受け、模擬ビルドまたはallowlist登録済みAndroid OSSの実ビルドを実行するPC側常駐プロセスです。
 
 ## 現在の状態
 
-Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。永続schemaはSQLite v10、Phase 3Eの新規buildはprivate Manifest v4／public v3です。API v1は既定で維持し、API v2はloopback上のdevelopment opt-inです。
+Phase 2Bの固定release build profileとAndroid比較E2Eに対応しています。Phase 2Cのtrust／update／install／settingsと、Phase 2Dの独立再ビルド／APK高度比較はAndroid側の責務です。永続schemaはSQLite v11、Phase 3Eの新規buildはprivate Manifest v4／public v3です。API v1は既定で維持し、API v2はloopback上のdevelopment opt-inです。
 
 Phase 3A の Runner 実装として、private Build Environment Manifest schema v2、recipe 固定 SDK / Build Tools package の事前検証、integrity / redaction 済み public projection endpoint を API v1 に additive に追加しています。Phase 3Bではfixed recipeへ`none`／`lockfile`／`lockfile_offline`を追加し、lock modeの`buildRoot/gradle.lockfile`をpre-build／post-buildで検査します。Phase 3Cではfixed recipeへtyped determinism blockを追加し、recipe literalの`SOURCE_DATE_EPOCH`、Gradleの`--no-build-cache`、`C.UTF-8`の`LANG`／`LC_ALL`をGradle processと子processだけへ適用します。effective値はSQLite v6、Job API、private Manifest v3／public v2へ保存し、historical private v2／public v1を未設定値に限って読み取ります。Phase 3Dではdetached checkout後・Wrapper／Gradle前のin-process static source scan、条件付きreview gate、SQLite v7、bounded detail／continue APIを実装しました。既存MicroG-RE recipeはpinning `none`、determinism未設定のままです。3Eは固定profileのopt-in Docker executor、SQLite v8、private v4／public v3を実装しました。raw comparison / trust を Runner に移さず、Build A / Build B の独立 Job / RCE／scan review境界も維持します。正本は [Phase 3 roadmap](../reprodroid-project/docs/design/phase-3-roadmap.md)、[ADR-0013](../reprodroid-project/docs/adr/0013-build-environment-manifest-public-api.md)、[ADR-0014](../reprodroid-project/docs/adr/0014-dependency-pinning-recipe-contract.md)、[ADR-0015](../reprodroid-project/docs/adr/0015-recipe-determinism-options.md)、[ADR-0016](../reprodroid-project/docs/adr/0016-pre-build-static-source-scan.md)です。
 
@@ -53,6 +53,14 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 導入物は`REPRODROID_STATE_DIR/toolchains`、途中物はinstallation ID単位の`toolchain-staging`だけへ置きます。archive size、展開bytes、entry count、path／link、component metadata、content manifestを検査し、同一filesystemのatomic move後にread-only化します。起動時はmanifestを実ファイルから再計算し、不一致を`RECONCILIATION_REQUIRED`にします。削除はinventory IDの期限付きpreviewと別の確定操作を必須とし、共有`JAVA_HOME`／`ANDROID_HOME`やcatalog外pathを受け取りません。
 
 wire responseはdefault値を含む契約fieldを常に明示します。`apiVersion`、`foundationContractVersion`、`runnerVersion`、`capabilities`、各storage／cleanup responseの`schemaVersion`を省略しません。Android側は未知field、重複key、必須field欠落、別runnerIdをfail closedで拒否します。
+
+## Phase 4.4（generic Docker build and comparison）
+
+`REPRODROID_ENABLE_API_V2=true`、loopback bind、`REPRODROID_ENABLE_REAL_BUILDS=true`、`REPRODROID_BUILD_SANDBOX=DOCKER`の全条件を満たす時だけ、`generic-build@1`と`apk-comparison@1`を広告します。`POST /v2/builds`はfull commit SHA、JCS化済み設定snapshot、利用者のRCE同意、expected APK base nameを受け、Job固有のsource／HOME／Gradle cache／containerで実行します。設定外のGradle、Java、Android SDK、NDK、CMake、任意image／mount／Docker socket／DinD／host network／port publishは受け付けません。
+
+generic pathのGradle起動はcatalog管理のGradle launcherだけを使い、upstream wrapperを実行しません。Runner管理、clone、source scan／review、artifact検査、comparison、trust／install policyはhost側に残り、Gradle processと子processだけがcontainerへ入ります。containerのcleanup／bounded importを確認できなければ新規generic buildを停止します。hard disk／inode quotaと固定egress allowlistは現行4.4の対象外であり、bridgeをhost／LAN隔離の証拠として扱いません。
+
+`POST /v2/comparisons`はOfficial-vs-A、Official-vs-B、A-vs-Bのraw `MATCH`／`DIFFERENT`／`INCOMPARABLE`を同じcomparison IDへ保存します。3軸`MATCH`、公式identity、trust／install policyが揃うことが`reproducible`の必要条件です。resource retryは独立evidenceのあるcontainer memory OOMだけに限定し、新しいA／B一組を一回だけ作成します。製品E2Eは未実施であり、これらの実装・fixture testを実public projectでのbuild成功へ読み替えません。
 
 Phase 1EではMicroG-REの固定taskをRunner APIとAndroid UIから実行し、同一commitから同一size・SHA-256のAPKを生成した。content endpointからの取得、同じstate directoryでのRunner再起動後のJob／artifact／log cursor復元、Windows Android Emulatorからのdownloadと標準PackageInstaller E2Eまで確認済みである。詳細は[Phase 1E検証レポート](../reprodroid-project/reports/2026/08/2026-08-21-phase-1e.md)、履歴と最終状態は[Phase 1E再開・完了記録](../reprodroid-project/docs/handoffs/phase-1e-resume.md)を参照してください。
 
@@ -261,11 +269,11 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 3E完了後の計画・対象外
+## Phase 4.4実装後の状態・対象外
 
-Phase 3Eの固定profileによるopt-in Docker実装・受入、Phase 4.1のAndroid登録、4.2のhistory／storage、4.3のtoolchain codeは完了しています。[Phase 4 roadmap](../reprodroid-project/docs/design/phase-4-roadmap.md)、[計画合意事項](../reprodroid-project/docs/design/phase-4-planning-decisions.md)、[4.3実装契約](../reprodroid-project/docs/design/phase-4-toolchain-contract.md)を正本とします。4.3の全9 artifactを空storeからAndroid操作で導入しrestart／manual removalまで行う製品E2Eと、toolchainをread-only mountする汎用Docker buildは未実施です。後者は4.4の別工程です。
+Phase 3Eの固定profile、Phase 4.1のAndroid登録、4.2のhistory／storage、4.3のtoolchain、4.4のgeneric Docker build／comparison codeを実装しています。4.3は空storeから9 artifactを導入し、inventory、Runner restart復旧、manual removal cleanupまで確認しました。4.4はSQLite11、`generic-build@1`／`apk-comparison@1`、catalog-managed Gradle launcher、独立A／B、raw三軸、memory OOM限定retryを追加しています。[Phase 4 roadmap](../reprodroid-project/docs/design/phase-4-roadmap.md)、[ADR-0021](../reprodroid-project/docs/adr/0021-phase-4-generic-build-sandbox-and-comparison.md)、[4.4実装記録](../reprodroid-project/reports/2026/09/2026-09-05-phase-4-4-implementation.md)を正本とします。Android + Dockerの公開source二project Build A／B・比較E2Eは利用者指示により`NOT_RUN`であり、実build成功やReproducibleの証拠ではありません。
 
-汎用buildはDocker必須、許可先限定通信・全書込み領域quota・独立A／Bを要求し、HOSTへfallbackしません。Jobの計画既定は4 CPU相当quota、memory 8 GiB・swapなし、disk 16 GiB、PID 1,024、inode 500,000、tmpfs 1 GiB、詳細log 64 MiB、Gradle workers最大2、Runner実行枠1、各build60分です。これらは現行固定profileの値ではなく、実装・実環境検証が必要です。現行bridge・起動前guardを汎用隔離や強制quotaの証明にしません。
+汎用buildはDocker必須、HOST fallbackなしで、4 CPU、memory 8 GiB、swapなし、PID 1,024、tmpfs 1 GiB、詳細log 64 MiB、Gradle workers最大2、Runner実行枠1、A／B各60分を固定します。Runnerがcatalog digestで検証済みのGradle launcherだけをcontainer内で起動し、repository Wrapper、Docker socket、DinD、host network、port publish、任意image／mountを拒否します。hard disk／inode quotaと固定egress allowlistは現行4.4の対象外であり、bridgeやtmpfsをこれらの実効制御の証拠にしません。
 
 不足JDK／Gradle／Android toolsの専用store導入、Android history／予約・hold／手動cleanup、HTTPS／pairing／認証、Runner／Job log export、WSL／Linux向け配布準備を含めます。資源不足再試行は既定OFF・限定許可付きで新A／Bを作り、scan review・全体budget・cleanup確認を省略しません。定期release確認からbuildを始めず、参照APK取得と比較はAndroidが所有します。merge／push／公開は別承認まで行いません。
 

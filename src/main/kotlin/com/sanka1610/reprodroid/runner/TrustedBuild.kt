@@ -355,12 +355,15 @@ internal class TrustedBuildExecutor(
 ) {
     suspend fun execute(job: StoredJob, recipe: BuildRecipe) {
         val snapshot = job.sandbox ?: throw invalidSandboxSnapshot()
-        snapshot.validatedProfile()
+        snapshot.validateAnyProfile()
         val dockerMode = snapshot.jobSandbox.mode == BuildSandboxMode.DOCKER
         if (dockerMode && dockerExecutor == null) {
             throw TrustedBuildFailure("SANDBOX_START_FAILED", "The Docker build executor is not available.")
         }
-        snapshot.validatedProfile()?.requireSupported(recipe)
+        if (job.genericBuild == null) snapshot.validatedProfile()?.requireSupported(recipe)
+        if (job.genericBuild != null && !dockerMode) {
+            throw TrustedBuildFailure("GENERIC_DOCKER_REQUIRED", "Generic builds cannot execute through HOST fallback.")
+        }
         val resolvedCommit = job.resolvedCommitSha
             ?: throw TrustedBuildFailure("RESOLVED_COMMIT_MISSING", "The confirmed job has no resolved commit.")
         val workspace = stateDirectory.resolve("workspaces").resolve(job.jobId).normalize()
@@ -368,8 +371,15 @@ internal class TrustedBuildExecutor(
         val homeDirectory = confinedPath(workspace, "home").also(Path::createDirectories)
         val gradleUserHome = confinedPath(workspace, "gradle-user-home").also(Path::createDirectories)
         workspace.createDirectories()
-        val buildJava = resolveBuildJavaRuntime(recipe)
-        val environment = restrictedEnvironment(homeDirectory, gradleUserHome, buildJava.home)
+        val genericConfiguration = job.genericBuild?.let { GenericBuildContract.validate(job.repositoryUrl, job.revision.value, it) }
+        val managedToolchains = genericConfiguration?.let(store::requireManagedToolchains)
+        val buildJava = resolveBuildJavaRuntime(recipe, managedToolchains?.javaHome)
+        val environment = restrictedEnvironment(homeDirectory, gradleUserHome, buildJava.home).toMutableMap().apply {
+            managedToolchains?.let {
+                put("ANDROID_HOME", it.androidSdkRoot.toString())
+                put("ANDROID_SDK_ROOT", it.androidSdkRoot.toString())
+            }
+        }
         val storedScan = store.getStoredSourceScan(job.jobId)
         if (storedScan?.reviewed == true) {
             if (!Files.isDirectory(sourceDirectory, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(sourceDirectory)) {
@@ -508,6 +518,7 @@ internal class TrustedBuildExecutor(
             dockerResult = requireNotNull(dockerExecutor).execute(
                 job, recipe, sourceDirectory.toAbsolutePath(), homeDirectory.toAbsolutePath(), gradleUserHome.toAbsolutePath(), buildJava,
                 Path.of(requireNotNull(environment["ANDROID_SDK_ROOT"] ?: environment["ANDROID_HOME"])).toAbsolutePath(),
+                managedToolchains,
             )
             // No mutable output may be inspected until execute() has completed its removal proof.
             listOf(sourceDirectory, homeDirectory, gradleUserHome).forEach {
@@ -572,13 +583,31 @@ internal class TrustedBuildExecutor(
         gradleFailure?.let { throw it }
 
         transition(job.jobId, JobState.DISCOVERING_ARTIFACTS, 90, "Discovering APKs using the fixed artifact recipe.")
-        val dockerOutputRoot = buildRoot.resolve("play-services-core/build/outputs/apk/default/release")
+        val dockerOutputRoot = if (genericConfiguration == null) {
+            buildRoot.resolve("play-services-core/build/outputs/apk/default/release")
+        } else {
+            val moduleDirectory = genericConfiguration.modulePath.removePrefix(":").replace(':', '/')
+            confinedPath(buildRoot, listOf(moduleDirectory, "build/outputs/apk").filter(String::isNotBlank).joinToString("/"))
+        }
         val apkImport = if (dockerMode) SandboxOutputImport(dockerOutputRoot, SandboxImportLimits.APK) else null
-        val importedApks = apkImport?.importApks(
+        val importedCandidates = apkImport?.importApks(
             stateDirectory.resolve("sandbox-imports").resolve(job.jobId).also(Path::createDirectories),
-        )
+        ) { relative ->
+            job.genericBuild != null || relative.nameCount == 1
+        }
+        val importedApks = importedCandidates?.let { candidates ->
+            job.genericBuild?.let { generic ->
+                selectGenericImportedApk(candidates, generic.expectedArtifactFileName)
+            } ?: candidates
+        }
         if (importedApks != null && importedApks.size != 1) {
-            throw TrustedBuildFailure(if (importedApks.isEmpty()) "APK_NOT_FOUND" else "UNEXPECTED_APK_COUNT", "The sandbox recipe requires exactly one APK.")
+            val code = if (importedApks.isEmpty()) "APK_NOT_FOUND" else "UNEXPECTED_APK_COUNT"
+            val message = if (job.genericBuild == null) {
+                "The sandbox recipe requires exactly one APK."
+            } else {
+                "Generic artifact selection requires exactly one APK matching the persisted file name."
+            }
+            throw TrustedBuildFailure(code, message)
         }
         val artifactPaths = importedApks?.map { it.first } ?: discoverArtifacts(buildRoot, recipe)
         val discoveredArtifacts = artifactPaths.map { artifactPath ->
@@ -620,10 +649,12 @@ internal class TrustedBuildExecutor(
             ).dependencies() else captureDependencies(gradleUserHome),
             artifacts = artifactPaths.zip(discoveredArtifacts).map { (path, metadata) ->
                 ManifestFile(
-                    if (dockerMode) "play-services-core/build/outputs/apk/default/release/${metadata.fileName}"
+                    if (dockerMode) importedApks?.single { it.first == path }?.second?.path ?: metadata.fileName
                     else buildRoot.relativize(path).toString().replace('\\', '/'), metadata.sizeBytes, metadata.sha256,
                 )
             },
+            genericBuild = job.genericBuild,
+            discovery = store.genericDiscovery(job.jobId),
         )
         val manifestDirectory = stateDirectory.resolve("manifests").resolve(job.jobId).also(Path::createDirectories)
         val manifestPath = confinedPath(manifestDirectory, "reprodroid-build.json")
@@ -824,8 +855,8 @@ internal class TrustedBuildExecutor(
         }
     }
 
-    private fun resolveBuildJavaRuntime(recipe: BuildRecipe): BuildJavaRuntime {
-        val configuredHome = recipe.javaHomeEnvironmentVariable?.let { variable ->
+    private fun resolveBuildJavaRuntime(recipe: BuildRecipe, managedJavaHome: Path? = null): BuildJavaRuntime {
+        val configuredHome = managedJavaHome?.toString() ?: recipe.javaHomeEnvironmentVariable?.let { variable ->
             System.getenv(variable)?.takeIf(String::isNotBlank)
                 ?: throw TrustedBuildFailure(
                     "BUILD_JAVA_HOME_MISSING",
@@ -871,6 +902,39 @@ internal class TrustedBuildExecutor(
     }
 }
 
+/**
+ * A single bounded APK output is unambiguous even when an upstream release workflow renames it
+ * after Gradle. Multiple outputs remain fail-closed unless exactly one has the persisted name.
+ * Unselected private staging copies are removed before any artifact metadata is accepted.
+ */
+internal fun selectGenericImportedApk(
+    candidates: List<Pair<Path, ManifestFile>>,
+    expectedFileName: String,
+): List<Pair<Path, ManifestFile>> {
+    val selected = when (candidates.size) {
+        1 -> candidates.single()
+        else -> candidates.singleOrNull { (_, manifest) ->
+            manifest.path.substringAfterLast('/') == expectedFileName
+        }
+    }
+    if (selected == null) {
+        try {
+            candidates.forEach { (path, _) -> Files.deleteIfExists(path) }
+        } catch (_: Exception) {
+            candidates.forEach { (path, _) -> runCatching { Files.deleteIfExists(path) } }
+            throw TrustedBuildFailure("SANDBOX_OUTPUT_INVALID", "Unselected generic APK staging copies could not be removed.")
+        }
+        return emptyList()
+    }
+    try {
+        candidates.filterNot { it === selected }.forEach { (path, _) -> Files.delete(path) }
+    } catch (_: Exception) {
+        candidates.forEach { (path, _) -> runCatching { Files.deleteIfExists(path) } }
+        throw TrustedBuildFailure("SANDBOX_OUTPUT_INVALID", "Unselected generic APK staging copies could not be removed.")
+    }
+    return listOf(selected)
+}
+
 internal data class BuildJavaRuntime(
     val home: Path,
     val executable: Path,
@@ -880,7 +944,7 @@ internal data class BuildJavaRuntime(
 
 @Serializable
 internal data class BuildEnvironmentManifest(
-    val schemaVersion: Int = 4,
+    val schemaVersion: Int = 5,
     val generatedAt: String,
     val jobId: String,
     val recipeId: String,
@@ -904,6 +968,8 @@ internal data class BuildEnvironmentManifest(
     val controllerJava: PublicJavaRuntime? = null,
     val controllerOperatingSystem: String? = null,
     val dockerAudit: DockerExecutionAudit? = null,
+    val genericBuild: GenericBuildSnapshot? = null,
+    val discovery: GenericDiscoveryEvidence? = null,
 )
 
 @Serializable

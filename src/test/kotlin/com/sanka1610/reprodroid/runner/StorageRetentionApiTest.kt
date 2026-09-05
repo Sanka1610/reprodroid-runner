@@ -430,7 +430,7 @@ class StorageRetentionApiTest {
     fun `SQLite ten migration creates durable storage and toolchain tables without changing old job`() {
         val jobId = seedTerminalJob()
         val runnerId = StorageRetentionStore(stateDirectory).runnerId()
-        assertEquals(10, sqlLong("PRAGMA user_version"))
+        assertEquals(11, sqlLong("PRAGMA user_version"))
         assertEquals(JobState.SUCCEEDED, requireNotNull(SQLiteJobStore(stateDirectory).getJob(jobId)).state)
         assertEquals(runnerId, StorageRetentionStore(stateDirectory).runnerId())
         val tables = setOf(

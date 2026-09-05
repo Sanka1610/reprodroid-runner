@@ -32,6 +32,7 @@ enum class JobState {
     SCANNING_SOURCE,
     AWAITING_SCAN_REVIEW,
     VERIFYING_WRAPPER,
+    DISCOVERING_CONFIGURATION,
     BUILDING,
     DISCOVERING_ARTIFACTS,
     SUCCEEDED,
@@ -83,6 +84,7 @@ data class CreateJobRequest(
     val repositoryUrl: String,
     val revision: RequestedRevision,
     val simulationOutcome: SimulationOutcome? = null,
+    val genericBuild: GenericBuildSnapshot? = null,
 )
 
 @Serializable
@@ -215,6 +217,8 @@ data class JobResponse(
     val createdAt: String,
     val updatedAt: String,
     val sandbox: JobSandbox? = null,
+    val genericBuild: GenericBuildSnapshot? = null,
+    val discovery: GenericDiscoveryEvidence? = null,
 )
 
 @Serializable
@@ -261,6 +265,8 @@ data class BuildEnvironmentManifestResponse(
     val apkHash: String,
     val determinism: DeterminismOptions? = null,
     val sandbox: SandboxEvidence? = null,
+    val genericBuild: GenericBuildSnapshot? = null,
+    val discoverySha256: String? = null,
 )
 
 @Serializable

@@ -55,6 +55,35 @@ class SandboxOutputImportTest {
         Files.list(failedDestination).use { assertEquals(0, it.count()) }
     }
 
+    @Test fun `generic APK selection accepts one renamed output and fails closed for ambiguous outputs`() {
+        val staging = Files.createDirectories(directory.resolve("generic-staging"))
+        fun candidate(name: String): Pair<Path, ManifestFile> {
+            val path = Files.writeString(staging.resolve(name), name)
+            return path to ManifestFile("release/$name", Files.size(path), sha256(path))
+        }
+
+        val renamed = candidate("app-release-unsigned.apk")
+        assertEquals(
+            listOf(renamed),
+            selectGenericImportedApk(listOf(renamed), "NewPipe_v0.29.1.apk"),
+        )
+
+        val preferred = candidate("FairEmail-v1.2333a-github-release.apk")
+        val other = candidate("FairEmail-v1.2333a-play-release.apk")
+        assertEquals(
+            listOf(preferred),
+            selectGenericImportedApk(listOf(preferred, other), preferred.first.fileName.toString()),
+        )
+        assertTrue(Files.isRegularFile(preferred.first))
+        assertFalse(Files.exists(other.first))
+
+        val first = candidate("first.apk")
+        val second = candidate("second.apk")
+        assertTrue(selectGenericImportedApk(listOf(first, second), "absent.apk").isEmpty())
+        assertFalse(Files.exists(first.first))
+        assertFalse(Files.exists(second.first))
+    }
+
     private fun invalid(root: Path) = assertEquals("SANDBOX_OUTPUT_INVALID", assertThrows(TrustedBuildFailure::class.java) {
         SandboxOutputImport(root, SandboxImportLimits.DEPENDENCIES).dependencies()
     }.code)

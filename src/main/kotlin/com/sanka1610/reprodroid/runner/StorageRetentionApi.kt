@@ -18,7 +18,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.add
 import java.time.Instant
 
-internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore) {
+internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore, genericExecutionEnabled: Boolean = false) {
     route("/v2") {
         get("/capabilities") {
             call.respond(
@@ -27,11 +27,17 @@ internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore) {
                     foundationContractVersion = 1,
                     runnerId = store.runnerId(),
                     runnerVersion = "0.1.0-alpha01",
-                    capabilities = listOf(
+                    capabilities = buildList {
+                        addAll(listOf(
                         V2Capability("foundation", 1),
                         V2Capability("storage-retention", 1),
                         V2Capability("toolchain-install", 1),
-                    ),
+                        ))
+                        if (genericExecutionEnabled) {
+                            add(V2Capability("generic-build", 1))
+                            add(V2Capability("apk-comparison", 1))
+                        }
+                    },
                 ),
             )
         }

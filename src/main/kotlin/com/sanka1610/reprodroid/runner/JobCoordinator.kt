@@ -144,6 +144,9 @@ internal class JobCoordinator(
 
     @Synchronized
     fun create(request: CreateJobRequest): CreateJobResponse {
+        if (request.genericBuild != null) {
+            throw ApiException.badRequest("GENERIC_BUILD_REQUIRES_V2", "Generic builds must use POST /v2/builds.")
+        }
         validate(request)
         if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
             if (sandboxLifecycle.cleanupPending) {
@@ -160,6 +163,63 @@ internal class JobCoordinator(
         val response = store.createJob(request, buildSandbox)
         check(queuedJobIds.trySend(response.jobId).isSuccess) { "The job queue is not accepting work." }
         return response
+    }
+
+    @Synchronized
+    fun createGeneric(
+        repositoryUrl: String,
+        commitSha: String,
+        snapshot: GenericBuildSnapshot,
+        idempotencyKey: String,
+        requestSha256: String,
+    ): GenericBuildReceipt {
+        if (buildSandbox != BuildSandboxMode.DOCKER) {
+            throw ApiException.serviceUnavailable("GENERIC_DOCKER_REQUIRED", "Generic builds require REPRODROID_BUILD_SANDBOX=DOCKER; HOST fallback is forbidden.")
+        }
+        if (!realBuildEnabled) {
+            throw ApiException.forbidden("REAL_BUILD_DISABLED", "REAL_TRUSTED execution is disabled by Runner configuration.")
+        }
+        if (sandboxLifecycle.cleanupPending) {
+            throw ApiException.serviceUnavailable("SANDBOX_CLEANUP_PENDING", "Owned sandbox resources require recovery before generic builds can be accepted.")
+        }
+        val recipe = GenericBuildContract.recipe(repositoryUrl, commitSha, snapshot)
+        val configuration = GenericBuildContract.validate(repositoryUrl, commitSha, snapshot)
+        store.requireManagedToolchains(configuration)
+        val request = CreateJobRequest(
+            executionMode = ExecutionMode.REAL_TRUSTED,
+            repositoryUrl = recipe.repositoryUrl,
+            revision = recipe.revision,
+            genericBuild = snapshot,
+        )
+        validate(request)
+        val receipt = store.createGenericJob(request, idempotencyKey, requestSha256)
+        if (!receipt.existing) {
+            check(queuedJobIds.trySend(receipt.response.jobId).isSuccess) { "The job queue is not accepting work." }
+        }
+        return receipt
+    }
+
+    @Synchronized
+    fun retryGenericResources(
+        comparisonId: String,
+        idempotencyKey: String,
+        requestSha256: String,
+    ): GenericResourceRetryReceipt {
+        if (buildSandbox != BuildSandboxMode.DOCKER) {
+            throw ApiException.serviceUnavailable("GENERIC_DOCKER_REQUIRED", "Generic resource retry requires REPRODROID_BUILD_SANDBOX=DOCKER.")
+        }
+        if (!realBuildEnabled) {
+            throw ApiException.forbidden("REAL_BUILD_DISABLED", "REAL_TRUSTED execution is disabled by Runner configuration.")
+        }
+        if (sandboxLifecycle.cleanupPending) {
+            throw ApiException.serviceUnavailable("SANDBOX_CLEANUP_PENDING", "Owned sandbox resources require recovery before generic builds can be accepted.")
+        }
+        val receipt = store.createGenericResourceRetry(comparisonId, idempotencyKey, requestSha256)
+        if (!receipt.existing) {
+            check(queuedJobIds.trySend(receipt.response.buildAJobId).isSuccess) { "The job queue is not accepting work." }
+            check(queuedJobIds.trySend(receipt.response.buildBJobId).isSuccess) { "The job queue is not accepting work." }
+        }
+        return receipt
     }
 
     fun get(jobId: String): JobResponse = store.getJob(jobId) ?: throw ApiException.notFound()
@@ -312,6 +372,9 @@ internal class JobCoordinator(
 
     fun retry(jobId: String): CreateJobResponse {
         val original = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+        if (original.genericBuild != null) {
+            throw ApiException.conflict("GENERIC_RETRY_REQUIRES_COMPARISON", "Generic resource retry must use the comparison retry-resource endpoint.")
+        }
         if (!original.state.isTerminal) {
             throw ApiException.conflict(
                 code = "JOB_NOT_TERMINAL",
@@ -357,7 +420,8 @@ internal class JobCoordinator(
 
     private suspend fun runRealJob(job: StoredJob) {
         if (sandboxLifecycle.cleanupPending) return
-        val recipe = recipeRegistry.find(job.repositoryUrl, job.revision)
+        val recipe = job.genericBuild?.let { GenericBuildContract.recipe(job.repositoryUrl, job.revision.value, it) }
+            ?: recipeRegistry.find(job.repositoryUrl, job.revision)
             ?: throw TrustedBuildFailure("RECIPE_NOT_FOUND", "The persisted repository no longer has an allowlisted recipe.")
         when (job.state) {
             JobState.CREATED -> {
@@ -417,6 +481,9 @@ internal class JobCoordinator(
                 "SIMULATION_OUTCOME_NOT_ALLOWED",
                 "simulationOutcome is only valid for SIMULATED jobs.",
             )
+        }
+        if (request.genericBuild != null && (request.executionMode != ExecutionMode.REAL_TRUSTED || request.revision.type != RevisionType.COMMIT)) {
+            throw ApiException.badRequest("INVALID_GENERIC_BUILD", "Generic builds require REAL_TRUSTED and a full commit revision.")
         }
     }
 

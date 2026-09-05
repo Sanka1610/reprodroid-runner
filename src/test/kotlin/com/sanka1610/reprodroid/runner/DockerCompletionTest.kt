@@ -22,7 +22,7 @@ class DockerCompletionTest {
 
     @Test fun `timeout observed OOM and generic exit remain distinct`() {
         assertEquals("GRADLE_BUILD_FAILED", classifyDockerBuildCompletion(state(exit = 137), 137, false)?.code)
-        assertEquals("SANDBOX_RESOURCE_LIMIT_EXCEEDED", classifyDockerBuildCompletion(state(exit = 137, oom = true), 137, false)?.code)
+        assertEquals("SANDBOX_MEMORY_LIMIT_EXCEEDED", classifyDockerBuildCompletion(state(exit = 137, oom = true), 137, false)?.code)
         assertEquals("PROCESS_TIMEOUT", classifyDockerBuildCompletion(state("running"), null, true)?.code)
     }
 }

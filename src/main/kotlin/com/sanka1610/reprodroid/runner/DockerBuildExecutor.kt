@@ -6,6 +6,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
 import java.nio.file.Path
 import java.time.Duration
+import java.time.Instant
 
 @Serializable
 internal data class DockerExecutionAudit(
@@ -43,21 +44,31 @@ internal class DockerBuildExecutor(
 
     suspend fun execute(
         job: StoredJob, recipe: BuildRecipe, source: Path, home: Path, gradleHome: Path,
-        java: BuildJavaRuntime, sdk: Path,
+        java: BuildJavaRuntime, sdk: Path, managedToolchains: ManagedToolchains? = null,
     ): DockerBuildResult {
         val snapshot = job.sandbox ?: throw invalidSandboxSnapshot()
-        val profile = snapshot.validatedProfile() ?: throw invalidSandboxSnapshot()
-        profile.requireSupported(recipe)
+        val fixedProfile = if (job.genericBuild == null) snapshot.validatedProfile() else null
+        val genericProfile = if (job.genericBuild != null) snapshot.validatedGenericProfile() else null
+        val profile: DockerSandboxPolicy = fixedProfile ?: genericProfile ?: throw invalidSandboxSnapshot()
+        fixedProfile?.requireSupported(recipe)
+        if (job.genericBuild != null && !recipe.managedToolchains) throw invalidSandboxSnapshot()
+        if (job.genericBuild == null && managedToolchains != null) throw invalidSandboxSnapshot()
         if (lifecycle.cleanupPending) throw TrustedBuildFailure("SANDBOX_CLEANUP_PENDING", "Sandbox recovery must complete before execution.")
         val environment = mapOf(
-            "PATH" to "${profile.jdk}/bin:/usr/bin:/bin", "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
+            "PATH" to listOfNotNull("${profile.jdk}/bin", profile.gradle?.let { "$it/bin" }, "/usr/bin", "/bin").joinToString(":"),
+            "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
             "GRADLE_USER_HOME" to profile.gradleHome, "ANDROID_HOME" to profile.sdk, "ANDROID_SDK_ROOT" to profile.sdk,
         )
-        val spec = DockerBuildSpec(profile, listOf(
-            SandboxMount(source.toString(), profile.source, false), SandboxMount(home.toString(), profile.home, false),
-            SandboxMount(gradleHome.toString(), profile.gradleHome, false), SandboxMount(java.home.toString(), profile.jdk, true),
-            SandboxMount(sdk.toString(), profile.sdk, true),
-        ), environment)
+        val mounts = buildList {
+            add(SandboxMount(source.toString(), profile.source, false))
+            add(SandboxMount(home.toString(), profile.home, false))
+            add(SandboxMount(gradleHome.toString(), profile.gradleHome, false))
+            add(SandboxMount(java.home.toString(), profile.jdk, true))
+            add(SandboxMount(sdk.toString(), profile.sdk, true))
+            if (managedToolchains != null) add(SandboxMount(managedToolchains.gradleHome.toString(), requireNotNull(profile.gradle), true))
+        }
+        val containerBuildRoot = if (recipe.buildRoot == ".") profile.source else "${profile.source}/${recipe.buildRoot}"
+        val spec = DockerBuildSpec(profile, mounts, environment, containerBuildRoot)
         spec.preflightMounts()
         val resources = mutableListOf<SandboxResource>()
         var failureCode = "SANDBOX_ENGINE_UNAVAILABLE"
@@ -80,13 +91,19 @@ internal class DockerBuildExecutor(
                 BuildSandboxMode.DOCKER, profile.profileId, DockerSandboxProfile.IMAGE_DIGEST, profile.platform,
                 engineVersion, profile.networkMode,
                 SandboxLimits(profile.cpuCount, profile.cpuset, profile.memoryBytes, profile.memorySwapBytes, profile.pids, profile.tmpfsBytes),
-                SandboxIsolation(profile.uid, profile.gid, true, true, true, "DEFAULT", true, true, false, false),
+                SandboxIsolation(profile.uid, profile.gid, true, true, true, "DEFAULT", true, true, false, false, profile.gradleReadOnly),
             ).also { it.validate() }
             failureCode = "SANDBOX_TOOLCHAIN_MISMATCH"
-            val probeCommand = listOf("/bin/sh", "-ec", TOOLCHAIN_PROBE)
+            val probeCommand = listOf("/bin/sh", "-ec", toolchainProbe(recipe, profile, job.genericBuild != null))
             val preflight = create(job.jobId, SandboxResourceRole.PREFLIGHT, engineId, imageId, spec, probeCommand, resources)
             val preflightInspection = requireNotNull(store.sandboxResources().single { it.attemptId == preflight.attemptId }.observationJson)
-            val probe = control.command(listOf("container", "start", "--attach", requireNotNull(preflight.containerId)), Duration.ofSeconds(60))
+            if (job.genericBuild != null) {
+                if (!store.transitionIfActive(job.jobId, JobState.DISCOVERING_CONFIGURATION, 48, "Discovering the configured Gradle project inside an isolated generic container.")) {
+                    throw CancellationException("Job is no longer active.")
+                }
+            }
+            val probeTimeout = recipe.discoveryTimeout ?: Duration.ofSeconds(60)
+            val probe = control.command(listOf("container", "start", "--attach", requireNotNull(preflight.containerId)), probeTimeout)
             val probeState = inspection.inspect(preflight.containerId).getValue("State").jsonObject
             require(!probeState.boolean("Running") && probeState.number("ExitCode") == 0L && !probeState.boolean("OOMKilled"))
             val measuredJava = PublicJavaRuntime(property(probe, "java.version"), property(probe, "java.vendor"))
@@ -95,16 +112,53 @@ internal class DockerBuildExecutor(
             require(property(probe, "user.home") == profile.home && property(probe, "java.home") == profile.jdk)
             require(Regex("(?m)^CapEff:\\s+0+$").containsMatchIn(probe) && Regex("(?m)^NoNewPrivs:\\s+1$").containsMatchIn(probe))
             require(Regex("(?m)^Seccomp:\\s+2$").containsMatchIn(probe))
+            job.genericBuild?.let { generic ->
+                val bytes = probe.toByteArray(Charsets.UTF_8)
+                if (bytes.size > 8 * 1024 * 1024) {
+                    throw TrustedBuildFailure("DISCOVERY_OUTPUT_LIMIT_EXCEEDED", "Generic discovery output exceeded 8 MiB.")
+                }
+                val configuration = GenericBuildContract.validate(recipe.repositoryUrl, recipe.revision.value, generic)
+                val missingTasks = configuration.tasks.filterNot { task ->
+                    val terminalName = task.substringAfterLast(':')
+                    Regex("(?m)^${Regex.escape(terminalName)}(?:\\s|$)").containsMatchIn(probe) || probe.contains(task)
+                }
+                if (missingTasks.isNotEmpty()) {
+                    throw TrustedBuildFailure("DISCOVERY_TASK_NOT_FOUND", "Configured Android task was not present in isolated Gradle discovery.")
+                }
+                val evidence = GenericDiscoveryEvidence(
+                    jobId = job.jobId,
+                    attempt = generic.attempt,
+                    configurationSha256 = generic.configurationSha256,
+                    outputSha256 = GenericBuildContract.hash(bytes),
+                    outputBytes = bytes.size.toLong(),
+                    selectedModule = configuration.modulePath,
+                    selectedVariant = configuration.variant,
+                    selectedTasks = configuration.tasks,
+                    observedAt = Instant.now().toString(),
+                )
+                if (!store.recordGenericDiscovery(evidence)) {
+                    throw TrustedBuildFailure("DISCOVERY_AUDIT_PERSISTENCE_FAILED", "Generic discovery evidence could not be persisted.")
+                }
+            }
             // Remove the probe before the build; the following intent returns COMPLETE to PENDING.
             if (!lifecycle.recover()) throw TrustedBuildFailure("SANDBOX_CLEANUP_FAILED", "Sandbox preflight cleanup is pending.")
             failureCode = "SANDBOX_START_FAILED"
-            val buildCommand = listOf(
-                "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
-                "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
-            ) + gradleOptions(recipe) + recipe.tasks
+            val launcher = if (job.genericBuild == null) {
+                listOf(
+                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+                    "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
+                )
+            } else {
+                listOf(
+                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+                    "-classpath", "${requireNotNull(profile.gradle)}/lib/*:${profile.gradle}/lib/plugins/*", "org.gradle.launcher.GradleMain",
+                )
+            }
+            val genericOptions = if (job.genericBuild != null) listOf("--rerun-tasks", "--no-configuration-cache", "--max-workers=2") else emptyList()
+            val buildCommand = launcher + gradleOptions(recipe) + genericOptions + recipe.tasks
             val build = create(job.jobId, SandboxResourceRole.BUILD, engineId, imageId, spec, buildCommand, resources)
             val buildInspection = requireNotNull(store.sandboxResources().single { it.attemptId == build.attemptId }.observationJson)
-            if (!store.transitionIfActive(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks inside docker-microg-v1.")) {
+            if (!store.transitionIfActive(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks inside ${profile.profileId}.")) {
                 throw CancellationException("Job is no longer active.")
             }
             var cliExitCode: Int? = null
@@ -193,21 +247,27 @@ internal class DockerBuildExecutor(
     private fun property(output: String, key: String): String =
         Regex("(?m)^\\s*${Regex.escape(key)} = (.+)$").findAll(output).single().groupValues[1].trim()
 
-    private companion object {
-        val TOOLCHAIN_PROBE = """
+    private fun toolchainProbe(recipe: BuildRecipe, profile: DockerSandboxPolicy, generic: Boolean): String {
+        val base = """
             test "$(id -u)" = 1000
             test "$(id -g)" = 1000
             cat /proc/self/status
             /opt/jdk/bin/java -Duser.home=/home/ubuntu -XshowSettings:properties -version
-            test -r /opt/android-sdk/platforms/android-36/android.jar
-            /opt/android-sdk/build-tools/36.0.0/aapt2 version
+            test -r /opt/android-sdk/platforms/android-${recipe.androidSdkApiLevel}/android.jar
+            /opt/android-sdk/build-tools/${recipe.buildToolsVersion}/aapt2 version
         """.trimIndent()
+        if (!generic) return base
+        val gradle = requireNotNull(profile.gradle)
+        val discovery = gradleOptions(recipe) + listOf("--no-configuration-cache", "--max-workers=2", "--dry-run") + recipe.tasks
+        val command = discovery.joinToString(" ") { value -> require(value.matches(Regex("[A-Za-z0-9:._=-]+"))); value }
+        return "$base\n/opt/jdk/bin/java -Duser.home=${profile.home} -Dgradle.user.home=${profile.gradleHome} " +
+            "-classpath '$gradle/lib/*:$gradle/lib/plugins/*' org.gradle.launcher.GradleMain $command"
     }
 }
 
 /** CLI return is not a substitute for the engine's observation of a started, exited process. */
 internal fun classifyDockerBuildCompletion(state: JsonObject, cliExitCode: Int?, timedOut: Boolean): TrustedBuildFailure? {
-    if (state.boolean("OOMKilled")) return TrustedBuildFailure("SANDBOX_RESOURCE_LIMIT_EXCEEDED", "The engine reported that the build was OOM-killed.")
+    if (state.boolean("OOMKilled")) return TrustedBuildFailure("SANDBOX_MEMORY_LIMIT_EXCEEDED", "The engine reported a cgroup OOM kill for the build container.")
     if (timedOut) return TrustedBuildFailure("PROCESS_TIMEOUT", "The Gradle build exceeded the recipe timeout.")
     if (state.string("Status") == "created" || state.string("StartedAt").startsWith("0001-")) {
         return TrustedBuildFailure("SANDBOX_START_FAILED", "The engine did not report that the build process started.")

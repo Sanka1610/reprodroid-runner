@@ -46,7 +46,11 @@ class DockerBuildSpecTest {
     @Test fun `insufficient free disk remains resource failure rather than mount fallback`() {
         val spec = fixture()
         val failure = assertThrows(TrustedBuildFailure::class.java) {
-            DockerBuildSpec(spec.profile.copy(minimumFreeDiskBytes = Long.MAX_VALUE), spec.mounts, spec.environment).preflightMounts()
+            DockerBuildSpec(
+                (spec.profile as DockerSandboxProfile).copy(minimumFreeDiskBytes = Long.MAX_VALUE),
+                spec.mounts,
+                spec.environment,
+            ).preflightMounts()
         }
         assertEquals("SANDBOX_RESOURCE_LIMIT_EXCEEDED", failure.code)
     }

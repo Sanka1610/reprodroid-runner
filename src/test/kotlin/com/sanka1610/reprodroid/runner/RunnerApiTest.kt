@@ -372,7 +372,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(10, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(11, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })
@@ -421,6 +421,12 @@ class RunnerApiTest {
             }
         }
 
+        DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute("PRAGMA user_version = 12")
+            }
+        }
+
         assertThrows(IllegalArgumentException::class.java) {
             SQLiteJobStore(stateDirectory)
         }
@@ -442,7 +448,7 @@ class RunnerApiTest {
 
         DriverManager.getConnection("jdbc:sqlite:$databasePath").use { connection ->
             connection.createStatement().use { statement ->
-                assertEquals(10, statement.executeQuery("PRAGMA user_version").use { result ->
+                assertEquals(11, statement.executeQuery("PRAGMA user_version").use { result ->
                     result.next()
                     result.getInt(1)
                 })

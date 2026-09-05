@@ -1,5 +1,7 @@
 package com.sanka1610.reprodroid.runner
 
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -21,7 +23,12 @@ internal data class StoredJob(
     val resolvedCommitSha: String?,
     val state: JobState,
     val sandbox: SandboxSnapshot? = null,
+    val genericBuild: GenericBuildSnapshot? = null,
 )
+
+internal data class GenericBuildReceipt(val response: CreateJobResponse, val existing: Boolean)
+internal data class GenericComparisonReceipt(val response: GenericComparisonResponse, val existing: Boolean)
+internal data class GenericResourceRetryReceipt(val response: GenericResourceRetryResponse, val existing: Boolean)
 
 internal data class StoredArtifact(
     val metadata: ArtifactMetadata,
@@ -72,36 +79,11 @@ class SQLiteJobStore(
     fun createJob(request: CreateJobRequest, sandboxMode: BuildSandboxMode = BuildSandboxMode.HOST): CreateJobResponse {
         val jobId = UUID.randomUUID().toString()
         val now = Instant.now(clock).toString()
-        val snapshot = if (request.executionMode == ExecutionMode.REAL_TRUSTED) SandboxSnapshot.newJob(sandboxMode) else null
+        val snapshot = if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
+            request.genericBuild?.let { SandboxSnapshot.newGenericJob(it.memoryBytes) } ?: SandboxSnapshot.newJob(sandboxMode)
+        } else null
         connection().use { connection ->
-            connection.prepareStatement(
-                """
-                INSERT INTO jobs (
-                    job_id, execution_mode, repository_url, revision_type, revision_value,
-                    simulation_outcome, state, progress_percent, requires_confirmation,
-                    created_at, updated_at, sandbox_mode, sandbox_origin, sandbox_profile_id,
-                    sandbox_snapshot, sandbox_snapshot_sha256, sandbox_cleanup_status, manifest_format
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setString(1, jobId)
-                statement.setString(2, request.executionMode.name)
-                statement.setString(3, request.repositoryUrl)
-                statement.setString(4, request.revision.type.name)
-                statement.setString(5, request.revision.value)
-                statement.setString(6, request.simulationOutcome?.name)
-                statement.setString(7, JobState.CREATED.name)
-                statement.setString(8, now)
-                statement.setString(9, now)
-                statement.setString(10, snapshot?.jobSandbox?.mode?.name)
-                statement.setString(11, snapshot?.jobSandbox?.origin?.name)
-                statement.setString(12, snapshot?.jobSandbox?.profileId)
-                statement.setString(13, snapshot?.canonicalProfile)
-                statement.setString(14, snapshot?.profileSha256)
-                statement.setString(15, snapshot?.jobSandbox?.cleanupStatus?.name)
-                statement.setString(16, snapshot?.manifestFormat?.name)
-                statement.executeUpdate()
-            }
+            insertJob(connection, jobId, request, snapshot, now)
         }
         try {
             appendLog(jobId, LogLevel.INFO, "Job created in ${request.executionMode} mode.")
@@ -111,6 +93,111 @@ class SQLiteJobStore(
             throw failure
         }
         return CreateJobResponse(jobId, JobState.CREATED)
+    }
+
+    private fun insertJob(
+        connection: Connection,
+        jobId: String,
+        request: CreateJobRequest,
+        snapshot: SandboxSnapshot?,
+        now: String,
+    ) {
+        connection.prepareStatement(
+            """
+            INSERT INTO jobs (
+                job_id, execution_mode, repository_url, revision_type, revision_value,
+                simulation_outcome, state, progress_percent, requires_confirmation,
+                created_at, updated_at, sandbox_mode, sandbox_origin, sandbox_profile_id,
+                sandbox_snapshot, sandbox_snapshot_sha256, sandbox_cleanup_status, manifest_format
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.setString(2, request.executionMode.name)
+            statement.setString(3, request.repositoryUrl)
+            statement.setString(4, request.revision.type.name)
+            statement.setString(5, request.revision.value)
+            statement.setString(6, request.simulationOutcome?.name)
+            statement.setString(7, JobState.CREATED.name)
+            statement.setString(8, now)
+            statement.setString(9, now)
+            statement.setString(10, snapshot?.jobSandbox?.mode?.name)
+            statement.setString(11, snapshot?.jobSandbox?.origin?.name)
+            statement.setString(12, snapshot?.jobSandbox?.profileId)
+            statement.setString(13, snapshot?.canonicalProfile)
+            statement.setString(14, snapshot?.profileSha256)
+            statement.setString(15, snapshot?.jobSandbox?.cleanupStatus?.name)
+            statement.setString(16, snapshot?.manifestFormat?.name)
+            statement.executeUpdate()
+        }
+    }
+
+    @Synchronized
+    internal fun createGenericJob(request: CreateJobRequest, idempotencyKey: String, requestSha256: String): GenericBuildReceipt {
+        requireNotNull(request.genericBuild)
+        connection().use { connection ->
+            connection.prepareStatement(
+                "SELECT request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind='GENERIC_BUILD_CREATE' AND idempotency_key=?",
+            ).use { statement ->
+                statement.setString(1, LOCAL_PRINCIPAL)
+                statement.setString(2, idempotencyKey)
+                statement.executeQuery().use { row ->
+                    if (row.next()) {
+                        if (row.getString(1) != requestSha256) {
+                            throw ApiException.conflict("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used with a different request.")
+                        }
+                        val jobId = row.getString(2)
+                        val job = getStoredJob(jobId) ?: throw ApiException.serviceUnavailable(
+                            "RECONCILIATION_REQUIRED", "The accepted generic build is missing its Job record.",
+                        )
+                        return GenericBuildReceipt(CreateJobResponse(jobId, job.state), true)
+                    }
+                }
+            }
+        }
+        val created = createJob(request, BuildSandboxMode.DOCKER)
+        val now = Instant.now(clock).toString()
+        try {
+            connection().use { connection ->
+                connection.autoCommit = false
+                try {
+                    connection.prepareStatement(
+                        "INSERT INTO generic_build_requests(job_id,request_json,configuration_sha256,comparison_id,attempt,retry_of_job_id,memory_bytes) VALUES(?,?,?,?,?,?,?)",
+                    ).use { statement ->
+                        statement.setString(1, created.jobId)
+                        statement.setString(2, GENERIC_JSON.encodeToString(request.genericBuild))
+                        statement.setString(3, request.genericBuild.configurationSha256)
+                        statement.setString(4, request.genericBuild.comparisonId)
+                        statement.setString(5, request.genericBuild.attempt.name)
+                        statement.setString(6, request.genericBuild.retryOfJobId)
+                        statement.setLong(7, request.genericBuild.memoryBytes)
+                        statement.executeUpdate()
+                    }
+                    val operationId = UUID.randomUUID().toString()
+                    connection.prepareStatement(
+                        "INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'generic-build',1,'COMPLETED','JOB',?,?,?)",
+                    ).use { statement ->
+                        statement.setString(1, operationId)
+                        statement.setString(2, LOCAL_PRINCIPAL)
+                        statement.setString(3, "GENERIC_BUILD_CREATE")
+                        statement.setString(4, idempotencyKey)
+                        statement.setString(5, requestSha256)
+                        statement.setString(6, created.jobId)
+                        statement.setString(7, now)
+                        statement.setString(8, now)
+                        statement.executeUpdate()
+                    }
+                    connection.commit()
+                } catch (failure: Throwable) {
+                    connection.rollback()
+                    throw failure
+                }
+            }
+        } catch (failure: Throwable) {
+            runCatching { deleteJob(created.jobId) }
+            throw failure
+        }
+        return GenericBuildReceipt(created, false)
     }
 
     @Synchronized
@@ -124,7 +211,7 @@ class SQLiteJobStore(
             statement.setString(1, jobId)
             statement.executeQuery().use { result ->
                 if (!result.next()) return@use null
-                result.toStoredJob()
+                result.toStoredJob().copy(genericBuild = genericBuild(connection, jobId))
             }
         }
     }
@@ -139,8 +226,373 @@ class SQLiteJobStore(
                     latestLogSequence = latestLogSequence(connection, jobId),
                     artifacts = listArtifacts(connection, jobId),
                     sourceScan = sourceScanSummary(connection, jobId, result),
+                    genericBuild = genericBuild(connection, jobId),
+                    discovery = genericDiscovery(connection, jobId),
                 )
             }
+        }
+    }
+
+    @Synchronized
+    internal fun recordGenericDiscovery(evidence: GenericDiscoveryEvidence): Boolean = connection().use { connection ->
+        connection.prepareStatement(
+            "INSERT OR REPLACE INTO generic_discovery_evidence(job_id,evidence_json,output_sha256,output_bytes,observed_at) VALUES(?,?,?,?,?)",
+        ).use { statement ->
+            statement.setString(1, evidence.jobId)
+            statement.setString(2, GENERIC_JSON.encodeToString(evidence))
+            statement.setString(3, evidence.outputSha256)
+            statement.setLong(4, evidence.outputBytes)
+            statement.setString(5, evidence.observedAt)
+            statement.executeUpdate() == 1
+        }
+    }
+
+    @Synchronized
+    internal fun genericDiscovery(jobId: String): GenericDiscoveryEvidence? = connection().use { genericDiscovery(it, jobId) }
+
+    @Synchronized
+    internal fun requireManagedToolchains(configuration: GenericBuildConfiguration): ManagedToolchains {
+        val required = listOf(
+            Triple("JDK", "21.0.12+1", "toolchains/jdk/21.0.12+1"),
+            Triple("GRADLE", configuration.gradleVersion, "toolchains/gradle/${configuration.gradleVersion}"),
+            Triple("ANDROID_PLATFORM", if (configuration.compileSdk == 36) "36-r02" else "37.0-r02", "toolchains/android/platforms/android-${configuration.compileSdk}"),
+            Triple("ANDROID_BUILD_TOOLS", configuration.buildToolsVersion, "toolchains/android/build-tools/${configuration.buildToolsVersion}"),
+        )
+        connection().use { connection ->
+            required.forEach { (component, version, relativePath) ->
+                connection.prepareStatement(
+                    "SELECT relative_path FROM toolchain_inventory WHERE component=? AND version=? AND state='VERIFIED'",
+                ).use { statement ->
+                    statement.setString(1, component)
+                    statement.setString(2, version)
+                    statement.executeQuery().use { row ->
+                        if (!row.next() || row.getString(1) != relativePath) {
+                            throw ApiException.conflict("TOOLCHAIN_NOT_INSTALLED", "$component $version is not verified in the managed store.")
+                        }
+                    }
+                }
+            }
+        }
+        return ManagedToolchains(
+            stateDirectory.resolve("toolchains/jdk/21.0.12+1"),
+            stateDirectory.resolve("toolchains/gradle/${configuration.gradleVersion}"),
+            stateDirectory.resolve("toolchains/android"),
+        ).validate(configuration)
+    }
+
+    @Synchronized
+    internal fun createGenericComparison(
+        request: CreateGenericComparisonRequest,
+        idempotencyKey: String,
+        requestSha256: String,
+    ): GenericComparisonReceipt {
+        requireCanonicalUuid(request.comparisonId, "comparisonId")
+        if (!request.configurationSha256.matches(Regex("[0-9a-f]{64}"))) {
+            throw ApiException.badRequest("INVALID_COMPARISON", "configurationSha256 is invalid.")
+        }
+        if (!request.officialIdentity.sha256.matches(Regex("[0-9a-f]{64}")) || request.officialIdentity.sizeBytes <= 0 ||
+            request.officialIdentity.packageName.isBlank() || request.officialIdentity.versionName.isBlank() || request.officialIdentity.versionCode < 0
+        ) throw ApiException.badRequest("INVALID_COMPARISON", "Official APK identity is incomplete.")
+        val buildA = getStoredJob(request.buildAJobId) ?: throw ApiException.notFound()
+        val buildB = getStoredJob(request.buildBJobId) ?: throw ApiException.notFound()
+        val snapshotA = buildA.genericBuild ?: throw ApiException.conflict("COMPARISON_BUILD_INVALID", "Build A is not a generic build.")
+        val snapshotB = buildB.genericBuild ?: throw ApiException.conflict("COMPARISON_BUILD_INVALID", "Build B is not a generic build.")
+        val buildAFailed = buildA.state == JobState.FAILED
+        val buildBFailed = buildB.state == JobState.FAILED
+        if (buildA.state !in setOf(JobState.SUCCEEDED, JobState.FAILED) ||
+            buildB.state !in setOf(JobState.SUCCEEDED, JobState.FAILED) ||
+            snapshotA.attempt != GenericBuildAttempt.A || snapshotB.attempt != GenericBuildAttempt.B ||
+            snapshotA.comparisonId != request.comparisonId || snapshotB.comparisonId != request.comparisonId ||
+            snapshotA.configurationSha256 != request.configurationSha256 || snapshotB.configurationSha256 != request.configurationSha256 ||
+            snapshotA.configurationCanonicalJson != snapshotB.configurationCanonicalJson ||
+            snapshotA.retryOfJobId != null != (snapshotB.retryOfJobId != null) ||
+            (buildAFailed && request.officialVsA != RawComparisonResult.INCOMPARABLE) ||
+            (buildBFailed && request.officialVsB != RawComparisonResult.INCOMPARABLE) ||
+            ((buildAFailed || buildBFailed) && request.buildAVsB != RawComparisonResult.INCOMPARABLE) ||
+            ((buildAFailed || buildBFailed) && (request.trustEligible || request.installEligible))
+        ) throw ApiException.conflict("COMPARISON_BUILD_MISMATCH", "Build A and B are not the persisted independent pair for this comparison.")
+        connection().use { connection ->
+            connection.prepareStatement(
+                "SELECT request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind='GENERIC_COMPARISON_CREATE' AND idempotency_key=?",
+            ).use { statement ->
+                statement.setString(1, LOCAL_PRINCIPAL)
+                statement.setString(2, idempotencyKey)
+                statement.executeQuery().use { row ->
+                    if (row.next()) {
+                        if (row.getString(1) != requestSha256) throw ApiException.conflict("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used with a different request.")
+                        return GenericComparisonReceipt(genericComparison(row.getString(2)), true)
+                    }
+                }
+            }
+        }
+        val now = Instant.now(clock).toString()
+        val retryParent = genericResourceRetryParent(request.comparisonId)
+        val response = GenericComparisonResponse(
+            comparisonId = request.comparisonId,
+            configurationSha256 = request.configurationSha256,
+            officialIdentity = request.officialIdentity,
+            buildAJobId = request.buildAJobId,
+            buildBJobId = request.buildBJobId,
+            officialVsA = request.officialVsA,
+            officialVsB = request.officialVsB,
+            buildAVsB = request.buildAVsB,
+            trustEligible = request.trustEligible,
+            installEligible = request.installEligible,
+            reproducible = buildA.state == JobState.SUCCEEDED && buildB.state == JobState.SUCCEEDED &&
+                request.officialVsA == RawComparisonResult.MATCH &&
+                request.officialVsB == RawComparisonResult.MATCH && request.buildAVsB == RawComparisonResult.MATCH &&
+                request.trustEligible && request.installEligible,
+            retryOfComparisonId = retryParent,
+            resourceRetryCount = if (retryParent == null) 0 else 1,
+            createdAt = now,
+            updatedAt = now,
+        )
+        connection().use { connection ->
+            connection.autoCommit = false
+            try {
+                connection.prepareStatement(
+                    "INSERT INTO generic_comparisons(comparison_id,principal_id,request_json,request_sha256,response_json,build_a_job_id,build_b_job_id,resource_retry_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ).use { statement ->
+                    statement.setString(1, request.comparisonId)
+                    statement.setString(2, LOCAL_PRINCIPAL)
+                    statement.setString(3, GENERIC_JSON.encodeToString(request))
+                    statement.setString(4, requestSha256)
+                    statement.setString(5, GENERIC_JSON.encodeToString(response))
+                    statement.setString(6, request.buildAJobId)
+                    statement.setString(7, request.buildBJobId)
+                    statement.setInt(8, response.resourceRetryCount)
+                    statement.setString(9, now)
+                    statement.setString(10, now)
+                    statement.executeUpdate()
+                }
+                connection.prepareStatement(
+                    "INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'apk-comparison',1,'COMPLETED','COMPARISON',?,?,?)",
+                ).use { statement ->
+                    statement.setString(1, UUID.randomUUID().toString())
+                    statement.setString(2, LOCAL_PRINCIPAL)
+                    statement.setString(3, "GENERIC_COMPARISON_CREATE")
+                    statement.setString(4, idempotencyKey)
+                    statement.setString(5, requestSha256)
+                    statement.setString(6, request.comparisonId)
+                    statement.setString(7, now)
+                    statement.setString(8, now)
+                    statement.executeUpdate()
+                }
+                connection.commit()
+            } catch (failure: Throwable) {
+                connection.rollback()
+                if (failure is java.sql.SQLException && failure.message.orEmpty().contains("UNIQUE")) {
+                    throw ApiException.conflict("COMPARISON_ALREADY_EXISTS", "comparisonId already exists.")
+                }
+                throw failure
+            }
+        }
+        return GenericComparisonReceipt(response, false)
+    }
+
+    @Synchronized
+    internal fun genericComparison(comparisonId: String): GenericComparisonResponse = connection().use { connection ->
+        connection.prepareStatement("SELECT response_json FROM generic_comparisons WHERE comparison_id=? AND principal_id=?").use { statement ->
+            statement.setString(1, comparisonId)
+            statement.setString(2, LOCAL_PRINCIPAL)
+            statement.executeQuery().use { row ->
+                if (!row.next()) throw ApiException.notFound("COMPARISON_NOT_FOUND", "The requested comparison does not exist.")
+                GENERIC_JSON.decodeFromString(row.getString(1))
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun createGenericResourceRetry(
+        comparisonId: String,
+        idempotencyKey: String,
+        requestSha256: String,
+    ): GenericResourceRetryReceipt {
+        requireCanonicalUuid(comparisonId, "comparisonId")
+        connection().use { connection ->
+            connection.prepareStatement(
+                "SELECT request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind='GENERIC_RESOURCE_RETRY' AND idempotency_key=?",
+            ).use { statement ->
+                statement.setString(1, LOCAL_PRINCIPAL)
+                statement.setString(2, idempotencyKey)
+                statement.executeQuery().use { row ->
+                    if (row.next()) {
+                        if (row.getString(1) != requestSha256) {
+                            throw ApiException.conflict("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used with a different request.")
+                        }
+                        val retryComparisonId = row.getString(2)
+                            ?: throw ApiException.serviceUnavailable("RECONCILIATION_REQUIRED", "The accepted resource retry has no result identity.")
+                        return GenericResourceRetryReceipt(genericResourceRetry(retryComparisonId), true)
+                    }
+                }
+            }
+        }
+
+        val original = genericComparison(comparisonId)
+        if (original.resourceRetryCount != 0 || original.retryOfComparisonId != null) {
+            throw ApiException.conflict(
+                "RESOURCE_RETRY_NOT_ELIGIBLE",
+                "Only one resource retry is permitted for an original comparison.",
+            )
+        }
+        val originalA = getStoredJob(original.buildAJobId) ?: throw ApiException.serviceUnavailable(
+            "RECONCILIATION_REQUIRED",
+            "The comparison references a missing Build A Job.",
+        )
+        val originalB = getStoredJob(original.buildBJobId) ?: throw ApiException.serviceUnavailable(
+            "RECONCILIATION_REQUIRED",
+            "The comparison references a missing Build B Job.",
+        )
+        val snapshotA = originalA.genericBuild ?: throw ApiException.conflict("RESOURCE_RETRY_NOT_ELIGIBLE", "Build A is not a generic build.")
+        val snapshotB = originalB.genericBuild ?: throw ApiException.conflict("RESOURCE_RETRY_NOT_ELIGIBLE", "Build B is not a generic build.")
+        val failures = listOf(originalA, originalB).mapNotNull { job ->
+            if (job.state == JobState.FAILED) job.jobId to getJobError(job.jobId) else null
+        }
+        if (failures.none { it.second?.code == "SANDBOX_MEMORY_LIMIT_EXCEEDED" }) {
+            throw ApiException.conflict(
+                "RESOURCE_RETRY_NOT_ELIGIBLE",
+                "A persisted cgroup memory-limit failure is required for a resource retry.",
+            )
+        }
+        if (originalA.state !in setOf(JobState.SUCCEEDED, JobState.FAILED) ||
+            originalB.state !in setOf(JobState.SUCCEEDED, JobState.FAILED) ||
+            snapshotA.attempt != GenericBuildAttempt.A || snapshotB.attempt != GenericBuildAttempt.B ||
+            snapshotA.comparisonId != comparisonId || snapshotB.comparisonId != comparisonId ||
+            snapshotA.retryOfJobId != null || snapshotB.retryOfJobId != null ||
+            snapshotA.configurationSha256 != snapshotB.configurationSha256 ||
+            snapshotA.configurationCanonicalJson != snapshotB.configurationCanonicalJson
+        ) {
+            throw ApiException.conflict("RESOURCE_RETRY_NOT_ELIGIBLE", "The original comparison does not contain a retryable A/B pair.")
+        }
+        val configuration = GenericBuildContract.validate(originalA.repositoryUrl, originalA.revision.value, snapshotA)
+        if (originalB.repositoryUrl != originalA.repositoryUrl || originalB.revision.value != originalA.revision.value) {
+            throw ApiException.conflict("RESOURCE_RETRY_NOT_ELIGIBLE", "Build A and B do not share the same source snapshot.")
+        }
+        requireManagedToolchains(configuration)
+
+        val retryComparisonId = UUID.randomUUID().toString()
+        val retryA = snapshotA.copy(
+            comparisonId = retryComparisonId,
+            attempt = GenericBuildAttempt.A,
+            retryOfJobId = originalA.jobId,
+            memoryBytes = GenericDockerSandboxProfile.RETRY_MEMORY_BYTES,
+        )
+        val retryB = snapshotB.copy(
+            comparisonId = retryComparisonId,
+            attempt = GenericBuildAttempt.B,
+            retryOfJobId = originalB.jobId,
+            memoryBytes = GenericDockerSandboxProfile.RETRY_MEMORY_BYTES,
+        )
+        val retryAJobId = UUID.randomUUID().toString()
+        val retryBJobId = UUID.randomUUID().toString()
+        val now = Instant.now(clock).toString()
+        val requestA = CreateJobRequest(
+            executionMode = ExecutionMode.REAL_TRUSTED,
+            repositoryUrl = originalA.repositoryUrl,
+            revision = originalA.revision,
+            genericBuild = retryA,
+        )
+        val requestB = requestA.copy(genericBuild = retryB)
+        val response = GenericResourceRetryResponse(
+            comparisonId = retryComparisonId,
+            retryOfComparisonId = comparisonId,
+            buildAJobId = retryAJobId,
+            buildBJobId = retryBJobId,
+            memoryBytes = GenericDockerSandboxProfile.RETRY_MEMORY_BYTES,
+        )
+        connection().use { connection ->
+            connection.autoCommit = false
+            try {
+                insertJob(connection, retryAJobId, requestA, SandboxSnapshot.newGenericJob(retryA.memoryBytes), now)
+                insertJob(connection, retryBJobId, requestB, SandboxSnapshot.newGenericJob(retryB.memoryBytes), now)
+                insertGenericBuildRequest(connection, retryAJobId, retryA)
+                insertGenericBuildRequest(connection, retryBJobId, retryB)
+                connection.prepareStatement(
+                    "INSERT INTO generic_resource_retries(retry_comparison_id,original_comparison_id,build_a_job_id,build_b_job_id,evidence_code,memory_bytes,created_at) VALUES(?,?,?,?,?,?,?)",
+                ).use { statement ->
+                    statement.setString(1, retryComparisonId)
+                    statement.setString(2, comparisonId)
+                    statement.setString(3, retryAJobId)
+                    statement.setString(4, retryBJobId)
+                    statement.setString(5, "SANDBOX_MEMORY_LIMIT_EXCEEDED")
+                    statement.setLong(6, response.memoryBytes)
+                    statement.setString(7, now)
+                    statement.executeUpdate()
+                }
+                connection.prepareStatement(
+                    "INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'apk-comparison',1,'COMPLETED','RESOURCE_RETRY',?,?,?)",
+                ).use { statement ->
+                    statement.setString(1, UUID.randomUUID().toString())
+                    statement.setString(2, LOCAL_PRINCIPAL)
+                    statement.setString(3, "GENERIC_RESOURCE_RETRY")
+                    statement.setString(4, idempotencyKey)
+                    statement.setString(5, requestSha256)
+                    statement.setString(6, retryComparisonId)
+                    statement.setString(7, now)
+                    statement.setString(8, now)
+                    statement.executeUpdate()
+                }
+                connection.commit()
+            } catch (failure: Throwable) {
+                connection.rollback()
+                throw failure
+            }
+        }
+        appendLog(retryAJobId, LogLevel.WARN, "Resource retry accepted from comparison $comparisonId with the 12 GiB generic memory profile.")
+        appendLog(retryBJobId, LogLevel.WARN, "Resource retry accepted from comparison $comparisonId with the 12 GiB generic memory profile.")
+        return GenericResourceRetryReceipt(response, false)
+    }
+
+    @Synchronized
+    internal fun genericResourceRetry(retryComparisonId: String): GenericResourceRetryResponse = connection().use { connection ->
+        connection.prepareStatement(
+            "SELECT original_comparison_id,build_a_job_id,build_b_job_id,memory_bytes FROM generic_resource_retries WHERE retry_comparison_id=?",
+        ).use { statement ->
+            statement.setString(1, retryComparisonId)
+            statement.executeQuery().use { row ->
+                if (!row.next()) throw ApiException.serviceUnavailable(
+                    "RECONCILIATION_REQUIRED",
+                    "The accepted resource retry pair is missing its durable record.",
+                )
+                GenericResourceRetryResponse(
+                    comparisonId = retryComparisonId,
+                    retryOfComparisonId = row.getString("original_comparison_id"),
+                    buildAJobId = row.getString("build_a_job_id"),
+                    buildBJobId = row.getString("build_b_job_id"),
+                    memoryBytes = row.getLong("memory_bytes"),
+                )
+            }
+        }
+    }
+
+    private fun genericResourceRetryParent(retryComparisonId: String): String? = connection().use { connection ->
+        connection.prepareStatement("SELECT original_comparison_id FROM generic_resource_retries WHERE retry_comparison_id=?").use { statement ->
+            statement.setString(1, retryComparisonId)
+            statement.executeQuery().use { row -> if (row.next()) row.getString(1) else null }
+        }
+    }
+
+    private fun getJobError(jobId: String): JobError? = connection().use { connection ->
+        connection.prepareStatement("SELECT error_code,error_message FROM jobs WHERE job_id=?").use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { row ->
+                if (!row.next()) null else row.getString("error_code")?.let { code -> JobError(code, row.getString("error_message")) }
+            }
+        }
+    }
+
+    private fun insertGenericBuildRequest(connection: Connection, jobId: String, snapshot: GenericBuildSnapshot) {
+        connection.prepareStatement(
+            "INSERT INTO generic_build_requests(job_id,request_json,configuration_sha256,comparison_id,attempt,retry_of_job_id,memory_bytes) VALUES(?,?,?,?,?,?,?)",
+        ).use { statement ->
+            statement.setString(1, jobId)
+            statement.setString(2, GENERIC_JSON.encodeToString(snapshot))
+            statement.setString(3, snapshot.configurationSha256)
+            statement.setString(4, snapshot.comparisonId)
+            statement.setString(5, snapshot.attempt.name)
+            statement.setString(6, snapshot.retryOfJobId)
+            statement.setLong(7, snapshot.memoryBytes)
+            statement.executeUpdate()
         }
     }
 
@@ -148,7 +600,7 @@ class SQLiteJobStore(
     @Synchronized
     internal fun requireCurrentManifest(jobId: String) {
         val snapshot = getStoredJob(jobId)?.sandbox ?: throw invalidSandboxSnapshot()
-        snapshot.validatedProfile()
+        snapshot.validateAnyProfile()
         sandboxTransaction { connection ->
             connection.prepareStatement("UPDATE jobs SET manifest_format = 'REQUIRED_V4' WHERE job_id = ?").use { statement ->
                 statement.setString(1, jobId)
@@ -177,8 +629,9 @@ class SQLiteJobStore(
         require(resource.containerId == null && !resource.removed && resource.observationJson == null)
         val snapshot = getStoredJob(resource.jobId)?.sandbox ?: throw invalidSandboxSnapshot()
         require(snapshot.jobSandbox.mode == BuildSandboxMode.DOCKER)
-        require(getStoredJob(resource.jobId)?.state == JobState.VERIFYING_WRAPPER)
-        require(snapshot.validatedProfile()?.endpoint == resource.endpoint)
+        require(getStoredJob(resource.jobId)?.state in setOf(JobState.VERIFYING_WRAPPER, JobState.DISCOVERING_CONFIGURATION))
+        val endpoint = snapshot.validatedGenericProfile()?.endpoint ?: snapshot.validatedProfile()?.endpoint
+        require(endpoint == resource.endpoint)
         connection.prepareStatement("SELECT owner_id FROM sandbox_owner WHERE singleton = 1").use { statement ->
             statement.executeQuery().use { require(it.next() && it.getString(1) == resource.ownerId) }
         }
@@ -923,6 +1376,7 @@ class SQLiteJobStore(
             JobState.CLONING,
             JobState.SCANNING_SOURCE,
             JobState.VERIFYING_WRAPPER,
+            JobState.DISCOVERING_CONFIGURATION,
             JobState.BUILDING,
             JobState.DISCOVERING_ARTIFACTS,
         )
@@ -1380,6 +1834,63 @@ class SQLiteJobStore(
                         )
                         """.trimIndent(),
                     )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS generic_build_requests (
+                            job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+                            request_json TEXT NOT NULL,
+                            configuration_sha256 TEXT NOT NULL,
+                            comparison_id TEXT NOT NULL,
+                            attempt TEXT NOT NULL,
+                            retry_of_job_id TEXT REFERENCES jobs(job_id),
+                            memory_bytes INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS generic_build_attempt_identity ON generic_build_requests(comparison_id,attempt,retry_of_job_id)",
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS generic_discovery_evidence (
+                            job_id TEXT PRIMARY KEY REFERENCES generic_build_requests(job_id) ON DELETE CASCADE,
+                            evidence_json TEXT NOT NULL,
+                            output_sha256 TEXT NOT NULL,
+                            output_bytes INTEGER NOT NULL,
+                            observed_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS generic_comparisons (
+                            comparison_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL,
+                            request_json TEXT NOT NULL,
+                            request_sha256 TEXT NOT NULL,
+                            response_json TEXT NOT NULL,
+                            build_a_job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                            build_b_job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                            retry_of_comparison_id TEXT REFERENCES generic_comparisons(comparison_id),
+                            resource_retry_count INTEGER NOT NULL DEFAULT 0,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS generic_resource_retries (
+                            retry_comparison_id TEXT PRIMARY KEY,
+                            original_comparison_id TEXT NOT NULL REFERENCES generic_comparisons(comparison_id),
+                            build_a_job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                            build_b_job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                            evidence_code TEXT NOT NULL,
+                            memory_bytes INTEGER NOT NULL,
+                            created_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
                 connection.commit()
@@ -1641,7 +2152,7 @@ class SQLiteJobStore(
             return SandboxSnapshot(
                 sandbox, getString("sandbox_snapshot"), getString("sandbox_snapshot_sha256"),
                 SandboxManifestFormat.valueOf(getString("manifest_format")),
-            ).also { it.validatedProfile() }
+            ).also { it.validateAnyProfile() }
         } catch (_: Exception) {
             throw invalidSandboxSnapshot()
         }
@@ -1661,6 +2172,8 @@ class SQLiteJobStore(
         latestLogSequence: Long,
         artifacts: List<ArtifactMetadata>,
         sourceScan: SourceScanSummaryResponse?,
+        genericBuild: GenericBuildSnapshot?,
+        discovery: GenericDiscoveryEvidence?,
     ): JobResponse = JobResponse(
         jobId = getString("job_id"),
         executionMode = ExecutionMode.valueOf(getString("execution_mode")),
@@ -1700,7 +2213,25 @@ class SQLiteJobStore(
         createdAt = getString("created_at"),
         updatedAt = getString("updated_at"),
         sandbox = toSandboxSnapshot()?.jobSandbox,
+        genericBuild = genericBuild,
+        discovery = discovery,
     )
+
+    private fun genericBuild(connection: Connection, jobId: String): GenericBuildSnapshot? =
+        connection.prepareStatement("SELECT request_json FROM generic_build_requests WHERE job_id=?").use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { row ->
+                if (row.next()) GENERIC_JSON.decodeFromString<GenericBuildSnapshot>(row.getString(1)) else null
+            }
+        }
+
+    private fun genericDiscovery(connection: Connection, jobId: String): GenericDiscoveryEvidence? =
+        connection.prepareStatement("SELECT evidence_json FROM generic_discovery_evidence WHERE job_id=?").use { statement ->
+            statement.setString(1, jobId)
+            statement.executeQuery().use { row ->
+                if (row.next()) GENERIC_JSON.decodeFromString<GenericDiscoveryEvidence>(row.getString(1)) else null
+            }
+        }
 
     private fun logPath(jobId: String): Path = logDirectory.resolve("$jobId.log")
 
@@ -1736,7 +2267,9 @@ class SQLiteJobStore(
     )
 
     private companion object {
-        const val SCHEMA_VERSION = 10
+        const val SCHEMA_VERSION = 11
+        const val LOCAL_PRINCIPAL = "local-development"
+        val GENERIC_JSON = Json { ignoreUnknownKeys = false; explicitNulls = false; encodeDefaults = true }
         val SANDBOX_COLUMNS = listOf(
             "sandbox_mode TEXT", "sandbox_origin TEXT", "sandbox_profile_id TEXT", "sandbox_snapshot TEXT",
             "sandbox_snapshot_sha256 TEXT", "sandbox_cleanup_status TEXT", "manifest_format TEXT",

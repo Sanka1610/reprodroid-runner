@@ -29,10 +29,15 @@ class ToolchainInstallerTest {
 
         val final = stateDirectory.resolve(installed.relativePath)
         assertTrue(final.resolve("bin/gradle").toFile().isFile)
+        assertTrue(Files.isExecutable(final.resolve("bin/gradle")))
         assertTrue(final.resolve(".reprodroid-content-manifest").toFile().isFile)
         assertTrue(states.containsAll(listOf(ToolchainInstallationState.VERIFYING_ARCHIVE, ToolchainInstallationState.EXTRACTING, ToolchainInstallationState.PUBLISHING)))
         assertTrue(installed.contentManifestSha256.matches(Regex("[0-9a-f]{64}")))
         assertTrue(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+        val executable = final.resolve("bin/gradle")
+        executable.toFile().setExecutable(false, false)
+        assertFalse(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+        executable.toFile().setExecutable(true, false)
         final.resolve("lib/marker").toFile().setWritable(true, true)
         Files.writeString(final.resolve("lib/marker"), "tampered")
         assertFalse(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
@@ -64,6 +69,59 @@ class ToolchainInstallerTest {
             ) { _, _ -> }
         }
         assertEquals("ARCHIVE_ENTRY_LIMIT_EXCEEDED", failure.code)
+        assertFalse(Files.exists(stateDirectory.resolve("toolchains/gradle/fixture")))
+    }
+
+    @Test
+    fun `tar relative symlink confined after normalization is accepted`() {
+        val payload = stateDirectory.resolve("tar-payload/gradle-fixture")
+        Files.createDirectories(payload.resolve("bin"))
+        Files.createDirectories(payload.resolve("lib"))
+        Files.writeString(payload.resolve("bin/gradle"), "#!/bin/sh\n")
+        Files.writeString(payload.resolve("lib/marker"), "ok")
+        Files.createSymbolicLink(payload.resolve("lib/gradle-link"), Path.of("../bin/gradle"))
+        val archive = stateDirectory.resolve("fixture.tar.gz")
+        val result = ProcessBuilder("tar", "-C", payload.parent.toString(), "-czf", archive.toString(), payload.fileName.toString())
+            .redirectErrorStream(true)
+            .start()
+        assertEquals(0, result.waitFor(), result.inputStream.bufferedReader().readText())
+        val tarArtifact = artifact(archive).copy(archiveType = ToolchainArchiveType.TAR_GZ)
+
+        val installed = installerFor(archive).install(
+            UUID.randomUUID().toString(),
+            tarArtifact,
+            { false },
+        ) { _, _ -> }
+
+        val link = stateDirectory.resolve(installed.relativePath).resolve("lib/gradle-link")
+        assertTrue(Files.isSymbolicLink(link))
+        assertEquals(Path.of("../bin/gradle"), Files.readSymbolicLink(link))
+        assertTrue(installerFor(archive).verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+    }
+
+    @Test
+    fun `tar relative symlink escaping extraction root is rejected`() {
+        val payload = stateDirectory.resolve("escape-payload/gradle-fixture")
+        Files.createDirectories(payload.resolve("bin"))
+        Files.createDirectories(payload.resolve("lib"))
+        Files.writeString(payload.resolve("bin/gradle"), "#!/bin/sh\n")
+        Files.writeString(payload.resolve("lib/marker"), "ok")
+        Files.createSymbolicLink(payload.resolve("lib/escape"), Path.of("../../../outside"))
+        val archive = stateDirectory.resolve("escape.tar.gz")
+        val result = ProcessBuilder("tar", "-C", payload.parent.toString(), "-czf", archive.toString(), payload.fileName.toString())
+            .redirectErrorStream(true)
+            .start()
+        assertEquals(0, result.waitFor(), result.inputStream.bufferedReader().readText())
+
+        val failure = assertThrows(ToolchainInstallFailure::class.java) {
+            installerFor(archive).install(
+                UUID.randomUUID().toString(),
+                artifact(archive).copy(archiveType = ToolchainArchiveType.TAR_GZ),
+                { false },
+            ) { _, _ -> }
+        }
+
+        assertEquals("ARCHIVE_LINK_INVALID", failure.code)
         assertFalse(Files.exists(stateDirectory.resolve("toolchains/gradle/fixture")))
     }
 

@@ -50,12 +50,15 @@ internal class SandboxOutputImport(
     }
 
     /** Copies to a controller-owned directory first; subsequent APK checks must read that private copy. */
-    fun importApks(destination: Path): List<Pair<Path, ManifestFile>> = guarded {
+    fun importApks(
+        destination: Path,
+        accept: (Path) -> Boolean = { relative -> relative.nameCount == 1 },
+    ): List<Pair<Path, ManifestFile>> = guarded {
         val result = mutableListOf<Pair<Path, ManifestFile>>()
         try {
             withDirectory(root, missingAllowed = true) { directory ->
                 traverse(directory, Path.of("")) { relative, parent, name ->
-                    if (relative.nameCount == 1 && relative.fileName.toString().endsWith(".apk", ignoreCase = true)) {
+                    if (relative.fileName.toString().endsWith(".apk", ignoreCase = true) && accept(relative)) {
                         val temporary = Files.createTempFile(destination, "sandbox-apk-", ".partial")
                         try {
                             val digest = Files.newByteChannel(temporary, StandardOpenOption.WRITE, NOFOLLOW_LINKS).use { output ->

@@ -77,6 +77,7 @@ internal class ToolchainInstaller(
         cancelled.throwIfCancelled()
         val payload = singleRootOrSelf(extractRoot)
         progress.update(ToolchainInstallationState.VERIFYING_CONTENT, artifact.archiveSizeBytes.toLong())
+        restoreExecutableEntries(artifact.component, payload)
         validateMetadata(artifact, payload)
         val manifest = createContentManifest(payload, cancelled)
         val manifestPath = payload.resolve(CONTENT_MANIFEST_NAME)
@@ -302,13 +303,14 @@ internal class ToolchainInstaller(
                     '5' -> safeDestination(root, name).createDirectories()
                     '2' -> {
                         val destination = safeDestination(root, name)
-                        if (linkName.startsWith('/') || linkName.any { it.code < 0x20 } || linkName.split('/').any { it == ".." }) {
+                        val linkTarget = runCatching { Path.of(linkName) }.getOrNull()
+                        if (linkName.isBlank() || linkName.any { it.code < 0x20 } || linkTarget == null || linkTarget.isAbsolute) {
                             throw ToolchainInstallFailure("ARCHIVE_LINK_INVALID", "Archive contains an unsafe symbolic link.")
                         }
                         safeParentDirectories(root, destination.parent)
-                        val resolvedTarget = destination.parent.resolve(linkName).normalize()
+                        val resolvedTarget = destination.parent.resolve(linkTarget).normalize()
                         if (!resolvedTarget.startsWith(root.normalize())) throw ToolchainInstallFailure("ARCHIVE_LINK_INVALID", "Archive link escapes extraction root.")
-                        Files.createSymbolicLink(destination, Path.of(linkName))
+                        Files.createSymbolicLink(destination, linkTarget)
                         input.skipExactly(size)
                     }
                     'L' -> {
@@ -352,7 +354,8 @@ internal class ToolchainInstaller(
                 when {
                     Files.isSymbolicLink(path) -> lines += "L\t$relative\t${Files.readSymbolicLink(path)}"
                     path.isDirectory(LinkOption.NOFOLLOW_LINKS) -> lines += "D\t$relative"
-                    path.isRegularFile(LinkOption.NOFOLLOW_LINKS) -> lines += "F\t$relative\t${Files.size(path)}\t${sha256(path)}"
+                    path.isRegularFile(LinkOption.NOFOLLOW_LINKS) -> lines +=
+                        "F\t$relative\t${Files.size(path)}\t${sha256(path)}\t${if (Files.isExecutable(path)) "X" else "-"}"
                     else -> throw ToolchainInstallFailure("TOOLCHAIN_CONTENT_INVALID", "Extracted content contains an unsupported file type.")
                 }
             }
@@ -364,6 +367,39 @@ internal class ToolchainInstaller(
     private fun singleRootOrSelf(root: Path): Path {
         val entries = Files.list(root).use { it.toList() }
         return if (entries.size == 1 && entries.single().isDirectory(LinkOption.NOFOLLOW_LINKS)) entries.single() else root
+    }
+
+    private fun restoreExecutableEntries(component: ToolchainComponent, root: Path) {
+        val executableRoots = when (component) {
+            ToolchainComponent.JDK,
+            ToolchainComponent.GRADLE,
+            ToolchainComponent.ANDROID_COMMAND_LINE_TOOLS,
+            ToolchainComponent.CMAKE,
+            -> listOf(root.resolve("bin"))
+            ToolchainComponent.ANDROID_BUILD_TOOLS -> BUILD_TOOLS_EXECUTABLES.map(root::resolve)
+            ToolchainComponent.ANDROID_PLATFORM,
+            ToolchainComponent.ANDROID_NDK,
+            -> emptyList()
+        }
+        executableRoots.forEach { candidate ->
+            if (candidate.isDirectory(LinkOption.NOFOLLOW_LINKS)) {
+                Files.list(candidate).use { entries ->
+                    entries.filter { it.isRegularFile(LinkOption.NOFOLLOW_LINKS) }.forEach(::makeExecutable)
+                }
+            } else if (candidate.isRegularFile(LinkOption.NOFOLLOW_LINKS)) {
+                makeExecutable(candidate)
+            }
+        }
+    }
+
+    private fun makeExecutable(path: Path) {
+        val permissions = Files.getPosixFilePermissions(path).toMutableSet()
+        permissions += setOf(
+            PosixFilePermission.OWNER_EXECUTE,
+            PosixFilePermission.GROUP_EXECUTE,
+            PosixFilePermission.OTHERS_EXECUTE,
+        )
+        Files.setPosixFilePermissions(path, permissions)
     }
 
     private fun safeDestination(root: Path, raw: String): Path {
@@ -462,6 +498,12 @@ internal class ToolchainInstaller(
         private const val MAX_REDIRECTS = 5
         private const val CONTENT_MANIFEST_NAME = ".reprodroid-content-manifest"
         private const val SIGNATURE_TIMEOUT_NANOS = 30_000_000_000L
+        private val BUILD_TOOLS_EXECUTABLES = listOf(
+            "aapt", "aapt2", "aarch64-linux-android-ld", "aidl", "apksigner",
+            "arm-linux-androideabi-ld", "bcc_compat", "d8", "dexdump",
+            "i686-linux-android-ld", "lld", "llvm-rs-cc", "mipsel-linux-android-ld",
+            "split-select", "x86_64-linux-android-ld", "zipalign",
+        )
         private val TRUSTED_HOSTS = setOf("github.com", "release-assets.githubusercontent.com", "services.gradle.org", "downloads.gradle.org", "dl.google.com")
         private val CANONICAL_UUID = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
     }

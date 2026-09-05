@@ -23,6 +23,8 @@ internal data class BuildRecipe(
     val allowRunnerSuppliedDistributionChecksum: Boolean,
     val dependencyPinning: DependencyPinning = DependencyPinning.LOCKFILE_OFFLINE,
     val determinism: DeterminismOptions = DeterminismOptions(noBuildCache = false),
+    val managedToolchains: Boolean = false,
+    val discoveryTimeout: Duration? = null,
 )
 
 internal class BuildRecipeRegistry(

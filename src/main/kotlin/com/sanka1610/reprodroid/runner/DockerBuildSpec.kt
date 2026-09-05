@@ -10,16 +10,22 @@ import java.nio.file.Path
 internal data class SandboxMount(val source: String, val destination: String, val readOnly: Boolean)
 
 internal class DockerBuildSpec(
-    val profile: DockerSandboxProfile,
+    val profile: DockerSandboxPolicy,
     val mounts: List<SandboxMount>,
     val environment: Map<String, String>,
+    val workingDirectory: String = profile.source,
 ) {
+    init {
+        require(workingDirectory == profile.source || workingDirectory.startsWith("${profile.source}/"))
+        require(".." !in workingDirectory.split('/'))
+    }
     fun preflightMounts() {
         try {
             val started = System.nanoTime()
             fun deadline() { require(System.nanoTime() - started <= 60_000_000_000) }
-            require(mounts.size == 5 && mounts.map { it.destination }.toSet() ==
-                setOf(profile.source, profile.home, profile.gradleHome, profile.jdk, profile.sdk))
+            val readOnlyDestinations = setOfNotNull(profile.jdk, profile.sdk, profile.gradle)
+            val destinations = setOf(profile.source, profile.home, profile.gradleHome, profile.jdk, profile.sdk) + listOfNotNull(profile.gradle)
+            require(mounts.size == destinations.size && mounts.map { it.destination }.toSet() == destinations)
             for (mount in mounts) {
                 deadline()
                 val path = Path.of(mount.source)
@@ -29,7 +35,7 @@ internal class DockerBuildSpec(
                     ancestor = ancestor.resolve(component)
                     require(Files.isDirectory(ancestor, NOFOLLOW_LINKS) && !Files.isSymbolicLink(ancestor))
                 }
-                require(mount.readOnly == (mount.destination in setOf(profile.jdk, profile.sdk)))
+                require(mount.readOnly == (mount.destination in readOnlyDestinations))
                 require(Files.isReadable(path) && Files.isExecutable(path))
                 if (!mount.readOnly) {
                     require(Files.getAttribute(path, "unix:uid") == profile.uid && Files.getAttribute(path, "unix:gid") == profile.gid)
@@ -70,7 +76,7 @@ internal class DockerBuildSpec(
             "--memory", profile.memoryBytes.toString(), "--memory-swap", profile.memorySwapBytes.toString(),
             "--pids-limit", profile.pids.toString(), "--network=bridge", "--restart=no",
             "--tmpfs", "/tmp:rw,nosuid,nodev,size=${profile.tmpfsBytes}",
-            "--workdir", profile.source, "--entrypoint", command.first(),
+            "--workdir", workingDirectory, "--entrypoint", command.first(),
         ))
         resource.labels.forEach { (key, value) -> addAll(listOf("--label", "$key=$value")) }
         mounts.forEach { mount ->
@@ -86,7 +92,7 @@ internal class DockerBuildSpec(
         require(inspected.string("Image") == imageId && inspected.string("Platform") == "linux")
         val config = inspected.getValue("Config").jsonObject
         require(config.string("Image") == profile.image && config.string("User") == "${profile.uid}:${profile.gid}")
-        require(config.string("WorkingDir") == profile.source && config.getValue("Entrypoint").jsonArray.map { it.jsonPrimitive.content } == listOf(command.first()))
+        require(config.string("WorkingDir") == workingDirectory && config.getValue("Entrypoint").jsonArray.map { it.jsonPrimitive.content } == listOf(command.first()))
         require(config.getValue("Cmd").jsonArray.map { it.jsonPrimitive.content } == command.drop(1))
         require(config.getValue("Env").jsonArray.map { it.jsonPrimitive.content }.toSet() == environment.map { (key, value) -> "$key=$value" }.toSet())
         val labels = config.getValue("Labels").jsonObject

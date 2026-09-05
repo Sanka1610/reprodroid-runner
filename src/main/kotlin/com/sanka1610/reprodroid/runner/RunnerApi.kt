@@ -173,8 +173,12 @@ fun Application.runnerModule(config: RunnerConfig) {
             }
         }
         if (config.apiV2Enabled) {
-            storageRetentionV2Routes(storageRetention)
+            storageRetentionV2Routes(
+                storageRetention,
+                genericExecutionEnabled = config.realBuildEnabled && config.buildSandbox == BuildSandboxMode.DOCKER,
+            )
             toolchainV2Routes(requireNotNull(toolchains))
+            genericBuildV2Routes(coordinator, store)
         }
     }
 }
