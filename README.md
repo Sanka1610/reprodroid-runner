@@ -1,5 +1,7 @@
 # ReproDroid Runner
 
+**Phase 4.6実装（2026-09-08）:** exclusive development HTTP／paired HTTPS、Runner-local P-256 CAとrenewable leaf、root SPKI pin、local CLI承認／失効、Android生成Bearerのhash保存、全通常API認証、明示LAN、legacy principalのpreview付きatomic adoption、verified SQLite12 migrationを実装しました。Runner全197件中、既存Docker環境gate 16件をskipし181件がPASS、failure／error 0です。実TLS／CLI 26観測とADB reverseのAndroid pairing／失効経路もPASSです。LAN allowはWindows／WSL経路の到達不能により`PARTIAL`で、firewall変更は行っていません。QR／camera／Play servicesは追加していません。[実装記録](../reprodroid-project/reports/2026/09/2026-09-08-phase-4-6-implementation.md)を参照してください。
+
 **Phase 4.5境界（2026-09-06）:** scheduled release discovery／notificationをAndroid単体のmetadata-only機能として実装しました。Runner production code、Job、API capability、SQLite11、toolchain、build／comparison経路は4.5で変更していません。Androidのdebug／release JVM test各147件、lintDebug、assemble、AndroidTest APK compileはPASSですが、接続端末がなくAndroid 16製品受入は`NOT_RUN`です。Runner testは4.5では`NOT_RUN`であり、Androidの回帰結果をRunner検証へ読み替えません。正本は[Phase 4.5契約](../reprodroid-project/docs/design/phase-4-release-check-contract.md)、[ADR-0023](../reprodroid-project/docs/adr/0023-phase-4-scheduled-release-discovery-and-notifications.md)、[実装記録](../reprodroid-project/reports/2026/09/2026-09-06-phase-4-5-implementation.md)です。
 
 **Phase 4 現在地（2026-09-05）:** SQLite11へ4.4のgeneric Docker build／comparisonを実装しました。loopback development opt-inの`generic-build@1`と`apk-comparison@1`は、catalog管理toolchain、Docker必須・HOST fallbackなし、独立A／B、dynamic discovery、raw 3軸保存、memory OOMだけの明示retryを提供します。4.3 installerは正当な相対symbolic linkをconfineして許可し、archiveの実行bitをcontent manifestへ束縛して復元します。空store導入では9 artifactの`VERIFIED`とRunner再起動後のinventory復元を確認しました。JVM testは130件（pass 114、明示opt-in skip 16、failure 0）です。generic Android + Docker Build A/B製品E2Eは利用者指示により実施しておらず、機能成功・Reproducible判定の証拠ではありません。正本は[ADR-0021](../reprodroid-project/docs/adr/0021-phase-4-generic-build-sandbox-and-comparison.md)と[4.4実装記録](../reprodroid-project/reports/2026/09/2026-09-05-phase-4-4-implementation.md)です。
@@ -44,7 +46,7 @@ Phase 3A の Runner 実装として、private Build Environment Manifest schema 
 
 ## Phase 4.2（development storage-retention API v2）
 
-`REPRODROID_ENABLE_API_V2=true`を指定したloopback bindで、`foundation@1`と`storage-retention@1`を有効化します。pairing／認証が未実装のため非loopbackでは起動を拒否します。このgateを有効にしたRunnerはv1のJob create、confirm、retry、source-scan continueを426 `API_UPGRADE_REQUIRED`で停止し、v1 readとcancelは移行・安全経路として維持します。v2 generic Job createへ暗黙変換しません。
+`REPRODROID_TRANSPORT_MODE=DEVELOPMENT_HTTP`はloopback bindだけで従来のlocal-development principalを有効化します。`PAIRED_HTTPS`は正確なendpointと初期化済みCAを要求し、全通常v1／v2 routeを認証します。両modeは排他的で、設定不明、非loopback development、鍵不整合では起動を拒否し、HTTPへfallbackしません。
 
 4.2のRunner endpointはcapability／operation read、storage summary、JOB／ARTIFACT hold、限定reservation、manual cleanup preview／executeです。cleanup requestはpathを受け取らず、Runnerがowner root内の候補を列挙します。symlink、path escape、active／review待ちJob、sandbox cleanup `PENDING`、ACTIVE hold／reservation、preview後に変化したresourceを削除しません。automatic cleanup、log export、共有送信は含みません。
 
@@ -271,13 +273,53 @@ REPRODROID_JDK_18_HOME="$HOME/.local/share/reprodroid/jdk-18.0.2.1+1" \
 
 起動時設定だけではbuildを開始しません。AndroidまたはAPIから、Runnerが解決したcommit SHAとRCEリスクをJob単位で確認する必要があります。
 
-## Phase 4.5実装後のRunner境界・対象外
+## Phase 4.6 secure Runnerのローカル操作
+
+以下は4.6作業ブランチの操作入口です。実行済みの検証範囲・残件は[4.6実装記録](../reprodroid-project/reports/2026/09/2026-09-08-phase-4-6-implementation.md)で管理し、この手順の存在だけを製品受入の証拠にしません。
+
+最初に専用のstate directoryと正確な接続先を選びます。既存stateの`runnerId`を作り直したり、欠損した鍵を暗黙再生成したりしません。次はloopback／ADB用の例で、`/absolute/path/to/runner-state`を実際の専用パスへ置き換え、同じ設定をRunner用とCLI用の両方のterminalへ適用します。
+
+```bash
+export REPRODROID_STATE_DIR=/absolute/path/to/runner-state
+export REPRODROID_TRANSPORT_MODE=PAIRED_HTTPS
+export REPRODROID_HOST=127.0.0.1
+export REPRODROID_PORT=8443
+export REPRODROID_ADVERTISED_ENDPOINT=https://127.0.0.1:8443
+./gradlew installDist
+build/install/reprodroid-runner/bin/reprodroid-runner security-init
+build/install/reprodroid-runner/bin/reprodroid-runner
+```
+
+`security-init`は未初期化stateへの一度の明示操作です。以後の起動では実行せず、引数なしの最後のコマンドだけを使います。HTTPSとHTTPは同時に開かず、paired構成で失敗してもHTTPへ戻りません。ADB接続は端末を選んだうえで`adb -s <serial> reverse tcp:8443 tcp:8443`を設定します。LANではbindとadvertised endpointを実際の正確なIP／DNSへ明示変更し、wildcard bind、firewallやrouterの自動変更、公開internetへの直接露出は行いません。
+
+別terminalで、同じstate／transport設定を使って次のlocal CLI操作を行います。表中のIDは前段の出力を確認して指定します。
+
+| コマンド引数 | 操作と境界 |
+|---|---|
+| `pairing-open` | 5分・1回限りのmanual payloadと同じ内容のfield一覧を表示。payloadとinvitation secretをlog／Issueへ貼らない |
+| `pairing-list` | pending request、device label、endpoint、作成時刻、confirmation fingerprintを確認 |
+| `pairing-approve <requestId>` | Android画面とfingerprintを照合した1要求だけを承認 |
+| `pairing-reject <requestId>` | 1要求を拒否。既に終端の状態は書き換えない |
+| `principals-list` | principalの状態とcredential ageの確認に必要な非秘密情報を表示 |
+| `principal-revoke <principalId>` | 紛失端末等のprincipalを失効。Job、履歴、artifactを削除せず、active Jobを自動cancelしない |
+| `adoption-preview <sourcePrincipalId> <targetPrincipalId>` | `local-development`または失効済みprincipalからactive principalへの所有権移行をpreview |
+| `adoption-execute <previewId>` | 10分以内のpreviewを再照合し、競合・active／review／cleanup状態がない場合だけ一括移行して監査 |
+| `security-change-endpoint` | paired Runner停止中に、設定済みの新endpoint向けleafを同じrootで発行。新設定で再起動し、Androidは新manual payloadで再pair |
+| `security-rotate-root` | paired Runner停止中の明示的root交換。pinが変わり旧principal／pending invitationを失効させるため、全端末で再pairが必要 |
+
+鍵は専用`security`ディレクトリ内でowner-onlyに保管し、root／leafの不整合や欠損はfail closedで止めます。同じrootのleaf更新は期限7日前から自動で行い、新規TLS接続へ適用します。Androidのlocal-deleteとRunnerでの失効は別操作です。再pairは新principalを作り、旧所有権・RCE同意・scan review・trust・install権限を自動継承しません。
+
+暗号ライブラリのlicenseと配布時のnoticeは[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)を参照してください。QR生成／scan、CAMERA permission、Google Play services、LAN管理APIは追加しません。
+
+## Phase 4.6実装後のRunner境界・対象外
 
 Phase 3Eの固定profile、Phase 4.1のAndroid登録、4.2のhistory／storage、4.3のtoolchain、4.4のgeneric Docker build／comparison codeを実装しています。4.5は[実装契約](../reprodroid-project/docs/design/phase-4-release-check-contract.md)と[ADR-0023](../reprodroid-project/docs/adr/0023-phase-4-scheduled-release-discovery-and-notifications.md)に従ってAndroidへ実装しましたが、Runner production code／SQLite／API capabilityは変更していません。4.5のscheduled／manual metadata checkはRunner停止・ADB reverseなしでも成立する設計で、Runner Job、toolchain導入、build／comparisonを起動しません。Runner testは今回`NOT_RUN`です。4.3は空storeから9 artifactを導入し、inventory、Runner restart復旧、manual removal cleanupまで確認しました。4.4はSQLite11、`generic-build@1`／`apk-comparison@1`、catalog-managed Gradle launcher、独立A／B、raw三軸、memory OOM限定retryを追加しています。[Phase 4 roadmap](../reprodroid-project/docs/design/phase-4-roadmap.md)、[4.5実装記録](../reprodroid-project/reports/2026/09/2026-09-06-phase-4-5-implementation.md)、[4.4実装記録](../reprodroid-project/reports/2026/09/2026-09-05-phase-4-4-implementation.md)を正本とします。Android 16の4.5製品受入とAndroid + Dockerの公開source二project Build A／B・比較E2Eは`NOT_RUN`であり、実provider経路、実build成功、Reproducibleの証拠ではありません。
 
+4.6の具体値は[実装契約](../reprodroid-project/docs/design/phase-4-runner-connectivity-contract.md)に従ってSQLite12へ実装しました。`DEVELOPMENT_HTTP`の無認証loopbackと`PAIRED_HTTPS`は排他的で、旧`REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`は受け付けません。paired modeの通常v1／v2 endpointはすべて認証し、管理操作はlocal CLIに限定します。旧principalのownershipは自動移行せず、preview、再検証、atomic execute、監査を伴う明示操作だけで移行します。実行結果と残る`PARTIAL`は[4.6実装記録](../reprodroid-project/reports/2026/09/2026-09-08-phase-4-6-implementation.md)を正本とします。
+
 汎用buildはDocker必須、HOST fallbackなしで、4 CPU、memory 8 GiB、swapなし、PID 1,024、tmpfs 1 GiB、詳細log 64 MiB、Gradle workers最大2、Runner実行枠1、A／B各60分を固定します。Runnerがcatalog digestで検証済みのGradle launcherだけをcontainer内で起動し、repository Wrapper、Docker socket、DinD、host network、port publish、任意image／mountを拒否します。hard disk／inode quotaと固定egress allowlistは現行4.4の対象外であり、bridgeやtmpfsをこれらの実効制御の証拠にしません。
 
-不足JDK／Gradle／Android toolsの専用store導入、Android history／予約・hold／手動cleanup、HTTPS／pairing／認証、Runner／Job log export、WSL／Linux向け配布準備を含めます。資源不足再試行は既定OFF・限定許可付きで新A／Bを作り、scan review・全体budget・cleanup確認を省略しません。定期release確認からbuildを始めず、参照APK取得と比較はAndroidが所有します。merge／push／公開は別承認まで行いません。
+不足JDK／Gradle／Android toolsの専用store導入、Android history／予約・hold／手動cleanup、HTTPS／pairing／認証、Runner／Job log export、WSL／Linux向け配布準備を含めます。資源不足再試行は既定OFF・限定許可付きで新A／Bを作り、scan review・全体budget・cleanup確認を省略しません。定期release確認からbuildを始めず、参照APK取得と比較はAndroidが所有します。4.6は利用者承認により検証後のローカル`develop`統合までを対象とし、push／`main`統合／公開は行いません。
 
 ### Phase 3 の対象外
 

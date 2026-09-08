@@ -16,6 +16,7 @@ import kotlin.io.path.createDirectories
 
 internal data class StoredJob(
     val jobId: String,
+    val principalId: String,
     val executionMode: ExecutionMode,
     val repositoryUrl: String,
     val revision: RequestedRevision,
@@ -64,26 +65,34 @@ internal enum class CancelJobResult {
 class SQLiteJobStore(
     private val stateDirectory: Path,
     private val clock: Clock = Clock.systemUTC(),
+    private val migrationPolicy: RunnerMigrationPolicy = RunnerMigrationPolicy(),
 ) {
     private val databasePath = stateDirectory.resolve("reprodroid-runner.sqlite3")
     private val logDirectory = stateDirectory.resolve("logs")
 
     init {
-        stateDirectory.createDirectories()
-        logDirectory.createDirectories()
         Class.forName("org.sqlite.JDBC")
-        initializeSchema()
+        RunnerDatabaseMigrationGate.initialize(stateDirectory, SCHEMA_VERSION, migrationPolicy) { initializeSchema(it) }
+        logDirectory.createDirectories()
     }
 
     @Synchronized
-    fun createJob(request: CreateJobRequest, sandboxMode: BuildSandboxMode = BuildSandboxMode.HOST): CreateJobResponse {
+    fun createJob(
+        request: CreateJobRequest,
+        sandboxMode: BuildSandboxMode = BuildSandboxMode.HOST,
+        principalId: String = LOCAL_DEVELOPMENT_PRINCIPAL,
+    ): CreateJobResponse {
         val jobId = UUID.randomUUID().toString()
         val now = Instant.now(clock).toString()
         val snapshot = if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
             request.genericBuild?.let { SandboxSnapshot.newGenericJob(it.memoryBytes) } ?: SandboxSnapshot.newJob(sandboxMode)
         } else null
         connection().use { connection ->
-            insertJob(connection, jobId, request, snapshot, now)
+            connection.autoCommit = false
+            try {
+                insertJob(connection, jobId, request, snapshot, now, principalId)
+                connection.commit()
+            } catch (failure: Throwable) { connection.rollback(); throw failure }
         }
         try {
             appendLog(jobId, LogLevel.INFO, "Job created in ${request.executionMode} mode.")
@@ -101,45 +110,49 @@ class SQLiteJobStore(
         request: CreateJobRequest,
         snapshot: SandboxSnapshot?,
         now: String,
+        principalId: String,
     ) {
+        requireActivePrincipal(connection, principalId)
         connection.prepareStatement(
             """
             INSERT INTO jobs (
-                job_id, execution_mode, repository_url, revision_type, revision_value,
+                job_id, principal_id, execution_mode, repository_url, revision_type, revision_value,
                 simulation_outcome, state, progress_percent, requires_confirmation,
                 created_at, updated_at, sandbox_mode, sandbox_origin, sandbox_profile_id,
                 sandbox_snapshot, sandbox_snapshot_sha256, sandbox_cleanup_status, manifest_format
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """.trimIndent(),
         ).use { statement ->
             statement.setString(1, jobId)
-            statement.setString(2, request.executionMode.name)
-            statement.setString(3, request.repositoryUrl)
-            statement.setString(4, request.revision.type.name)
-            statement.setString(5, request.revision.value)
-            statement.setString(6, request.simulationOutcome?.name)
-            statement.setString(7, JobState.CREATED.name)
-            statement.setString(8, now)
+            statement.setString(2, principalId)
+            statement.setString(3, request.executionMode.name)
+            statement.setString(4, request.repositoryUrl)
+            statement.setString(5, request.revision.type.name)
+            statement.setString(6, request.revision.value)
+            statement.setString(7, request.simulationOutcome?.name)
+            statement.setString(8, JobState.CREATED.name)
             statement.setString(9, now)
-            statement.setString(10, snapshot?.jobSandbox?.mode?.name)
-            statement.setString(11, snapshot?.jobSandbox?.origin?.name)
-            statement.setString(12, snapshot?.jobSandbox?.profileId)
-            statement.setString(13, snapshot?.canonicalProfile)
-            statement.setString(14, snapshot?.profileSha256)
-            statement.setString(15, snapshot?.jobSandbox?.cleanupStatus?.name)
-            statement.setString(16, snapshot?.manifestFormat?.name)
+            statement.setString(10, now)
+            statement.setString(11, snapshot?.jobSandbox?.mode?.name)
+            statement.setString(12, snapshot?.jobSandbox?.origin?.name)
+            statement.setString(13, snapshot?.jobSandbox?.profileId)
+            statement.setString(14, snapshot?.canonicalProfile)
+            statement.setString(15, snapshot?.profileSha256)
+            statement.setString(16, snapshot?.jobSandbox?.cleanupStatus?.name)
+            statement.setString(17, snapshot?.manifestFormat?.name)
             statement.executeUpdate()
         }
     }
 
     @Synchronized
-    internal fun createGenericJob(request: CreateJobRequest, idempotencyKey: String, requestSha256: String): GenericBuildReceipt {
+    internal fun createGenericJob(request: CreateJobRequest, idempotencyKey: String, requestSha256: String, principalId: String): GenericBuildReceipt {
         requireNotNull(request.genericBuild)
         connection().use { connection ->
+            requireActivePrincipal(connection, principalId)
             connection.prepareStatement(
                 "SELECT request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind='GENERIC_BUILD_CREATE' AND idempotency_key=?",
             ).use { statement ->
-                statement.setString(1, LOCAL_PRINCIPAL)
+                statement.setString(1, principalId)
                 statement.setString(2, idempotencyKey)
                 statement.executeQuery().use { row ->
                     if (row.next()) {
@@ -155,12 +168,13 @@ class SQLiteJobStore(
                 }
             }
         }
-        val created = createJob(request, BuildSandboxMode.DOCKER)
+        val created = createJob(request, BuildSandboxMode.DOCKER, principalId)
         val now = Instant.now(clock).toString()
         try {
             connection().use { connection ->
                 connection.autoCommit = false
                 try {
+                    requireActivePrincipal(connection, principalId)
                     connection.prepareStatement(
                         "INSERT INTO generic_build_requests(job_id,request_json,configuration_sha256,comparison_id,attempt,retry_of_job_id,memory_bytes) VALUES(?,?,?,?,?,?,?)",
                     ).use { statement ->
@@ -178,7 +192,7 @@ class SQLiteJobStore(
                         "INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'generic-build',1,'COMPLETED','JOB',?,?,?)",
                     ).use { statement ->
                         statement.setString(1, operationId)
-                        statement.setString(2, LOCAL_PRINCIPAL)
+                        statement.setString(2, principalId)
                         statement.setString(3, "GENERIC_BUILD_CREATE")
                         statement.setString(4, idempotencyKey)
                         statement.setString(5, requestSha256)
@@ -285,6 +299,7 @@ class SQLiteJobStore(
         request: CreateGenericComparisonRequest,
         idempotencyKey: String,
         requestSha256: String,
+        principalId: String,
     ): GenericComparisonReceipt {
         requireCanonicalUuid(request.comparisonId, "comparisonId")
         if (!request.configurationSha256.matches(Regex("[0-9a-f]{64}"))) {
@@ -293,8 +308,8 @@ class SQLiteJobStore(
         if (!request.officialIdentity.sha256.matches(Regex("[0-9a-f]{64}")) || request.officialIdentity.sizeBytes <= 0 ||
             request.officialIdentity.packageName.isBlank() || request.officialIdentity.versionName.isBlank() || request.officialIdentity.versionCode < 0
         ) throw ApiException.badRequest("INVALID_COMPARISON", "Official APK identity is incomplete.")
-        val buildA = getStoredJob(request.buildAJobId) ?: throw ApiException.notFound()
-        val buildB = getStoredJob(request.buildBJobId) ?: throw ApiException.notFound()
+        val buildA = getStoredJob(request.buildAJobId)?.takeIf { it.principalId == principalId } ?: throw ApiException.notFound()
+        val buildB = getStoredJob(request.buildBJobId)?.takeIf { it.principalId == principalId } ?: throw ApiException.notFound()
         val snapshotA = buildA.genericBuild ?: throw ApiException.conflict("COMPARISON_BUILD_INVALID", "Build A is not a generic build.")
         val snapshotB = buildB.genericBuild ?: throw ApiException.conflict("COMPARISON_BUILD_INVALID", "Build B is not a generic build.")
         val buildAFailed = buildA.state == JobState.FAILED
@@ -315,12 +330,12 @@ class SQLiteJobStore(
             connection.prepareStatement(
                 "SELECT request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind='GENERIC_COMPARISON_CREATE' AND idempotency_key=?",
             ).use { statement ->
-                statement.setString(1, LOCAL_PRINCIPAL)
+                statement.setString(1, principalId)
                 statement.setString(2, idempotencyKey)
                 statement.executeQuery().use { row ->
                     if (row.next()) {
                         if (row.getString(1) != requestSha256) throw ApiException.conflict("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used with a different request.")
-                        return GenericComparisonReceipt(genericComparison(row.getString(2)), true)
+                        return GenericComparisonReceipt(genericComparison(row.getString(2), principalId), true)
                     }
                 }
             }
@@ -350,11 +365,12 @@ class SQLiteJobStore(
         connection().use { connection ->
             connection.autoCommit = false
             try {
+                requireActivePrincipal(connection, principalId)
                 connection.prepareStatement(
                     "INSERT INTO generic_comparisons(comparison_id,principal_id,request_json,request_sha256,response_json,build_a_job_id,build_b_job_id,resource_retry_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 ).use { statement ->
                     statement.setString(1, request.comparisonId)
-                    statement.setString(2, LOCAL_PRINCIPAL)
+                    statement.setString(2, principalId)
                     statement.setString(3, GENERIC_JSON.encodeToString(request))
                     statement.setString(4, requestSha256)
                     statement.setString(5, GENERIC_JSON.encodeToString(response))
@@ -369,7 +385,7 @@ class SQLiteJobStore(
                     "INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'apk-comparison',1,'COMPLETED','COMPARISON',?,?,?)",
                 ).use { statement ->
                     statement.setString(1, UUID.randomUUID().toString())
-                    statement.setString(2, LOCAL_PRINCIPAL)
+                    statement.setString(2, principalId)
                     statement.setString(3, "GENERIC_COMPARISON_CREATE")
                     statement.setString(4, idempotencyKey)
                     statement.setString(5, requestSha256)
@@ -391,10 +407,10 @@ class SQLiteJobStore(
     }
 
     @Synchronized
-    internal fun genericComparison(comparisonId: String): GenericComparisonResponse = connection().use { connection ->
+    internal fun genericComparison(comparisonId: String, principalId: String): GenericComparisonResponse = connection().use { connection ->
         connection.prepareStatement("SELECT response_json FROM generic_comparisons WHERE comparison_id=? AND principal_id=?").use { statement ->
             statement.setString(1, comparisonId)
-            statement.setString(2, LOCAL_PRINCIPAL)
+            statement.setString(2, principalId)
             statement.executeQuery().use { row ->
                 if (!row.next()) throw ApiException.notFound("COMPARISON_NOT_FOUND", "The requested comparison does not exist.")
                 GENERIC_JSON.decodeFromString(row.getString(1))
@@ -407,13 +423,14 @@ class SQLiteJobStore(
         comparisonId: String,
         idempotencyKey: String,
         requestSha256: String,
+        principalId: String,
     ): GenericResourceRetryReceipt {
         requireCanonicalUuid(comparisonId, "comparisonId")
         connection().use { connection ->
             connection.prepareStatement(
                 "SELECT request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind='GENERIC_RESOURCE_RETRY' AND idempotency_key=?",
             ).use { statement ->
-                statement.setString(1, LOCAL_PRINCIPAL)
+                statement.setString(1, principalId)
                 statement.setString(2, idempotencyKey)
                 statement.executeQuery().use { row ->
                     if (row.next()) {
@@ -428,7 +445,7 @@ class SQLiteJobStore(
             }
         }
 
-        val original = genericComparison(comparisonId)
+        val original = genericComparison(comparisonId, principalId)
         if (original.resourceRetryCount != 0 || original.retryOfComparisonId != null) {
             throw ApiException.conflict(
                 "RESOURCE_RETRY_NOT_ELIGIBLE",
@@ -503,8 +520,8 @@ class SQLiteJobStore(
         connection().use { connection ->
             connection.autoCommit = false
             try {
-                insertJob(connection, retryAJobId, requestA, SandboxSnapshot.newGenericJob(retryA.memoryBytes), now)
-                insertJob(connection, retryBJobId, requestB, SandboxSnapshot.newGenericJob(retryB.memoryBytes), now)
+                insertJob(connection, retryAJobId, requestA, SandboxSnapshot.newGenericJob(retryA.memoryBytes), now, principalId)
+                insertJob(connection, retryBJobId, requestB, SandboxSnapshot.newGenericJob(retryB.memoryBytes), now, principalId)
                 insertGenericBuildRequest(connection, retryAJobId, retryA)
                 insertGenericBuildRequest(connection, retryBJobId, retryB)
                 connection.prepareStatement(
@@ -523,7 +540,7 @@ class SQLiteJobStore(
                     "INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'apk-comparison',1,'COMPLETED','RESOURCE_RETRY',?,?,?)",
                 ).use { statement ->
                     statement.setString(1, UUID.randomUUID().toString())
-                    statement.setString(2, LOCAL_PRINCIPAL)
+                    statement.setString(2, principalId)
                     statement.setString(3, "GENERIC_RESOURCE_RETRY")
                     statement.setString(4, idempotencyKey)
                     statement.setString(5, requestSha256)
@@ -876,16 +893,19 @@ class SQLiteJobStore(
     }
 
     @Synchronized
-    fun confirmRealJob(jobId: String, resolvedCommitSha: String): Boolean {
+    fun confirmRealJob(jobId: String, resolvedCommitSha: String, principalId: String = LOCAL_DEVELOPMENT_PRINCIPAL): Boolean {
         val current = getStoredJob(jobId) ?: return false
+        if (current.principalId != principalId) throw ApiException.notFound()
         if (current.state != JobState.AWAITING_CONFIRMATION || current.resolvedCommitSha != resolvedCommitSha) return false
-        appendLog(jobId, LogLevel.WARN, "Client acknowledged RCE risk for commit $resolvedCommitSha.")
-        return connection().use { connection ->
+        val accepted = connection().use { connection ->
+            connection.autoCommit = false
+            try {
+            requireActivePrincipal(connection, principalId)
             connection.prepareStatement(
                 """
                 UPDATE jobs
                 SET state = ?, progress_percent = 15, requires_confirmation = 0, updated_at = ?
-                WHERE job_id = ? AND state = ? AND resolved_commit_sha = ?
+                WHERE job_id = ? AND state = ? AND resolved_commit_sha = ? AND principal_id = ?
                 """.trimIndent(),
             ).use { statement ->
                 statement.setString(1, JobState.QUEUED.name)
@@ -893,9 +913,13 @@ class SQLiteJobStore(
                 statement.setString(3, jobId)
                 statement.setString(4, JobState.AWAITING_CONFIRMATION.name)
                 statement.setString(5, resolvedCommitSha)
-                statement.executeUpdate() == 1
+                statement.setString(6, principalId)
+                (statement.executeUpdate() == 1).also { connection.commit() }
             }
+            } catch (failure: Throwable) { connection.rollback(); throw failure }
         }
+        if (accepted) appendLog(jobId, LogLevel.WARN, "Client acknowledged RCE risk for commit $resolvedCommitSha.")
+        return accepted
     }
 
     @Synchronized
@@ -1060,17 +1084,19 @@ class SQLiteJobStore(
     fun getSourceScan(jobId: String): SourceScanDetailResponse? = getStoredSourceScan(jobId)?.detail
 
     @Synchronized
-    internal fun reviewSourceScan(jobId: String, resultSha256: String): ReviewSourceScanResult = connection().use { connection ->
+    internal fun reviewSourceScan(jobId: String, resultSha256: String, principalId: String = LOCAL_DEVELOPMENT_PRINCIPAL): ReviewSourceScanResult = connection().use { connection ->
         connection.autoCommit = false
         try {
+            requireActivePrincipal(connection, principalId)
             val row = connection.prepareStatement(
                 """
                 SELECT j.state, s.result_sha256, s.requires_review, s.reviewed
                 FROM jobs j LEFT JOIN source_scan_results s ON s.job_id = j.job_id
-                WHERE j.job_id = ?
+                WHERE j.job_id = ? AND j.principal_id = ?
                 """.trimIndent(),
             ).use { statement ->
                 statement.setString(1, jobId)
+                statement.setString(2, principalId)
                 statement.executeQuery().use { rows ->
                     if (!rows.next()) return@use null
                     ReviewRow(
@@ -1423,8 +1449,8 @@ class SQLiteJobStore(
         }
     }.getOrDefault(false)
 
-    private fun initializeSchema() {
-        connection().use { connection ->
+    private fun initializeSchema(connection: Connection) {
+        connection.run {
             connection.autoCommit = false
             try {
                 connection.createStatement().use { statement ->
@@ -1435,10 +1461,20 @@ class SQLiteJobStore(
                     require(schemaVersion in 0..SCHEMA_VERSION) {
                         "Unsupported Runner database schema version: $schemaVersion"
                     }
+                    if (schemaVersion >= 9) {
+                        statement.executeQuery("SELECT singleton,runner_id FROM runner_identity").use { identity ->
+                            check(identity.next()) { "RUNNER_IDENTITY_MISSING: established Runner identity is missing." }
+                            val id = identity.getString("runner_id")
+                            check(identity.getInt("singleton") == 1 && runCatching { UUID.fromString(id).toString() == id }.getOrDefault(false) && !identity.next()) {
+                                "RUNNER_IDENTITY_INVALID: established Runner identity is not singular and canonical."
+                            }
+                        }
+                    }
                     statement.executeUpdate(
                         """
                         CREATE TABLE IF NOT EXISTS jobs (
                             job_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL DEFAULT 'local-development',
                             execution_mode TEXT NOT NULL,
                             repository_url TEXT NOT NULL,
                             revision_type TEXT NOT NULL,
@@ -1474,6 +1510,9 @@ class SQLiteJobStore(
                         )
                         """.trimIndent(),
                     )
+                    if (schemaVersion < 12 && !columnExists(connection, "jobs", "principal_id")) {
+                        statement.executeUpdate("ALTER TABLE jobs ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'local-development'")
+                    }
                     statement.executeUpdate(
                         """
                         CREATE TABLE IF NOT EXISTS source_scan_results (
@@ -1549,6 +1588,9 @@ class SQLiteJobStore(
                     statement.executeUpdate(
                         "CREATE INDEX IF NOT EXISTS jobs_state_index ON jobs(state)",
                     )
+                    statement.executeUpdate(
+                        "CREATE INDEX IF NOT EXISTS jobs_principal_index ON jobs(principal_id)",
+                    )
                     if (schemaVersion == 1) {
                         AUDIT_COLUMNS.forEach { columnDefinition ->
                             statement.executeUpdate("ALTER TABLE jobs ADD COLUMN $columnDefinition")
@@ -1617,6 +1659,15 @@ class SQLiteJobStore(
                         )
                         """.trimIndent(),
                     )
+                    if (schemaVersion < 9) {
+                        connection.prepareStatement(
+                            "INSERT INTO runner_identity(singleton,runner_id,created_at) SELECT 1,?,? WHERE NOT EXISTS(SELECT 1 FROM runner_identity)",
+                        ).use { identity ->
+                            identity.setString(1, UUID.randomUUID().toString())
+                            identity.setString(2, Instant.now(clock).toString())
+                            identity.executeUpdate()
+                        }
+                    }
                     statement.executeUpdate(
                         """
                         CREATE TABLE IF NOT EXISTS storage_settings (
@@ -1891,6 +1942,135 @@ class SQLiteJobStore(
                         )
                         """.trimIndent(),
                     )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS security_certificates (
+                            certificate_id TEXT PRIMARY KEY,
+                            generation_id TEXT NOT NULL,
+                            kind TEXT NOT NULL CHECK(kind IN ('ROOT', 'LEAF')),
+                            certificate_sha256 TEXT NOT NULL,
+                            spki_sha256 TEXT NOT NULL,
+                            serial_hex TEXT NOT NULL,
+                            not_before TEXT NOT NULL,
+                            not_after TEXT NOT NULL,
+                            relative_path TEXT NOT NULL,
+                            state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'RETIRED')),
+                            created_at TEXT NOT NULL,
+                            UNIQUE(generation_id, kind)
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS principals (
+                            principal_id TEXT PRIMARY KEY,
+                            kind TEXT NOT NULL CHECK(kind IN ('DEVELOPMENT', 'PAIRED')),
+                            display_name TEXT NOT NULL,
+                            state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'REVOKED')),
+                            created_at TEXT NOT NULL,
+                            revoked_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        "INSERT OR IGNORE INTO principals(principal_id,kind,display_name,state,created_at) " +
+                            "VALUES('local-development','DEVELOPMENT','Local development','ACTIVE',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS pairing_invitations (
+                            invitation_id TEXT PRIMARY KEY,
+                            secret_sha256 TEXT NOT NULL,
+                            endpoint TEXT NOT NULL,
+                            state TEXT NOT NULL CHECK(state IN ('OPEN', 'CONSUMED', 'EXPIRED', 'LOCKED')),
+                            invalid_attempts INTEGER NOT NULL DEFAULT 0 CHECK(invalid_attempts BETWEEN 0 AND 5),
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            consumed_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS pairing_requests (
+                            request_id TEXT PRIMARY KEY,
+                            invitation_id TEXT NOT NULL UNIQUE REFERENCES pairing_invitations(invitation_id),
+                            device_display_name TEXT NOT NULL,
+                            token_id TEXT NOT NULL UNIQUE,
+                            token_sha256 TEXT NOT NULL,
+                            continuation_id TEXT NOT NULL UNIQUE,
+                            continuation_sha256 TEXT NOT NULL,
+                            confirmation_fingerprint TEXT NOT NULL,
+                            principal_id TEXT REFERENCES principals(principal_id),
+                            state TEXT NOT NULL CHECK(state IN ('PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'EXPIRED', 'FAILED')),
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            decided_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS credentials (
+                            token_id TEXT PRIMARY KEY,
+                            token_sha256 TEXT NOT NULL,
+                            principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+                            created_at TEXT NOT NULL,
+                            last_used_at TEXT,
+                            state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'REVOKED')),
+                            revoked_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS revocation_events (
+                            event_id TEXT PRIMARY KEY,
+                            principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+                            actor_kind TEXT NOT NULL CHECK(actor_kind IN ('SELF', 'LOCAL_CLI', 'ROOT_REPLACEMENT')),
+                            reason TEXT NOT NULL,
+                            created_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS security_audit_events (
+                            event_id TEXT PRIMARY KEY,
+                            event_kind TEXT NOT NULL,
+                            subject_id TEXT NOT NULL,
+                            detail_json TEXT NOT NULL,
+                            created_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS ownership_adoption_previews (
+                            preview_id TEXT PRIMARY KEY,
+                            source_principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+                            target_principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+                            snapshot_sha256 TEXT NOT NULL,
+                            counts_json TEXT NOT NULL,
+                            state TEXT NOT NULL CHECK(state IN ('OPEN', 'EXECUTED', 'EXPIRED')),
+                            expires_at TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            executed_at TEXT
+                        )
+                        """.trimIndent(),
+                    )
+                    statement.executeUpdate(
+                        """
+                        CREATE TABLE IF NOT EXISTS ownership_adoption_audit (
+                            audit_id TEXT PRIMARY KEY,
+                            preview_id TEXT NOT NULL UNIQUE REFERENCES ownership_adoption_previews(preview_id),
+                            source_principal_id TEXT NOT NULL,
+                            target_principal_id TEXT NOT NULL,
+                            counts_json TEXT NOT NULL,
+                            created_at TEXT NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
                     statement.execute("PRAGMA user_version = $SCHEMA_VERSION")
                 }
                 connection.commit()
@@ -2123,6 +2303,7 @@ class SQLiteJobStore(
 
     private fun ResultSet.toStoredJob(): StoredJob = StoredJob(
         jobId = getString("job_id"),
+        principalId = getString("principal_id"),
         executionMode = ExecutionMode.valueOf(getString("execution_mode")),
         repositoryUrl = getString("repository_url"),
         revision = RequestedRevision(
@@ -2266,9 +2447,10 @@ class SQLiteJobStore(
         val reviewed: Boolean,
     )
 
-    private companion object {
-        const val SCHEMA_VERSION = 11
-        const val LOCAL_PRINCIPAL = "local-development"
+    companion object {
+        const val SCHEMA_VERSION = 12
+        const val LOCAL_DEVELOPMENT_PRINCIPAL = "local-development"
+        private const val LOCAL_PRINCIPAL = LOCAL_DEVELOPMENT_PRINCIPAL
         val GENERIC_JSON = Json { ignoreUnknownKeys = false; explicitNulls = false; encodeDefaults = true }
         val SANDBOX_COLUMNS = listOf(
             "sandbox_mode TEXT", "sandbox_origin TEXT", "sandbox_profile_id TEXT", "sandbox_snapshot TEXT",

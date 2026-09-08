@@ -15,6 +15,14 @@ application {
     mainClass = "com.sanka1610.reprodroid.runner.ApplicationKt"
 }
 
+distributions {
+    main {
+        contents {
+            from("LICENSE", "THIRD_PARTY_LICENSES.md")
+        }
+    }
+}
+
 dependencies {
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.netty)
@@ -26,6 +34,8 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.sqlite.jdbc)
     implementation(libs.jcs)
+    implementation(libs.bouncycastle.provider)
+    implementation(libs.bouncycastle.pkix)
     runtimeOnly(libs.logback.classic)
 
     testImplementation(platform(libs.junit.bom))

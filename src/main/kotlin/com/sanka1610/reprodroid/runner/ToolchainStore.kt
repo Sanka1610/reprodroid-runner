@@ -97,7 +97,7 @@ internal class ToolchainStore(
         connection().use { connection ->
             existingByIdempotency(connection, principalId, "toolchain-install", idempotencyKey)?.let { existing ->
                 if (existing.requestSha256 != requestSha) throw ApiException.conflict("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used with a different request.")
-                return installation(existing.resourceId)
+                return installation(existing.resourceId, principalId)
             }
             val now = Instant.now().toString()
             val operationId = uuid()
@@ -135,14 +135,15 @@ internal class ToolchainStore(
                 connection.commit()
             } catch (failure: Throwable) { connection.rollback(); throw failure }
             worker.submit { process(installationId) }
-            return installation(installationId)
+            return installation(installationId, principalId)
         }
     }
 
     @Synchronized
-    fun installation(installationId: String): ToolchainInstallationResponse = connection().use { connection ->
-        connection.prepareStatement("SELECT * FROM toolchain_installations WHERE installation_id=?").use { statement ->
+    fun installation(installationId: String, principalId: String? = null): ToolchainInstallationResponse = connection().use { connection ->
+        connection.prepareStatement("SELECT * FROM toolchain_installations WHERE installation_id=?" + if (principalId == null) "" else " AND principal_id=?").use { statement ->
             statement.setString(1, installationId)
+            if (principalId != null) statement.setString(2, principalId)
             statement.executeQuery().use { row ->
                 if (!row.next()) throw ApiException.notFound("TOOLCHAIN_INSTALLATION_NOT_FOUND", "The requested installation does not exist.")
                 val items = connection.prepareStatement("SELECT * FROM toolchain_installation_items WHERE installation_id=? ORDER BY ordinal").use { itemStatement ->
@@ -170,8 +171,8 @@ internal class ToolchainStore(
     }
 
     @Synchronized
-    fun cancel(installationId: String): ToolchainInstallationResponse {
-        val current = installation(installationId)
+    fun cancel(installationId: String, principalId: String? = null): ToolchainInstallationResponse {
+        val current = installation(installationId, principalId)
         if (current.state in TERMINAL_STATES) return current
         connection().use { connection ->
             connection.prepareStatement("UPDATE toolchain_installations SET cancel_requested=1,state=?,updated_at=? WHERE installation_id=?").use { statement ->
@@ -179,7 +180,7 @@ internal class ToolchainStore(
                 statement.setString(3, installationId); statement.executeUpdate()
             }
         }
-        return installation(installationId)
+        return installation(installationId, principalId)
     }
 
     @Synchronized
@@ -221,11 +222,18 @@ internal class ToolchainStore(
             }
         } }
         val now = Instant.now(); val previewId = uuid(); val expiresAt = now.plus(15, ChronoUnit.MINUTES)
-        connection().use { connection -> connection.prepareStatement("INSERT INTO toolchain_removal_previews(preview_id,principal_id,artifact_ids_json,releasable_bytes,expires_at,created_at,idempotency_key,request_sha256) VALUES(?,?,?,?,?,?,?,?)").use { statement ->
+        connection().use { connection ->
+            connection.autoCommit = false
+            try {
+            requireActivePrincipal(connection, principalId)
+            connection.prepareStatement("INSERT INTO toolchain_removal_previews(preview_id,principal_id,artifact_ids_json,releasable_bytes,expires_at,created_at,idempotency_key,request_sha256) VALUES(?,?,?,?,?,?,?,?)").use { statement ->
             statement.setString(1, previewId); statement.setString(2, principalId); statement.setString(3, json.encodeToString(ids))
             statement.setLong(4, bytes); statement.setString(5, expiresAt.toString()); statement.setString(6, now.toString())
             statement.setString(7, idempotencyKey); statement.setString(8, requestSha); statement.executeUpdate()
-        } }
+            }
+            connection.commit()
+            } catch (failure: Throwable) { connection.rollback(); throw failure }
+        }
         return ToolchainRemovalPreviewResponse(previewId = previewId, artifactIds = ids, releasableBytes = bytes.toString(), expiresAt = expiresAt.toString())
     }
 
@@ -273,10 +281,14 @@ internal class ToolchainStore(
         }
         val operationId = uuid(); val now = Instant.now().toString()
         connection().use { connection ->
+            connection.autoCommit = false
+            try {
             insertOperation(connection, operationId, principalId, "toolchain-remove", idempotencyKey, requestSha, request.previewId, now)
             connection.prepareStatement("UPDATE operations SET state='APPLYING',updated_at=? WHERE operation_id=?").use { statement ->
                 statement.setString(1, now); statement.setString(2, operationId); statement.executeUpdate()
             }
+            connection.commit()
+            } catch (failure: Throwable) { connection.rollback(); throw failure }
         }
         try {
             ids.forEach { id ->
@@ -371,12 +383,16 @@ internal class ToolchainStore(
             val reserved = connection.createStatement().executeQuery("SELECT COALESCE(SUM(requested_bytes),0) FROM storage_reservations WHERE area='RUNNER_TOOLCHAIN' AND state='ACTIVE'").use { row -> row.next(); row.getLong(1) }
             val fileStore: FileStore = Files.getFileStore(stateDirectory)
             if (requested > budget - used - reserved || requested > fileStore.usableSpace) throw ToolchainInstallFailure("TOOLCHAIN_STORAGE_UNAVAILABLE", "The Runner cannot reserve enough toolchain storage.")
-            val operationId = connection.prepareStatement("SELECT operation_id FROM toolchain_installations WHERE installation_id=?").use { statement -> statement.setString(1, installationId); statement.executeQuery().use { row -> row.next(); row.getString(1) } }
+            val owner = connection.prepareStatement("SELECT operation_id,principal_id FROM toolchain_installations WHERE installation_id=?").use { statement ->
+                statement.setString(1, installationId); statement.executeQuery().use { row ->
+                    check(row.next()) { "Missing toolchain installation ownership." }; row.getString(1) to row.getString(2)
+                }
+            }
             val now = Instant.now().toString()
             connection.prepareStatement("INSERT OR IGNORE INTO storage_reservations(reservation_id,principal_id,area,purpose,resource_kind,resource_id,requested_bytes,state,created_operation_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").use { statement ->
-                statement.setString(1, installationId); statement.setString(2, "local-development"); statement.setString(3, "RUNNER_TOOLCHAIN")
+                statement.setString(1, installationId); statement.setString(2, owner.second); statement.setString(3, "RUNNER_TOOLCHAIN")
                 statement.setString(4, "TOOLCHAIN_INSTALL"); statement.setString(5, "TOOLCHAIN_INSTALLATION"); statement.setString(6, installationId)
-                statement.setLong(7, requested); statement.setString(8, "ACTIVE"); statement.setString(9, operationId); statement.setString(10, now); statement.setString(11, now); statement.executeUpdate()
+                statement.setLong(7, requested); statement.setString(8, "ACTIVE"); statement.setString(9, owner.first); statement.setString(10, now); statement.setString(11, now); statement.executeUpdate()
             }
         }
     }
@@ -449,13 +465,17 @@ internal class ToolchainStore(
     private fun reservationBytes(artifact: ToolchainCatalogArtifact): Long = Math.addExact(artifact.archiveSizeBytes.toLong(), artifact.maximumExpandedBytes.toLong())
 
     private fun insertOperation(connection: Connection, operationId: String, principal: String, kind: String, key: String, requestSha: String, resultId: String, now: String) {
+        requireActivePrincipal(connection, principal)
         connection.prepareStatement("INSERT INTO operations(operation_id,principal_id,operation_kind,idempotency_key,request_sha256,contract_id,contract_version,state,result_type,result_id,created_at,updated_at) VALUES(?,?,?,?,?,'toolchain-install',1,'RESERVED',?,?,?,?)").use { statement ->
             statement.setString(1, operationId); statement.setString(2, principal); statement.setString(3, kind); statement.setString(4, key); statement.setString(5, requestSha)
             statement.setString(6, if (kind == "toolchain-install") "TOOLCHAIN_INSTALLATION" else "TOOLCHAIN_REMOVAL"); statement.setString(7, resultId); statement.setString(8, now); statement.setString(9, now); statement.executeUpdate()
         }
     }
-    private fun existingByIdempotency(connection: Connection, principal: String, kind: String, key: String): ExistingOperation? = connection.prepareStatement("SELECT operation_id,request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind=? AND idempotency_key=?").use { statement ->
+    private fun existingByIdempotency(connection: Connection, principal: String, kind: String, key: String): ExistingOperation? {
+        requireActivePrincipal(connection, principal)
+        return connection.prepareStatement("SELECT operation_id,request_sha256,result_id FROM operations WHERE principal_id=? AND operation_kind=? AND idempotency_key=?").use { statement ->
         statement.setString(1,principal); statement.setString(2,kind); statement.setString(3,key); statement.executeQuery().use { row -> if (row.next()) ExistingOperation(row.getString(1),row.getString(2),row.getString(3)) else null }
+        }
     }
     private fun connection(): Connection = DriverManager.getConnection("jdbc:sqlite:$databasePath").apply { createStatement().use { it.execute("PRAGMA foreign_keys=ON"); it.execute("PRAGMA busy_timeout=5000") } }
     private fun canonicalSha(value: String): String = sha256(JsonCanonicalizer(value).encodedUTF8)

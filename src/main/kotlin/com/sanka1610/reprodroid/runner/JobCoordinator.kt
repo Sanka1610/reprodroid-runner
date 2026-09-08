@@ -143,7 +143,7 @@ internal class JobCoordinator(
     }
 
     @Synchronized
-    fun create(request: CreateJobRequest): CreateJobResponse {
+    fun create(request: CreateJobRequest, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): CreateJobResponse {
         if (request.genericBuild != null) {
             throw ApiException.badRequest("GENERIC_BUILD_REQUIRES_V2", "Generic builds must use POST /v2/builds.")
         }
@@ -160,7 +160,7 @@ internal class JobCoordinator(
             }
             recipeRegistry.requireAllowed(request.repositoryUrl, request.revision)
         }
-        val response = store.createJob(request, buildSandbox)
+        val response = store.createJob(request, buildSandbox, principalId)
         check(queuedJobIds.trySend(response.jobId).isSuccess) { "The job queue is not accepting work." }
         return response
     }
@@ -172,6 +172,7 @@ internal class JobCoordinator(
         snapshot: GenericBuildSnapshot,
         idempotencyKey: String,
         requestSha256: String,
+        principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
     ): GenericBuildReceipt {
         if (buildSandbox != BuildSandboxMode.DOCKER) {
             throw ApiException.serviceUnavailable("GENERIC_DOCKER_REQUIRED", "Generic builds require REPRODROID_BUILD_SANDBOX=DOCKER; HOST fallback is forbidden.")
@@ -192,7 +193,7 @@ internal class JobCoordinator(
             genericBuild = snapshot,
         )
         validate(request)
-        val receipt = store.createGenericJob(request, idempotencyKey, requestSha256)
+        val receipt = store.createGenericJob(request, idempotencyKey, requestSha256, principalId)
         if (!receipt.existing) {
             check(queuedJobIds.trySend(receipt.response.jobId).isSuccess) { "The job queue is not accepting work." }
         }
@@ -204,6 +205,7 @@ internal class JobCoordinator(
         comparisonId: String,
         idempotencyKey: String,
         requestSha256: String,
+        principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
     ): GenericResourceRetryReceipt {
         if (buildSandbox != BuildSandboxMode.DOCKER) {
             throw ApiException.serviceUnavailable("GENERIC_DOCKER_REQUIRED", "Generic resource retry requires REPRODROID_BUILD_SANDBOX=DOCKER.")
@@ -214,7 +216,7 @@ internal class JobCoordinator(
         if (sandboxLifecycle.cleanupPending) {
             throw ApiException.serviceUnavailable("SANDBOX_CLEANUP_PENDING", "Owned sandbox resources require recovery before generic builds can be accepted.")
         }
-        val receipt = store.createGenericResourceRetry(comparisonId, idempotencyKey, requestSha256)
+        val receipt = store.createGenericResourceRetry(comparisonId, idempotencyKey, requestSha256, principalId)
         if (!receipt.existing) {
             check(queuedJobIds.trySend(receipt.response.buildAJobId).isSuccess) { "The job queue is not accepting work." }
             check(queuedJobIds.trySend(receipt.response.buildBJobId).isSuccess) { "The job queue is not accepting work." }
@@ -222,27 +224,36 @@ internal class JobCoordinator(
         return receipt
     }
 
-    fun get(jobId: String): JobResponse = store.getJob(jobId) ?: throw ApiException.notFound()
+    fun get(jobId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): JobResponse {
+        requireOwnedJob(jobId, principalId)
+        return store.getJob(jobId) ?: throw ApiException.notFound()
+    }
 
-    fun logs(jobId: String, afterSequence: Long, limit: Int): LogResponse =
-        store.getLogs(jobId, afterSequence, limit) ?: throw ApiException.notFound()
+    fun logs(jobId: String, afterSequence: Long, limit: Int, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): LogResponse {
+        requireOwnedJob(jobId, principalId)
+        return store.getLogs(jobId, afterSequence, limit) ?: throw ApiException.notFound()
+    }
 
-    fun artifacts(jobId: String): ArtifactListResponse = ArtifactListResponse(
-        store.listArtifacts(jobId) ?: throw ApiException.notFound(),
-    )
+    fun artifacts(jobId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): ArtifactListResponse {
+        requireOwnedJob(jobId, principalId)
+        return ArtifactListResponse(store.listArtifacts(jobId) ?: throw ApiException.notFound())
+    }
 
-    fun buildEnvironmentManifest(jobId: String): BuildEnvironmentManifestResponse =
-        buildManifestPublisher.publicManifest(jobId)
+    fun buildEnvironmentManifest(jobId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): BuildEnvironmentManifestResponse {
+        requireOwnedJob(jobId, principalId)
+        return buildManifestPublisher.publicManifest(jobId)
+    }
 
-    fun sourceScan(jobId: String): SourceScanDetailResponse {
-        store.getStoredJob(jobId) ?: throw ApiException.notFound()
+    fun sourceScan(jobId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): SourceScanDetailResponse {
+        requireOwnedJob(jobId, principalId)
         return store.getSourceScan(jobId) ?: throw ApiException.conflict(
             code = "SOURCE_SCAN_NOT_AVAILABLE",
             message = "Source scan evidence is not available for this job.",
         )
     }
 
-    fun continueSourceScan(jobId: String, request: ContinueSourceScanRequest) {
+    fun continueSourceScan(jobId: String, request: ContinueSourceScanRequest, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL) {
+        requireOwnedJob(jobId, principalId)
         if (!request.riskAcknowledged) {
             throw ApiException.forbidden(
                 code = "SOURCE_SCAN_RISK_ACKNOWLEDGEMENT_REQUIRED",
@@ -256,7 +267,9 @@ internal class JobCoordinator(
             )
         }
         val result = try {
-            store.reviewSourceScan(jobId, request.scanResultSha256)
+            store.reviewSourceScan(jobId, request.scanResultSha256, principalId)
+        } catch (failure: ApiException) {
+            throw failure
         } catch (_: Throwable) {
             store.failIfActive(
                 jobId = jobId,
@@ -287,8 +300,8 @@ internal class JobCoordinator(
         }
     }
 
-    fun confirm(jobId: String, request: ConfirmJobRequest) {
-        val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+    fun confirm(jobId: String, request: ConfirmJobRequest, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL) {
+        val job = requireOwnedJob(jobId, principalId)
         if (job.executionMode != ExecutionMode.REAL_TRUSTED) {
             throw ApiException.conflict(
                 code = "CONFIRMATION_NOT_APPLICABLE",
@@ -314,7 +327,7 @@ internal class JobCoordinator(
                 message = "The confirmed commit does not match the Runner-resolved commit.",
             )
         }
-        if (!store.confirmRealJob(jobId, confirmedSha)) {
+        if (!store.confirmRealJob(jobId, confirmedSha, principalId)) {
             throw ApiException.conflict(
                 code = "CONFIRMATION_RACE",
                 message = "The job changed state before confirmation was applied.",
@@ -323,8 +336,8 @@ internal class JobCoordinator(
         check(queuedJobIds.trySend(jobId).isSuccess) { "The job queue is not accepting work." }
     }
 
-    fun artifactContent(jobId: String, artifactId: String): ArtifactContent {
-        val job = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+    fun artifactContent(jobId: String, artifactId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): ArtifactContent {
+        val job = requireOwnedJob(jobId, principalId)
         val storedArtifact = store.getStoredArtifact(jobId, artifactId) ?: throw ApiException.artifactNotFound()
         if (job.state != JobState.SUCCEEDED) {
             throw ApiException.conflict(
@@ -357,7 +370,8 @@ internal class JobCoordinator(
         return ArtifactContent(storedArtifact.metadata, contentRealPath)
     }
 
-    fun cancel(jobId: String) {
+    fun cancel(jobId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL) {
+        requireOwnedJob(jobId, principalId)
         when (store.cancelIfActive(jobId)) {
             CancelJobResult.NOT_FOUND -> throw ApiException.notFound()
             CancelJobResult.ALREADY_TERMINAL -> throw ApiException.conflict(
@@ -370,8 +384,8 @@ internal class JobCoordinator(
         }
     }
 
-    fun retry(jobId: String): CreateJobResponse {
-        val original = store.getStoredJob(jobId) ?: throw ApiException.notFound()
+    fun retry(jobId: String, principalId: String = SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL): CreateJobResponse {
+        val original = requireOwnedJob(jobId, principalId)
         if (original.genericBuild != null) {
             throw ApiException.conflict("GENERIC_RETRY_REQUIRES_COMPARISON", "Generic resource retry must use the comparison retry-resource endpoint.")
         }
@@ -388,8 +402,12 @@ internal class JobCoordinator(
                 revision = original.revision,
                 simulationOutcome = original.simulationOutcome,
             ),
+            principalId,
         )
     }
+
+    private fun requireOwnedJob(jobId: String, principalId: String): StoredJob =
+        store.getStoredJob(jobId)?.takeIf { it.principalId == principalId } ?: throw ApiException.notFound()
 
     private suspend fun runJob(jobId: String) {
         try {

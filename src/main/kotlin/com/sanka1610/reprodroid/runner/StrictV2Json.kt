@@ -22,7 +22,11 @@ internal object StrictV2Json {
     private const val MAX_STRING_BYTES = 16 * 1024
     private val json = Json { explicitNulls = true; ignoreUnknownKeys = false }
 
-    suspend fun receive(call: ApplicationCall): JsonObject {
+    suspend fun receive(call: ApplicationCall): JsonObject = receive(call, MAX_BODY_BYTES, MAX_DEPTH, MAX_STRING_BYTES)
+
+    suspend fun receivePairing(call: ApplicationCall): JsonObject = receive(call, 64 * 1024, 16, 4 * 1024)
+
+    private suspend fun receive(call: ApplicationCall, maxBodyBytes: Int, maxDepth: Int, maxStringBytes: Int): JsonObject {
         val type = call.request.contentType()
         if (type.withoutParameters() != ContentType.Application.Json) {
             throw ApiException.badRequest("INVALID_CONTENT_TYPE", "Content-Type must be application/json with UTF-8 encoding.")
@@ -34,7 +38,7 @@ internal object StrictV2Json {
         call.request.headers[HttpHeaders.ContentLength]?.let { raw ->
             val length = raw.toLongOrNull()
                 ?: throw ApiException.badRequest("INVALID_CONTENT_LENGTH", "Content-Length is invalid.")
-            if (length < 0 || length > MAX_BODY_BYTES) requestTooLarge()
+            if (length < 0 || length > maxBodyBytes) requestTooLarge(maxBodyBytes)
         }
         val channel = call.receiveChannel()
         val output = ByteArrayOutputStream()
@@ -43,7 +47,7 @@ internal object StrictV2Json {
             val read = channel.readAvailable(buffer)
             if (read == -1) break
             if (read == 0) continue
-            if (output.size() + read > MAX_BODY_BYTES) requestTooLarge()
+            if (output.size() + read > maxBodyBytes) requestTooLarge(maxBodyBytes)
             output.write(buffer, 0, read)
         }
         val bytes = output.toByteArray()
@@ -61,7 +65,7 @@ internal object StrictV2Json {
             throw ApiException.badRequest("INVALID_JSON", "The request body is not valid UTF-8 JSON.")
         }
         try {
-            JsonAuditor(text).audit()
+            JsonAuditor(text, maxDepth, maxStringBytes).audit()
             return json.parseToJsonElement(text).jsonObject
         } catch (failure: ApiException) {
             throw failure
@@ -72,13 +76,13 @@ internal object StrictV2Json {
         }
     }
 
-    private fun requestTooLarge(): Nothing = throw ApiException(
+    private fun requestTooLarge(maxBodyBytes: Int): Nothing = throw ApiException(
         io.ktor.http.HttpStatusCode.PayloadTooLarge,
         "REQUEST_TOO_LARGE",
-        "The request body exceeds 256 KiB.",
+        "The request body exceeds $maxBodyBytes bytes.",
     )
 
-    private class JsonAuditor(private val source: String) {
+    private class JsonAuditor(private val source: String, private val maxDepth: Int, private val maxStringBytes: Int) {
         private var index = 0
 
         fun audit() {
@@ -89,7 +93,7 @@ internal object StrictV2Json {
         }
 
         private fun parseValue(depth: Int) {
-            if (depth > MAX_DEPTH) invalid("JSON nesting exceeds 32 levels.")
+            if (depth > maxDepth) invalid("JSON nesting exceeds the supported limit.")
             skipWhitespace()
             when (peek()) {
                 '{' -> parseObject(depth)
@@ -141,8 +145,8 @@ internal object StrictV2Json {
                 val character = source[index++]
                 when {
                     character == '"' -> {
-                        if (result.toString().toByteArray(StandardCharsets.UTF_8).size > MAX_STRING_BYTES) {
-                            invalid("A JSON string exceeds 16 KiB.")
+                        if (result.toString().toByteArray(StandardCharsets.UTF_8).size > maxStringBytes) {
+                            invalid("A JSON string exceeds the supported limit.")
                         }
                         return result.toString()
                     }
