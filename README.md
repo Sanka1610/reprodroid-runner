@@ -60,7 +60,7 @@ wire responseはdefault値を含む契約fieldを常に明示します。`apiVer
 
 ## Phase 4.4（generic Docker build and comparison）
 
-`REPRODROID_ENABLE_API_V2=true`、loopback bind、`REPRODROID_ENABLE_REAL_BUILDS=true`、`REPRODROID_BUILD_SANDBOX=DOCKER`の全条件を満たす時だけ、`generic-build@1`と`apk-comparison@1`を広告します。`POST /v2/builds`はfull commit SHA、JCS化済み設定snapshot、利用者のRCE同意、expected APK base nameを受け、Job固有のsource／HOME／Gradle cache／containerで実行します。設定外のGradle、Java、Android SDK、NDK、CMake、任意image／mount／Docker socket／DinD／host network／port publishは受け付けません。
+`REPRODROID_ENABLE_API_V2=true`、loopback bind、`REPRODROID_ENABLE_REAL_BUILDS=true`、`REPRODROID_BUILD_SANDBOX=DOCKER`の全条件を満たす時だけ、`generic-build@1`、`apk-comparison@1`、`codeberg-source@1`を広告します。`POST /v2/builds`はfull commit SHA、JCS化済み設定snapshot、利用者のRCE同意、expected APK base nameを受け、Job固有のsource／HOME／Gradle cache／containerで実行します。設定外のGradle、Java、Android SDK、NDK、CMake、任意image／mount／Docker socket／DinD／host network／port publishは受け付けません。
 
 generic pathのGradle起動はcatalog管理のGradle launcherだけを使い、upstream wrapperを実行しません。Runner管理、clone、source scan／review、artifact検査、comparison、trust／install policyはhost側に残り、Gradle processと子processだけがcontainerへ入ります。containerのcleanup／bounded importを確認できなければ新規generic buildを停止します。hard disk／inode quotaと固定egress allowlistは現行4.4の対象外であり、bridgeをhost／LAN隔離の証拠として扱いません。
 
@@ -124,7 +124,7 @@ Phase 2D最終E2Eは2026-08-26にfresh stateから再実行しました。MicroG
 
 - デフォルト無効
 - Runner起動時の明示設定が必要
-- allowlist登録済みGitHub HTTPS URLだけを許可
+- allowlist登録済みのpublic GitHub／Codeberg HTTPS URLだけを許可
 - リポジトリ別レシピでbuild root、Gradle task、artifact pathを固定
 - branch/tagをcommit SHAへ解決し、利用者確認後にdetached checkout
 - Wrapperの配布ZIPとJARを公式checksumで検証
@@ -144,6 +144,12 @@ Gradle Wrapperを検証しても、`build.gradle(.kts)`やpluginはホスト上�
 2. canonical repository URLがallowlistと一致
 
 さらに、解決済みcommit SHA、実行task、RCE警告をAndroid側で確認するまでbuildを開始しません。
+
+## Phase 4.7（Codeberg公開source）
+
+generic buildのsource providerは、`github.com`と`codeberg.org`だけからなる閉じたhost registryです。両providerともHTTPS originのowner／repositoryだけを受け付け、credentials、port、query、fragment、余分なpath segment、encoded traversalは拒否します。入力は`https://{github.com|codeberg.org}/{owner}/{repository}`へcanonicalizeし、job、clone、Build Environment Manifestで同じ値を使用します。
+
+`generic-build@1`のbody shapeやSQLite12は変更せず、Codeberg対応は別capability `codeberg-source@1`として広告します。このcapabilityはgeneric executionが有効なRunnerだけが広告し、Androidは未広告の旧Runnerに対してCodeberg sourceをfail closedで送信しません。commitはlowercaseのfull 40-character SHA-1だけを受け付けます。Runnerのprovider固有責務はsourceのclone／downloadに限定し、metadata、release、APKの発見・取得・選択はAndroid側の責務です。実public Codeberg projectのbuild／comparison E2Eは未実施であり、targeted JVM test以外の成功を主張しません。
 
 ## Wrapper検査
 

@@ -1,6 +1,5 @@
 package com.sanka1610.reprodroid.runner
 
-import java.net.URI
 import java.time.Duration
 
 internal data class BuildRecipe(
@@ -34,7 +33,9 @@ internal class BuildRecipeRegistry(
         recipes.forEach(::validateDeterminismRecipe)
     }
 
-    private val recipesByRepository = recipes.groupBy { canonicalRepositoryKey(it.repositoryUrl) }
+    private val recipesByRepository = recipes
+        .map { it.copy(repositoryUrl = canonicalRepositoryKey(it.repositoryUrl)) }
+        .groupBy { it.repositoryUrl }
 
     fun requireAllowed(repositoryUrl: String, revision: RequestedRevision): BuildRecipe {
         val repositoryRecipes = recipesByRepository[canonicalRepositoryKey(repositoryUrl)]
@@ -101,33 +102,8 @@ internal class BuildRecipeRegistry(
             ),
         )
 
-        internal fun canonicalRepositoryKey(repositoryUrl: String): String {
-            val uri = runCatching { URI(repositoryUrl) }.getOrNull()
-                ?: throw ApiException.badRequest("INVALID_REPOSITORY_URL", "repositoryUrl is not a valid URI.")
-            if (
-                uri.scheme?.lowercase() != "https" ||
-                uri.host?.lowercase() != "github.com" ||
-                uri.userInfo != null ||
-                uri.port != -1 ||
-                uri.query != null ||
-                uri.fragment != null
-            ) {
-                throw ApiException.badRequest(
-                    "INVALID_REPOSITORY_URL",
-                    "REAL_TRUSTED repositoryUrl must be a GitHub HTTPS URL without credentials, port, query, or fragment.",
-                )
-            }
-            val segments = uri.path.trim('/').removeSuffix(".git").split('/')
-            if (segments.size != 2 || segments.any { it.isBlank() || !GITHUB_SEGMENT.matches(it) }) {
-                throw ApiException.badRequest(
-                    "INVALID_REPOSITORY_URL",
-                    "REAL_TRUSTED repositoryUrl must identify one GitHub owner and repository.",
-                )
-            }
-            return "https://github.com/${segments[0].lowercase()}/${segments[1].lowercase()}"
-        }
-
-        private val GITHUB_SEGMENT = Regex("[A-Za-z0-9_.-]+")
+        internal fun canonicalRepositoryKey(repositoryUrl: String): String =
+            SourceProviderHostRegistry.canonicalUrl(repositoryUrl)
 
         private fun validateDeterminismRecipe(recipe: BuildRecipe) {
             require(recipe.determinism.sourceDateEpoch?.let { it >= 0 } != false) {

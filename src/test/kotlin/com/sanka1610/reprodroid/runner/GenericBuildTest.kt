@@ -3,6 +3,7 @@ package com.sanka1610.reprodroid.runner
 import org.erdtman.jcs.JsonCanonicalizer
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -112,6 +113,37 @@ class GenericBuildTest {
         }.exceptionOrNull()
         assertTrue(failure is ApiException, failure.toString())
         assertEquals("COMPARISON_BUILD_MISMATCH", (failure as ApiException).code)
+    }
+
+    @Test
+    fun `generic recipe canonicalizes Codeberg and requires a lowercase full commit SHA`() {
+        val configuration = GenericBuildContract.canonicalConfiguration(configuration())
+        val configurationSha256 = GenericBuildContract.hash(JsonCanonicalizer(configuration).encodedUTF8)
+        val snapshot = GenericBuildSnapshot(
+            comparisonId = UUID.randomUUID().toString(),
+            attempt = GenericBuildAttempt.A,
+            configurationRevision = 1,
+            configurationSha256 = configurationSha256,
+            configurationCanonicalJson = configuration,
+            expectedArtifactFileName = "example.apk",
+        )
+
+        val recipe = GenericBuildContract.recipe(
+            "https://Codeberg.org/Owner/Repository.git/",
+            "a".repeat(40),
+            snapshot,
+        )
+        assertEquals("https://codeberg.org/owner/repository", recipe.repositoryUrl)
+        assertEquals("a".repeat(40), recipe.revision.value)
+
+        val failure = assertThrows(ApiException::class.java) {
+            GenericBuildContract.validate(
+                "https://codeberg.org/owner/repository",
+                "A".repeat(40),
+                snapshot,
+            )
+        }
+        assertEquals("INVALID_GENERIC_BUILD", failure.code)
     }
 
     private fun createGeneric(

@@ -84,6 +84,26 @@ class StorageRetentionApiTest {
     }
 
     @Test
+    fun `generic execution advertises the Codeberg source capability`() = testApplication {
+        application {
+            runnerModule(testConfig().copy(realBuildEnabled = true, buildSandbox = BuildSandboxMode.DOCKER))
+        }
+        val capabilities = jsonClient().get("/v2/capabilities").body<V2CapabilitiesResponse>()
+
+        assertEquals(
+            listOf(
+                V2Capability("foundation", 1),
+                V2Capability("storage-retention", 1),
+                V2Capability("toolchain-install", 1),
+                V2Capability("generic-build", 1),
+                V2Capability("apk-comparison", 1),
+                V2Capability("codeberg-source", 1),
+            ),
+            capabilities.capabilities,
+        )
+    }
+
+    @Test
     fun `strict v2 JSON rejects duplicate and unknown fields before operation persistence`() = testApplication {
         val jobId = seedTerminalJob()
         application { runnerModule(testConfig()) }

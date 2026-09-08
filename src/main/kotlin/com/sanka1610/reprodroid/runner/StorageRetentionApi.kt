@@ -42,6 +42,7 @@ internal fun Route.storageRetentionV2Routes(
                         if (genericExecutionEnabled) {
                             add(V2Capability("generic-build", 1))
                             add(V2Capability("apk-comparison", 1))
+                            add(V2Capability("codeberg-source", 1))
                         }
                         if (config.transportMode == TransportMode.PAIRED_HTTPS) add(V2Capability("runner-authentication", 1))
                     },

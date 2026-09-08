@@ -190,12 +190,13 @@ internal object GenericBuildContract {
     }
 
     fun recipe(repositoryUrl: String, commitSha: String, snapshot: GenericBuildSnapshot): BuildRecipe {
-        val configuration = validate(repositoryUrl, commitSha, snapshot)
+        val canonicalRepositoryUrl = BuildRecipeRegistry.canonicalRepositoryKey(repositoryUrl)
+        val configuration = validate(canonicalRepositoryUrl, commitSha, snapshot)
         val moduleDirectory = configuration.modulePath.removePrefix(":").replace(':', '/')
         val outputRoot = listOf(moduleDirectory, "build/outputs/apk").filter(String::isNotBlank).joinToString("/")
         return BuildRecipe(
             id = "generic-${snapshot.configurationSha256.take(16)}-${snapshot.attempt.name.lowercase()}",
-            repositoryUrl = repositoryUrl,
+            repositoryUrl = canonicalRepositoryUrl,
             revision = RequestedRevision(RevisionType.COMMIT, commitSha),
             variantName = configuration.variant,
             buildRoot = configuration.buildRoot,

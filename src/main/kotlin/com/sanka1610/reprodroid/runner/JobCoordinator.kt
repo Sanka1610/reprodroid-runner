@@ -148,7 +148,12 @@ internal class JobCoordinator(
             throw ApiException.badRequest("GENERIC_BUILD_REQUIRES_V2", "Generic builds must use POST /v2/builds.")
         }
         validate(request)
-        if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
+        val normalizedRequest = if (request.executionMode == ExecutionMode.REAL_TRUSTED) {
+            request.copy(repositoryUrl = BuildRecipeRegistry.canonicalRepositoryKey(request.repositoryUrl))
+        } else {
+            request
+        }
+        if (normalizedRequest.executionMode == ExecutionMode.REAL_TRUSTED) {
             if (sandboxLifecycle.cleanupPending) {
                 throw ApiException.serviceUnavailable("SANDBOX_CLEANUP_PENDING", "Owned sandbox resources require recovery before real builds can be accepted.")
             }
@@ -158,9 +163,9 @@ internal class JobCoordinator(
                     message = "REAL_TRUSTED execution is disabled by Runner configuration.",
                 )
             }
-            recipeRegistry.requireAllowed(request.repositoryUrl, request.revision)
+            recipeRegistry.requireAllowed(normalizedRequest.repositoryUrl, normalizedRequest.revision)
         }
-        val response = store.createJob(request, buildSandbox, principalId)
+        val response = store.createJob(normalizedRequest, buildSandbox, principalId)
         check(queuedJobIds.trySend(response.jobId).isSuccess) { "The job queue is not accepting work." }
         return response
     }
