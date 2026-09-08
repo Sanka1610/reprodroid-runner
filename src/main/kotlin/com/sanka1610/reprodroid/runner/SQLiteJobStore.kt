@@ -2,6 +2,7 @@ package com.sanka1610.reprodroid.runner
 
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import org.sqlite.SQLiteConfig
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -1308,7 +1309,7 @@ class SQLiteJobStore(
         val logPath = logPath(jobId)
         Files.createDirectories(logPath.parent)
 
-        connection().use { connection ->
+        connection(SQLiteConfig.TransactionMode.IMMEDIATE).use { connection ->
             connection.autoCommit = false
             try {
                 val sequence = latestLogSequence(connection, jobId) + 1
@@ -2085,10 +2086,23 @@ class SQLiteJobStore(
         }
     }
 
-    private fun connection(): Connection = DriverManager.getConnection("jdbc:sqlite:$databasePath").apply {
-        createStatement().use { statement ->
-            statement.execute("PRAGMA foreign_keys = ON")
-            statement.execute("PRAGMA busy_timeout = 5000")
+    private fun connection(transactionMode: SQLiteConfig.TransactionMode? = null): Connection {
+        val properties = transactionMode?.let { mode ->
+            SQLiteConfig().apply {
+                setTransactionMode(mode)
+                enforceForeignKeys(true)
+                setBusyTimeout(5_000)
+            }.toProperties()
+        }
+        return if (properties == null) {
+            DriverManager.getConnection("jdbc:sqlite:$databasePath").apply {
+                createStatement().use { statement ->
+                    statement.execute("PRAGMA foreign_keys = ON")
+                    statement.execute("PRAGMA busy_timeout = 5000")
+                }
+            }
+        } else {
+            DriverManager.getConnection("jdbc:sqlite:$databasePath", properties)
         }
     }
 

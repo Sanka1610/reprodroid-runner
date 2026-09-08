@@ -33,6 +33,19 @@ class ToolchainApiTest {
             "android/platforms/android-37.0",
             catalog.artifacts.single { it.artifactId == "android-platform-37.0-r02" }.installSubdirectory,
         )
+        assertEquals(
+            AndroidLocalPackageMetadata(
+                path = "platforms;android-37.0",
+                apiLevel = "37.0",
+                revisionMajor = 2,
+                extensionLevel = 22,
+                baseExtension = true,
+                codename = "",
+                layoutlibApi = 15,
+                displayName = "Android SDK Platform 37.0",
+            ),
+            catalog.artifacts.single { it.artifactId == "android-platform-37.0-r02" }.androidLocalPackage,
+        )
 
         val response = client.post("/v2/toolchains/plans:resolve") {
             contentType(ContentType.Application.Json)

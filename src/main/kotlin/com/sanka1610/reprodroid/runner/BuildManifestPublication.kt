@@ -120,11 +120,7 @@ internal class BuildManifestPublisher(
             val image = PRIVATE_JSON.parseToJsonElement(audit.imageInspection).jsonObject
             require(image.string("Id") == audit.imageId && image.string("Os") == "linux" && image.string("Architecture") == "amd64")
             require(image.getValue("RepoDigests").jsonArray.any { it.jsonPrimitive.content == profile.image })
-            val environment = mapOf(
-                "PATH" to listOfNotNull("${profile.jdk}/bin", profile.gradle?.let { "$it/bin" }, "/usr/bin", "/bin").joinToString(":"),
-                "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
-                "GRADLE_USER_HOME" to profile.gradleHome, "ANDROID_HOME" to profile.sdk, "ANDROID_SDK_ROOT" to profile.sdk,
-            )
+            val environment = profile.containerEnvironment()
             fixedProfile?.requireSupported(recipe)
             val launcher = if (job.genericBuild == null) {
                 listOf(

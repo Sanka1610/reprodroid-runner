@@ -9,6 +9,21 @@ import java.nio.file.Path
 @Serializable
 internal data class SandboxMount(val source: String, val destination: String, val readOnly: Boolean)
 
+internal data class SandboxTmpfs(val path: String, val options: List<String>) {
+    val argument: String get() = "$path:${options.joinToString(",")}"
+}
+
+internal fun DockerSandboxPolicy.tmpfsPolicies(): List<SandboxTmpfs> =
+    if (this is GenericDockerSandboxProfile) {
+        listOf(
+            SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "noexec", "mode=1777", "size=$regularTmpfsBytes")),
+            SandboxTmpfs(nativeTmpfsPath, listOf("rw", "nosuid", "nodev", "exec", "mode=1777", "size=$nativeTmpfsBytes")),
+        )
+    } else {
+        // Preserve the exact docker-microg-v1 and docker-generic-v1 policy and audit shape.
+        listOf(SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "size=$tmpfsBytes")))
+    }
+
 internal class DockerBuildSpec(
     val profile: DockerSandboxPolicy,
     val mounts: List<SandboxMount>,
@@ -67,7 +82,7 @@ internal class DockerBuildSpec(
     }
 
     fun createArguments(resource: SandboxResource, command: List<String>): List<String> = buildList {
-        require(environment.keys == setOf("PATH", "JAVA_HOME", "HOME", "GRADLE_USER_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"))
+        require(environment == profile.containerEnvironment())
         addAll(listOf(
             "container", "create", "--pull=never", "--platform", profile.platform,
             "--name", resource.expectedName, "--user", "${profile.uid}:${profile.gid}",
@@ -75,9 +90,9 @@ internal class DockerBuildSpec(
             "--cpus", profile.cpuCount.toString(), "--cpuset-cpus", profile.cpuset,
             "--memory", profile.memoryBytes.toString(), "--memory-swap", profile.memorySwapBytes.toString(),
             "--pids-limit", profile.pids.toString(), "--network=bridge", "--restart=no",
-            "--tmpfs", "/tmp:rw,nosuid,nodev,size=${profile.tmpfsBytes}",
-            "--workdir", workingDirectory, "--entrypoint", command.first(),
         ))
+        profile.tmpfsPolicies().forEach { policy -> addAll(listOf("--tmpfs", policy.argument)) }
+        addAll(listOf("--workdir", workingDirectory, "--entrypoint", command.first()))
         resource.labels.forEach { (key, value) -> addAll(listOf("--label", "$key=$value")) }
         mounts.forEach { mount ->
             addAll(listOf("--mount", "type=bind,source=${mount.source},target=${mount.destination},bind-propagation=rprivate" + if (mount.readOnly) ",readonly" else ""))
@@ -109,9 +124,11 @@ internal class DockerBuildSpec(
             require(host[field].let { it == null || it == JsonNull || it == JsonArray(emptyList()) || it == JsonObject(emptyMap()) })
         }
         val tmpfs = host.getValue("Tmpfs").jsonObject
-        require(tmpfs.keys == setOf("/tmp"))
-        val tmpfsOptions = tmpfs.string("/tmp").split(',').toSet()
-        require(tmpfsOptions == setOf("rw", "nosuid", "nodev", "size=${profile.tmpfsBytes}"))
+        val expectedTmpfs = profile.tmpfsPolicies()
+        require(tmpfs.keys == expectedTmpfs.map { it.path }.toSet())
+        expectedTmpfs.forEach { expected ->
+            require(tmpfs.string(expected.path).split(',').toSet() == expected.options.toSet())
+        }
         val actualMounts = inspected.getValue("Mounts").jsonArray
         require(actualMounts.size == mounts.size)
         require(actualMounts.map { it.jsonObject.string("Destination") }.toSet() == mounts.map { it.destination }.toSet())

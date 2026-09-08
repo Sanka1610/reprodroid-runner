@@ -118,7 +118,17 @@
       "maximumExpandedBytes": "268435456",
       "maximumEntries": 20000,
       "installSubdirectory": "android/platforms/android-37.0",
-      "licenseId": "android-sdk-license"
+      "licenseId": "android-sdk-license",
+      "androidLocalPackage": {
+        "path": "platforms;android-37.0",
+        "apiLevel": "37.0",
+        "revisionMajor": 2,
+        "extensionLevel": 22,
+        "baseExtension": true,
+        "codename": "",
+        "layoutlibApi": 15,
+        "displayName": "Android SDK Platform 37.0"
+      }
     },
     {
       "artifactId": "android-build-tools-37.0.0-linux",

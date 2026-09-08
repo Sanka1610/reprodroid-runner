@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
+import java.util.UUID
 
 /** Filesystem-only policy probes; never invoke Docker or weaken an executable Job snapshot. */
 class DockerBuildSpecTest {
@@ -64,6 +65,38 @@ class DockerBuildSpecTest {
             assertEquals("SANDBOX_PROFILE_UNSUPPORTED", assertThrows(TrustedBuildFailure::class.java) {
                 profile.requireSupported(changed)
             }.code)
+        }
+    }
+
+    @Test fun `generic v2 confines executable native libraries to a bounded dedicated tmpfs`() {
+        val profile = GenericDockerSandboxProfile()
+        assertEquals(profile.tmpfsBytes, profile.regularTmpfsBytes + profile.nativeTmpfsBytes)
+        assertEquals(
+            listOf(
+                SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "noexec", "mode=1777", "size=1006632960")),
+                SandboxTmpfs("/run/reprodroid-native", listOf("rw", "nosuid", "nodev", "exec", "mode=1777", "size=67108864")),
+            ),
+            profile.tmpfsPolicies(),
+        )
+        assertEquals("-Dorg.sqlite.tmpdir=/run/reprodroid-native", profile.containerEnvironment()["JAVA_TOOL_OPTIONS"])
+
+        val id = UUID.randomUUID().toString()
+        val resource = SandboxResource(id, UUID.randomUUID().toString(), UUID.randomUUID().toString(),
+            SandboxResourceRole.PREFLIGHT, "reprodroid-preflight-$id", "engine", profile.endpoint)
+        val arguments = DockerBuildSpec(profile, emptyList(), profile.containerEnvironment())
+            .createArguments(resource, listOf("/bin/true"))
+        assertTrue(arguments.windowed(2).contains(listOf("--tmpfs", profile.tmpfsPolicies()[0].argument)))
+        assertTrue(arguments.windowed(2).contains(listOf("--tmpfs", profile.tmpfsPolicies()[1].argument)))
+        assertTrue(arguments.windowed(2).contains(listOf("--env", "JAVA_TOOL_OPTIONS=${profile.sqliteNativeJvmOption}")))
+    }
+
+    @Test fun `historical profiles retain their exact single tmpfs and environment`() {
+        listOf<DockerSandboxPolicy>(DockerSandboxProfile(), LegacyGenericDockerSandboxProfile()).forEach { profile ->
+            assertEquals(
+                listOf(SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "size=1073741824"))),
+                profile.tmpfsPolicies(),
+            )
+            assertFalse(profile.containerEnvironment().containsKey("JAVA_TOOL_OPTIONS"))
         }
     }
 

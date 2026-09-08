@@ -36,11 +36,17 @@ data class JobSandbox(
         when (mode) {
             BuildSandboxMode.HOST -> require(profileId == null && cleanupStatus == null)
             BuildSandboxMode.DOCKER -> require(
-                origin == SandboxOrigin.NEW_JOB && profileId in setOf(DockerSandboxProfile.ID, GenericDockerSandboxProfile.ID) && cleanupStatus != null,
+                origin == SandboxOrigin.NEW_JOB && profileId in SUPPORTED_DOCKER_PROFILE_IDS && cleanupStatus != null,
             )
         }
     }
 }
+
+private val SUPPORTED_DOCKER_PROFILE_IDS = setOf(
+    DockerSandboxProfile.ID,
+    LegacyGenericDockerSandboxProfile.ID,
+    GenericDockerSandboxProfile.ID,
+)
 
 internal enum class SandboxManifestFormat { LEGACY_ALLOWED, REQUIRED_V4 }
 
@@ -123,9 +129,9 @@ internal data class DockerSandboxProfile(
     }
 }
 
-/** A separate immutable profile for Phase 4.4 generic builds. */
+/** Historical Phase 4.4 profile. Its serialized shape and runtime policy remain immutable. */
 @Serializable
-internal data class GenericDockerSandboxProfile(
+internal data class LegacyGenericDockerSandboxProfile(
     override val profileId: String = ID,
     override val image: String = "ubuntu@${DockerSandboxProfile.IMAGE_DIGEST}",
     override val platform: String = "linux/amd64",
@@ -135,8 +141,8 @@ internal data class GenericDockerSandboxProfile(
     override val gid: Int = 1000,
     override val cpuCount: Int = 4,
     override val cpuset: String = "0-3",
-    override val memoryBytes: Long = DEFAULT_MEMORY_BYTES,
-    override val memorySwapBytes: Long = DEFAULT_MEMORY_BYTES,
+    override val memoryBytes: Long = GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES,
+    override val memorySwapBytes: Long = GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES,
     override val pids: Int = 1024,
     override val tmpfsBytes: Long = 1_073_741_824,
     override val networkMode: String = "BRIDGE",
@@ -160,14 +166,83 @@ internal data class GenericDockerSandboxProfile(
     val detailedLogBytes: Long = 67_108_864,
 ) : DockerSandboxPolicy {
     init {
-        require(memoryBytes in setOf(DEFAULT_MEMORY_BYTES, RETRY_MEMORY_BYTES))
+        require(memoryBytes in setOf(GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES, GenericDockerSandboxProfile.RETRY_MEMORY_BYTES))
         require(memorySwapBytes == memoryBytes)
     }
 
+    companion object { const val ID = "docker-generic-v1" }
+}
+
+/** Phase 4.7 generic profile with a bounded executable native-library tmpfs. */
+@Serializable
+internal data class GenericDockerSandboxProfile(
+    override val profileId: String = ID,
+    override val image: String = "ubuntu@${DockerSandboxProfile.IMAGE_DIGEST}",
+    override val platform: String = "linux/amd64",
+    override val dockerExecutable: String = "/usr/bin/docker",
+    override val endpoint: String = "unix:///var/run/docker.sock",
+    override val uid: Int = 1000,
+    override val gid: Int = 1000,
+    override val cpuCount: Int = 4,
+    override val cpuset: String = "0-3",
+    override val memoryBytes: Long = DEFAULT_MEMORY_BYTES,
+    override val memorySwapBytes: Long = DEFAULT_MEMORY_BYTES,
+    override val pids: Int = 1024,
+    override val tmpfsBytes: Long = TOTAL_TMPFS_BYTES,
+    val regularTmpfsBytes: Long = REGULAR_TMPFS_BYTES,
+    val nativeTmpfsBytes: Long = NATIVE_TMPFS_BYTES,
+    val nativeTmpfsPath: String = NATIVE_TMPFS_PATH,
+    val sqliteNativeJvmOption: String = SQLITE_NATIVE_JVM_OPTION,
+    override val networkMode: String = "BRIDGE",
+    val readOnlyRoot: Boolean = true,
+    val capDropAll: Boolean = true,
+    val noNewPrivileges: Boolean = true,
+    val seccomp: String = "DEFAULT",
+    val sdkReadOnly: Boolean = true,
+    val jdkReadOnly: Boolean = true,
+    override val gradleReadOnly: Boolean = true,
+    val dockerSocketMounted: Boolean = false,
+    val jobDiskQuotaEnforced: Boolean = false,
+    override val minimumFreeDiskBytes: Long = 17_179_869_184,
+    override val home: String = "/home/ubuntu",
+    override val source: String = "/work/source",
+    override val gradleHome: String = "/work/gradle-home",
+    override val jdk: String = "/opt/jdk",
+    override val sdk: String = "/opt/android-sdk",
+    override val gradle: String = "/opt/gradle",
+    val maxGradleWorkers: Int = 2,
+    val detailedLogBytes: Long = 67_108_864,
+) : DockerSandboxPolicy {
+    init {
+        require(memoryBytes in setOf(DEFAULT_MEMORY_BYTES, RETRY_MEMORY_BYTES))
+        require(memorySwapBytes == memoryBytes)
+        require(tmpfsBytes == TOTAL_TMPFS_BYTES)
+        require(regularTmpfsBytes == REGULAR_TMPFS_BYTES && nativeTmpfsBytes == NATIVE_TMPFS_BYTES)
+        require(regularTmpfsBytes + nativeTmpfsBytes == tmpfsBytes)
+        require(nativeTmpfsPath == NATIVE_TMPFS_PATH && sqliteNativeJvmOption == SQLITE_NATIVE_JVM_OPTION)
+    }
+
     companion object {
-        const val ID = "docker-generic-v1"
+        const val ID = "docker-generic-v2"
         const val DEFAULT_MEMORY_BYTES = 8_589_934_592L
         const val RETRY_MEMORY_BYTES = 12_884_901_888L
+        const val TOTAL_TMPFS_BYTES = 1_073_741_824L
+        const val REGULAR_TMPFS_BYTES = 1_006_632_960L
+        const val NATIVE_TMPFS_BYTES = 67_108_864L
+        const val NATIVE_TMPFS_PATH = "/run/reprodroid-native"
+        const val SQLITE_NATIVE_JVM_OPTION = "-Dorg.sqlite.tmpdir=$NATIVE_TMPFS_PATH"
+    }
+}
+
+internal fun DockerSandboxPolicy.containerEnvironment(): Map<String, String> = buildMap {
+    put("PATH", listOfNotNull("$jdk/bin", gradle?.let { "$it/bin" }, "/usr/bin", "/bin").joinToString(":"))
+    put("JAVA_HOME", jdk)
+    put("HOME", home)
+    put("GRADLE_USER_HOME", gradleHome)
+    put("ANDROID_HOME", sdk)
+    put("ANDROID_SDK_ROOT", sdk)
+    if (this@containerEnvironment is GenericDockerSandboxProfile) {
+        put("JAVA_TOOL_OPTIONS", sqliteNativeJvmOption)
     }
 }
 
@@ -234,16 +309,25 @@ internal data class SandboxSnapshot(
             .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
     }
 
-    fun validatedGenericProfile(): GenericDockerSandboxProfile? {
+    fun validatedGenericProfile(): DockerSandboxPolicy? {
         try {
-            if (jobSandbox.profileId != GenericDockerSandboxProfile.ID) return null
+            if (jobSandbox.profileId !in setOf(LegacyGenericDockerSandboxProfile.ID, GenericDockerSandboxProfile.ID)) return null
             require(jobSandbox.mode == BuildSandboxMode.DOCKER && manifestFormat == SandboxManifestFormat.REQUIRED_V4)
             val canonical = requireNotNull(canonicalProfile)
             require(canonical.toByteArray(Charsets.UTF_8).size <= 8192)
             require(profileSha256 == hash(canonical))
-            val decoded = GENERIC_SNAPSHOT_JSON.decodeFromString<GenericDockerSandboxProfile>(canonical)
-            require(decoded.profileId == GenericDockerSandboxProfile.ID)
-            require(canonical == GENERIC_SNAPSHOT_JSON.encodeToString(decoded))
+            val decoded: DockerSandboxPolicy = when (jobSandbox.profileId) {
+                LegacyGenericDockerSandboxProfile.ID -> GENERIC_SNAPSHOT_JSON.decodeFromString<LegacyGenericDockerSandboxProfile>(canonical)
+                GenericDockerSandboxProfile.ID -> GENERIC_SNAPSHOT_JSON.decodeFromString<GenericDockerSandboxProfile>(canonical)
+                else -> error("unsupported generic profile")
+            }
+            require(decoded.profileId == jobSandbox.profileId)
+            val encoded = when (decoded) {
+                is LegacyGenericDockerSandboxProfile -> GENERIC_SNAPSHOT_JSON.encodeToString(decoded)
+                is GenericDockerSandboxProfile -> GENERIC_SNAPSHOT_JSON.encodeToString(decoded)
+                else -> error("unsupported generic profile")
+            }
+            require(canonical == encoded)
             return decoded
         } catch (_: Exception) {
             throw invalidSandboxSnapshot()
@@ -251,7 +335,11 @@ internal data class SandboxSnapshot(
     }
 
     fun validateAnyProfile() {
-        if (jobSandbox.profileId == GenericDockerSandboxProfile.ID) validatedGenericProfile() else validatedProfile()
+        if (jobSandbox.profileId in setOf(LegacyGenericDockerSandboxProfile.ID, GenericDockerSandboxProfile.ID)) {
+            validatedGenericProfile()
+        } else {
+            validatedProfile()
+        }
     }
 }
 
@@ -291,7 +379,7 @@ data class SandboxEvidence(
             val fixed = profileId == DockerSandboxProfile.ID
             val profile = DockerSandboxProfile()
             val generic = GenericDockerSandboxProfile()
-            require(profileId in setOf(profile.profileId, generic.profileId) && imageDigest == DockerSandboxProfile.IMAGE_DIGEST)
+            require(profileId in SUPPORTED_DOCKER_PROFILE_IDS && imageDigest == DockerSandboxProfile.IMAGE_DIGEST)
             require(platform == profile.platform && networkMode == profile.networkMode)
             val version = requireNotNull(engineVersion)
             require(version.isNotBlank() && version.toByteArray(Charsets.UTF_8).size <= 128 &&

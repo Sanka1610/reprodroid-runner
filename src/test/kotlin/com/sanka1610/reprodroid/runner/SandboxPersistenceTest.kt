@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.sql.DriverManager
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
@@ -42,6 +43,31 @@ class SandboxPersistenceTest {
         assertTrue(raw.contains("\"sandbox\":{\"mode\":\"HOST\",\"origin\":\"NEW_JOB\"}"))
         assertFalse(raw.contains("profileId"))
         assertFalse(raw.contains("snapshot"))
+    }
+
+    @Test fun `new generic snapshots use v2 while canonical v1 snapshots remain readable`() {
+        val current = SandboxSnapshot.newGenericJob()
+        assertEquals(GenericDockerSandboxProfile.ID, current.jobSandbox.profileId)
+        assertEquals(GenericDockerSandboxProfile(), current.validatedGenericProfile())
+
+        val legacy = LegacyGenericDockerSandboxProfile()
+        val canonicalJson = """{"profileId":"docker-generic-v1","image":"ubuntu@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316","platform":"linux/amd64","dockerExecutable":"/usr/bin/docker","endpoint":"unix:///var/run/docker.sock","uid":1000,"gid":1000,"cpuCount":4,"cpuset":"0-3","memoryBytes":8589934592,"memorySwapBytes":8589934592,"pids":1024,"tmpfsBytes":1073741824,"networkMode":"BRIDGE","readOnlyRoot":true,"capDropAll":true,"noNewPrivileges":true,"seccomp":"DEFAULT","sdkReadOnly":true,"jdkReadOnly":true,"gradleReadOnly":true,"dockerSocketMounted":false,"jobDiskQuotaEnforced":false,"minimumFreeDiskBytes":17179869184,"home":"/home/ubuntu","source":"/work/source","gradleHome":"/work/gradle-home","jdk":"/opt/jdk","sdk":"/opt/android-sdk","gradle":"/opt/gradle","maxGradleWorkers":2,"detailedLogBytes":67108864}"""
+        assertEquals(canonicalJson, Json { encodeDefaults = true; ignoreUnknownKeys = false }.encodeToString(legacy))
+        val sha256 = MessageDigest.getInstance("SHA-256")
+            .digest(canonicalJson.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+        assertEquals("0162d71930ce7661b5226f5d806477ff970671df4c4977efa5f73ec39583fd62", sha256)
+        val restored = SandboxSnapshot(
+            JobSandbox(BuildSandboxMode.DOCKER, SandboxOrigin.NEW_JOB, legacy.profileId, SandboxCleanupStatus.COMPLETE),
+            canonicalJson,
+            sha256,
+            SandboxManifestFormat.REQUIRED_V4,
+        )
+        assertEquals(legacy, restored.validatedGenericProfile())
+
+        val wrongIdentity = restored.copy(jobSandbox = restored.jobSandbox.copy(profileId = GenericDockerSandboxProfile.ID))
+        assertEquals("SANDBOX_SNAPSHOT_INVALID", assertThrows(TrustedBuildFailure::class.java) {
+            wrongIdentity.validatedGenericProfile()
+        }.code)
     }
 
     @Test fun `missing and tampered snapshot fields fail closed`() {

@@ -12,6 +12,18 @@ enum class ToolchainArchiveType { ZIP, TAR_GZ }
 enum class ToolchainSignaturePolicy { NONE, OPENPGP_REQUIRED }
 
 @Serializable
+data class AndroidLocalPackageMetadata(
+    val path: String,
+    val apiLevel: String,
+    val revisionMajor: Int,
+    val extensionLevel: Int,
+    val baseExtension: Boolean,
+    val codename: String,
+    val layoutlibApi: Int,
+    val displayName: String,
+)
+
+@Serializable
 data class ToolchainCatalogArtifact(
     val artifactId: String,
     val component: ToolchainComponent,
@@ -29,6 +41,7 @@ data class ToolchainCatalogArtifact(
     val signatureUrl: String? = null,
     val signingKeyResource: String? = null,
     val signingKeyFingerprint: String? = null,
+    val androidLocalPackage: AndroidLocalPackageMetadata? = null,
 )
 
 @Serializable

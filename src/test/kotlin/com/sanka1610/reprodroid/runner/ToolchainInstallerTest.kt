@@ -118,6 +118,96 @@ class ToolchainInstallerTest {
     }
 
     @Test
+    fun `minor Android platform publishes catalog-bound local package metadata`() {
+        val archive = stateDirectory.resolve("android-platform.zip")
+        zip(
+            archive,
+            mapOf(
+                "android.jar" to "jar",
+                "source.properties" to """
+                    Pkg.Revision=2
+                    AndroidVersion.ApiLevel=37.0
+                    AndroidVersion.CodeName=
+                    AndroidVersion.ExtensionLevel=22
+                    AndroidVersion.IsBaseSdk=true
+                    Layoutlib.Api=15
+                """.trimIndent() + "\n",
+            ),
+        )
+        val installer = installerFor(archive)
+
+        val installed = installer.install(UUID.randomUUID().toString(), androidPlatformArtifact(archive), { false }) { _, _ -> }
+
+        val final = stateDirectory.resolve(installed.relativePath)
+        val packageXml = Files.readString(final.resolve("package.xml"))
+        assertTrue(packageXml.contains("path=\"platforms;android-37.0\""))
+        assertTrue(packageXml.contains("<api-level>37.0</api-level>"))
+        assertTrue(packageXml.contains("<extension-level>22</extension-level>"))
+        assertTrue(packageXml.contains("<major>2</major>"))
+        assertTrue(packageXml.contains("<display-name>Android SDK Platform 37.0</display-name>"))
+        assertTrue(final.resolve(".reprodroid-content-manifest").toFile().readText().contains("package.xml"))
+        assertTrue(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+
+        final.toFile().setWritable(true, true)
+        final.resolve("package.xml").toFile().setWritable(true, true)
+        Files.writeString(final.resolve("package.xml"), packageXml.replace("37.0", "37.1"))
+        assertFalse(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+    }
+
+    @Test
+    fun `minor Android platform rejects source metadata that differs from catalog`() {
+        val archive = stateDirectory.resolve("android-platform-mismatch.zip")
+        zip(
+            archive,
+            mapOf(
+                "android.jar" to "jar",
+                "source.properties" to """
+                    Pkg.Revision=2
+                    AndroidVersion.ApiLevel=37
+                    AndroidVersion.CodeName=
+                    AndroidVersion.ExtensionLevel=22
+                    AndroidVersion.IsBaseSdk=true
+                    Layoutlib.Api=15
+                """.trimIndent() + "\n",
+            ),
+        )
+
+        val failure = assertThrows(ToolchainInstallFailure::class.java) {
+            installerFor(archive).install(UUID.randomUUID().toString(), androidPlatformArtifact(archive), { false }) { _, _ -> }
+        }
+
+        assertEquals("TOOLCHAIN_METADATA_INVALID", failure.code)
+        assertFalse(Files.exists(stateDirectory.resolve("toolchains/android/platforms/android-37.0")))
+    }
+
+    @Test
+    fun `minor Android platform rejects archive package metadata that differs from catalog`() {
+        val archive = stateDirectory.resolve("android-platform-package-mismatch.zip")
+        zip(
+            archive,
+            mapOf(
+                "android.jar" to "jar",
+                "source.properties" to """
+                    Pkg.Revision=2
+                    AndroidVersion.ApiLevel=37.0
+                    AndroidVersion.CodeName=
+                    AndroidVersion.ExtensionLevel=22
+                    AndroidVersion.IsBaseSdk=true
+                    Layoutlib.Api=15
+                """.trimIndent() + "\n",
+                "package.xml" to "<repository><localPackage path=\"platforms;android-37.1\"/></repository>\n",
+            ),
+        )
+
+        val failure = assertThrows(ToolchainInstallFailure::class.java) {
+            installerFor(archive).install(UUID.randomUUID().toString(), androidPlatformArtifact(archive), { false }) { _, _ -> }
+        }
+
+        assertEquals("TOOLCHAIN_METADATA_INVALID", failure.code)
+        assertFalse(Files.exists(stateDirectory.resolve("toolchains/android/platforms/android-37.0")))
+    }
+
+    @Test
     fun `jdk lib directory symlink is rejected before final publish`() {
         val payload = stateDirectory.resolve("jdk-lib-link/jdk-fixture")
         Files.createDirectories(payload.resolve("bin"))
@@ -252,6 +342,25 @@ class ToolchainInstallerTest {
         url = "https://github.com/adoptium/fixture.zip",
         installSubdirectory = "jdk/fixture",
         licenseId = "jdk-gpl-2.0-with-classpath-exception",
+    )
+
+    private fun androidPlatformArtifact(archive: Path) = artifact(archive).copy(
+        artifactId = "android-platform-37.0-r02",
+        component = ToolchainComponent.ANDROID_PLATFORM,
+        version = "37.0-r02",
+        url = "https://dl.google.com/android/repository/platform-37.0_r02.zip",
+        installSubdirectory = "android/platforms/android-37.0",
+        licenseId = "android-sdk-license",
+        androidLocalPackage = AndroidLocalPackageMetadata(
+            path = "platforms;android-37.0",
+            apiLevel = "37.0",
+            revisionMajor = 2,
+            extensionLevel = 22,
+            baseExtension = true,
+            codename = "",
+            layoutlibApi = 15,
+            displayName = "Android SDK Platform 37.0",
+        ),
     )
 
     private fun jdkTarPayload(directory: String): Path {

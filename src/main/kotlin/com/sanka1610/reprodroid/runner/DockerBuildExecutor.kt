@@ -54,11 +54,7 @@ internal class DockerBuildExecutor(
         if (job.genericBuild != null && !recipe.managedToolchains) throw invalidSandboxSnapshot()
         if (job.genericBuild == null && managedToolchains != null) throw invalidSandboxSnapshot()
         if (lifecycle.cleanupPending) throw TrustedBuildFailure("SANDBOX_CLEANUP_PENDING", "Sandbox recovery must complete before execution.")
-        val environment = mapOf(
-            "PATH" to listOfNotNull("${profile.jdk}/bin", profile.gradle?.let { "$it/bin" }, "/usr/bin", "/bin").joinToString(":"),
-            "JAVA_HOME" to profile.jdk, "HOME" to profile.home,
-            "GRADLE_USER_HOME" to profile.gradleHome, "ANDROID_HOME" to profile.sdk, "ANDROID_SDK_ROOT" to profile.sdk,
-        )
+        val environment = profile.containerEnvironment()
         val mounts = buildList {
             add(SandboxMount(source.toString(), profile.source, false))
             add(SandboxMount(home.toString(), profile.home, false))
@@ -110,6 +106,10 @@ internal class DockerBuildExecutor(
             val measuredOs = listOf("os.name", "os.version", "os.arch").joinToString(" ") { property(probe, it) }
             require(measuredJava == PublicJavaRuntime(java.version, java.vendor))
             require(property(probe, "user.home") == profile.home && property(probe, "java.home") == profile.jdk)
+            if (profile is GenericDockerSandboxProfile) {
+                require(property(probe, "org.sqlite.tmpdir") == profile.nativeTmpfsPath)
+                require(Regex("(?m)^REPRODROID_NATIVE_TMPFS_OK$").containsMatchIn(probe))
+            }
             require(Regex("(?m)^CapEff:\\s+0+$").containsMatchIn(probe) && Regex("(?m)^NoNewPrivs:\\s+1$").containsMatchIn(probe))
             require(Regex("(?m)^Seccomp:\\s+2$").containsMatchIn(probe))
             job.genericBuild?.let { generic ->
@@ -248,6 +248,29 @@ internal class DockerBuildExecutor(
         Regex("(?m)^\\s*${Regex.escape(key)} = (.+)$").findAll(output).single().groupValues[1].trim()
 
     private fun toolchainProbe(recipe: BuildRecipe, profile: DockerSandboxPolicy, generic: Boolean): String {
+        val mountProbe = if (profile is GenericDockerSandboxProfile) """
+            regular_options="$(awk '$2 == "/tmp" { print $4 }' /proc/mounts)"
+            native_options="$(awk '$2 == "${profile.nativeTmpfsPath}" { print $4 }' /proc/mounts)"
+            test -n "${'$'}regular_options"
+            test -n "${'$'}native_options"
+            case ",${'$'}regular_options," in *,rw,*) ;; *) exit 1 ;; esac
+            case ",${'$'}regular_options," in *,nosuid,*) ;; *) exit 1 ;; esac
+            case ",${'$'}regular_options," in *,nodev,*) ;; *) exit 1 ;; esac
+            case ",${'$'}regular_options," in *,noexec,*) ;; *) exit 1 ;; esac
+            case ",${'$'}native_options," in *,rw,*) ;; *) exit 1 ;; esac
+            case ",${'$'}native_options," in *,nosuid,*) ;; *) exit 1 ;; esac
+            case ",${'$'}native_options," in *,nodev,*) ;; *) exit 1 ;; esac
+            case ",${'$'}native_options," in *,noexec,*) exit 1 ;; esac
+            printf '#!/bin/sh\nexit 0\n' > ${profile.nativeTmpfsPath}/reprodroid-exec-probe
+            chmod 700 ${profile.nativeTmpfsPath}/reprodroid-exec-probe
+            ${profile.nativeTmpfsPath}/reprodroid-exec-probe
+            rm ${profile.nativeTmpfsPath}/reprodroid-exec-probe
+            printf '#!/bin/sh\nexit 0\n' > /tmp/reprodroid-noexec-probe
+            chmod 700 /tmp/reprodroid-noexec-probe
+            if /tmp/reprodroid-noexec-probe 2>/dev/null; then exit 1; fi
+            rm /tmp/reprodroid-noexec-probe
+            echo REPRODROID_NATIVE_TMPFS_OK
+        """.trimIndent() else ""
         val base = """
             test "$(id -u)" = 1000
             test "$(id -g)" = 1000
@@ -256,11 +279,12 @@ internal class DockerBuildExecutor(
             test -r /opt/android-sdk/platforms/${androidPlatformDirectoryName(recipe.androidSdkApiLevel)}/android.jar
             /opt/android-sdk/build-tools/${recipe.buildToolsVersion}/aapt2 version
         """.trimIndent()
-        if (!generic) return base
+        val verifiedBase = if (mountProbe.isEmpty()) base else "$base\n$mountProbe"
+        if (!generic) return verifiedBase
         val gradle = requireNotNull(profile.gradle)
         val discovery = gradleOptions(recipe) + listOf("--no-configuration-cache", "--max-workers=2", "--dry-run") + recipe.tasks
         val command = discovery.joinToString(" ") { value -> require(value.matches(Regex("[A-Za-z0-9:._=-]+"))); value }
-        return "$base\n/opt/jdk/bin/java -Duser.home=${profile.home} -Dgradle.user.home=${profile.gradleHome} " +
+        return "$verifiedBase\n/opt/jdk/bin/java -Duser.home=${profile.home} -Dgradle.user.home=${profile.gradleHome} " +
             "-classpath '$gradle/lib/*:$gradle/lib/plugins/*' org.gradle.launcher.GradleMain $command"
     }
 }

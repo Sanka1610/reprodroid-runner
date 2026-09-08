@@ -4,8 +4,10 @@ import kotlinx.coroutines.runInterruptible
 import java.io.BufferedReader
 import java.nio.file.Path
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 internal data class ProcessResult(
@@ -14,6 +16,21 @@ internal data class ProcessResult(
 )
 
 internal class ProcessTimeoutException(message: String) : RuntimeException(message)
+
+internal enum class ProcessFailureStage {
+    START,
+    OUTPUT_READ,
+    AUDIT_APPEND,
+    WAIT,
+    OUTPUT_DRAIN,
+}
+
+internal class ProcessExecutionException(
+    val stage: ProcessFailureStage,
+    cause: Throwable? = null,
+) : RuntimeException("External process failed during ${stage.name}.", cause)
+
+private class OutputCallbackException(cause: Throwable) : RuntimeException(cause)
 
 internal interface ProcessExecutor {
     suspend fun execute(
@@ -43,10 +60,15 @@ internal class SystemProcessExecutor : ProcessExecutor {
             clear()
             putAll(environment)
         }
-        val process = processBuilder.start()
+        val process = try {
+            processBuilder.start()
+        } catch (failure: Throwable) {
+            throw ProcessExecutionException(ProcessFailureStage.START, failure)
+        }
         val captured = mutableListOf<String>()
         val loggedBytes = AtomicLong(0)
-        val readerFailure = arrayOfNulls<Throwable>(1)
+        val readerFailure = AtomicReference<ProcessExecutionException?>()
+        val readerDone = CountDownLatch(1)
         val readerThread = thread(name = "reprodroid-process-output", isDaemon = true) {
             try {
                 process.inputStream.bufferedReader().use { reader ->
@@ -56,25 +78,50 @@ internal class SystemProcessExecutor : ProcessExecutor {
                             synchronized(captured) { captured += line }
                         }
                         val newTotal = loggedBytes.addAndGet(line.toByteArray().size.toLong())
-                        if (newTotal <= MAX_LOGGED_BYTES) onOutput(line)
+                        if (newTotal <= MAX_LOGGED_BYTES) {
+                            try {
+                                onOutput(line)
+                            } catch (failure: Throwable) {
+                                throw OutputCallbackException(failure)
+                            }
+                        }
                     }
                 }
             } catch (failure: Throwable) {
-                readerFailure[0] = failure
+                val callbackFailure = failure as? OutputCallbackException
+                readerFailure.compareAndSet(
+                    null,
+                    ProcessExecutionException(
+                        if (callbackFailure == null) ProcessFailureStage.OUTPUT_READ else ProcessFailureStage.AUDIT_APPEND,
+                        callbackFailure?.cause ?: failure,
+                    ),
+                )
+                if (process.isAlive) terminateProcessTree(process)
+            } finally {
+                readerDone.countDown()
             }
         }
 
         try {
-            val completed = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)
+            val completed = try {
+                process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)
+            } catch (failure: InterruptedException) {
+                throw failure
+            } catch (failure: Throwable) {
+                throw ProcessExecutionException(ProcessFailureStage.WAIT, failure)
+            }
             if (!completed) {
                 terminateProcessTree(process)
                 throw ProcessTimeoutException("Process exceeded timeout of ${timeout.toMinutes()} minutes.")
             }
-            readerThread.join(READER_JOIN_MILLIS)
-            readerFailure[0]?.let { throw it }
+            if (!readerDone.await(READER_JOIN_MILLIS, TimeUnit.MILLISECONDS)) {
+                throw ProcessExecutionException(ProcessFailureStage.OUTPUT_DRAIN)
+            }
+            readerFailure.get()?.let { throw it }
             ProcessResult(process.exitValue(), synchronized(captured) { captured.toList() })
         } finally {
             if (process.isAlive) terminateProcessTree(process)
+            if (readerThread.isAlive) runCatching { process.inputStream.close() }
             readerThread.interrupt()
         }
     }

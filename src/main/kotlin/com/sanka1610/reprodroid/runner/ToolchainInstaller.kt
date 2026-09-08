@@ -17,6 +17,7 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
 import java.time.Duration
+import java.util.Properties
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
 import kotlin.io.path.createDirectories
@@ -79,6 +80,7 @@ internal class ToolchainInstaller(
         progress.update(ToolchainInstallationState.VERIFYING_CONTENT, artifact.archiveSizeBytes.toLong())
         restoreExecutableEntries(artifact.component, payload)
         validateMetadata(artifact, payload)
+        materializeAndroidLocalPackageMetadata(artifact, payload)
         val manifest = createContentManifest(payload, cancelled)
         val manifestPath = payload.resolve(CONTENT_MANIFEST_NAME)
         Files.writeString(manifestPath, manifest.text, StandardCharsets.UTF_8)
@@ -351,6 +353,77 @@ internal class ToolchainInstaller(
             throw ToolchainInstallFailure("TOOLCHAIN_METADATA_INVALID", "Extracted ${artifact.artifactId} does not contain a safe JDK process helper.")
         }
     }
+
+    private fun materializeAndroidLocalPackageMetadata(artifact: ToolchainCatalogArtifact, root: Path) {
+        val metadata = artifact.androidLocalPackage ?: return
+        if (artifact.component != ToolchainComponent.ANDROID_PLATFORM) {
+            throw ToolchainInstallFailure("TOOLCHAIN_METADATA_INVALID", "Android local package metadata is only valid for platform packages.")
+        }
+        val properties = runCatching {
+            Properties().also { loaded ->
+                Files.newInputStream(root.resolve("source.properties")).use(loaded::load)
+            }
+        }.getOrElse {
+            throw ToolchainInstallFailure(
+                "TOOLCHAIN_METADATA_INVALID",
+                "Extracted ${artifact.artifactId} source.properties is invalid.",
+            )
+        }
+        fun requireProperty(name: String, expected: String) {
+            if (properties.getProperty(name) != expected) {
+                throw ToolchainInstallFailure(
+                    "TOOLCHAIN_METADATA_INVALID",
+                    "Extracted ${artifact.artifactId} metadata does not match the trusted catalog.",
+                )
+            }
+        }
+        requireProperty("AndroidVersion.ApiLevel", metadata.apiLevel)
+        requireProperty("Pkg.Revision", metadata.revisionMajor.toString())
+        requireProperty("AndroidVersion.ExtensionLevel", metadata.extensionLevel.toString())
+        requireProperty("AndroidVersion.IsBaseSdk", metadata.baseExtension.toString())
+        requireProperty("AndroidVersion.CodeName", metadata.codename)
+        requireProperty("Layoutlib.Api", metadata.layoutlibApi.toString())
+
+        val packageXml = androidLocalPackageXml(metadata)
+        val packageXmlPath = root.resolve("package.xml")
+        if (packageXmlPath.exists(LinkOption.NOFOLLOW_LINKS)) {
+            if (!packageXmlPath.isRegularFile(LinkOption.NOFOLLOW_LINKS) ||
+                Files.readString(packageXmlPath, StandardCharsets.UTF_8) != packageXml
+            ) {
+                throw ToolchainInstallFailure(
+                    "TOOLCHAIN_METADATA_INVALID",
+                    "Extracted ${artifact.artifactId} package.xml does not match the trusted catalog.",
+                )
+            }
+        } else {
+            Files.writeString(packageXmlPath, packageXml, StandardCharsets.UTF_8)
+            fsyncFile(packageXmlPath)
+        }
+    }
+
+    private fun androidLocalPackageXml(metadata: AndroidLocalPackageMetadata): String = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <ns:repository xmlns:ns="http://schemas.android.com/repository/android/common/02"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xmlns:repo="http://schemas.android.com/sdk/android/repo/repository2/04">
+            <localPackage path="${xmlAttribute(metadata.path)}" obsolete="false">
+                <type-details xsi:type="repo:platformDetailsType">
+                    <api-level>${xmlText(metadata.apiLevel)}</api-level>
+                    <codename>${xmlText(metadata.codename)}</codename>
+                    <extension-level>${metadata.extensionLevel}</extension-level>
+                    <base-extension>${metadata.baseExtension}</base-extension>
+                    <layoutlib api="${metadata.layoutlibApi}"/>
+                </type-details>
+                <revision>
+                    <major>${metadata.revisionMajor}</major>
+                </revision>
+                <display-name>${xmlText(metadata.displayName)}</display-name>
+            </localPackage>
+        </ns:repository>
+    """.trimIndent() + "\n"
+
+    private fun xmlAttribute(value: String): String = xmlText(value).replace("\"", "&quot;").replace("'", "&apos;")
+    private fun xmlText(value: String): String = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     private fun createContentManifest(root: Path, cancelled: () -> Boolean): ContentManifest {
         val lines = mutableListOf<String>()

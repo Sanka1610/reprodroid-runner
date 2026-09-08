@@ -15,11 +15,13 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.sql.SQLException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.Properties
 import java.util.UUID
+import org.slf4j.LoggerFactory
 import kotlin.io.path.createDirectories
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.name
@@ -28,6 +30,8 @@ internal class TrustedBuildFailure(
     val code: String,
     override val message: String,
 ) : RuntimeException(message)
+
+private val trustedBuildLogger = LoggerFactory.getLogger("ReproDroidRunner")
 
 internal interface SourceResolver {
     suspend fun resolve(recipe: BuildRecipe, revision: RequestedRevision, jobId: String): String
@@ -748,10 +752,41 @@ internal class TrustedBuildExecutor(
             throw cancellation
         } catch (failure: ProcessTimeoutException) {
             throw TrustedBuildFailure("PROCESS_TIMEOUT", failure.message ?: "External process timed out.")
-        } catch (_: Throwable) {
-            throw TrustedBuildFailure(failureCode, "$outputPrefix could not be started or monitored.")
+        } catch (failure: ProcessExecutionException) {
+            logProcessFailure(outputPrefix, failure)
+            val code = if (failure.stage == ProcessFailureStage.AUDIT_APPEND) {
+                "BUILD_LOG_PERSISTENCE_FAILED"
+            } else {
+                failureCode
+            }
+            throw TrustedBuildFailure(code, "$outputPrefix could not be started or monitored.").also {
+                it.initCause(failure)
+            }
+        } catch (failure: Throwable) {
+            trustedBuildLogger.error(
+                "External process failure for {} (stage=UNKNOWN, type={}).",
+                outputPrefix,
+                failure.javaClass.simpleName,
+            )
+            throw TrustedBuildFailure(failureCode, "$outputPrefix could not be started or monitored.").also {
+                it.initCause(failure)
+            }
         }
         if (result.exitCode != 0) throw TrustedBuildFailure(failureCode, "$outputPrefix exited with code ${result.exitCode}.")
+    }
+
+    private fun logProcessFailure(outputPrefix: String, failure: ProcessExecutionException) {
+        val sqlFailure = generateSequence(failure.cause) { it.cause }
+            .filterIsInstance<SQLException>()
+            .firstOrNull()
+        trustedBuildLogger.error(
+            "External process failure for {} (stage={}, type={}, sqlState={}, vendorCode={}).",
+            outputPrefix,
+            failure.stage.name,
+            failure.cause?.javaClass?.simpleName ?: "none",
+            sqlFailure?.sqlState ?: "none",
+            sqlFailure?.errorCode?.toString() ?: "none",
+        )
     }
 
     private suspend fun captureChecked(

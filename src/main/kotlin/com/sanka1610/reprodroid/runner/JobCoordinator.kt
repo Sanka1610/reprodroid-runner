@@ -16,9 +16,14 @@ import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.LinkOption
+import java.sql.SQLException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.CoroutineContext
+import org.slf4j.LoggerFactory
+import org.sqlite.SQLiteException
+
+private val jobCoordinatorLogger = LoggerFactory.getLogger("ReproDroidRunner")
 
 internal class SimulatedBuildExecutor(
     private val store: SQLiteJobStore,
@@ -433,6 +438,26 @@ internal class JobCoordinator(
                 logMessage = failure.message,
             )
         } catch (failure: Throwable) {
+            val top = failure.stackTrace.firstOrNull()
+            val sqlFailure = generateSequence(failure) { it.cause }
+                .filterIsInstance<SQLException>()
+                .firstOrNull()
+            val runnerFrames = failure.stackTrace.asSequence()
+                .filter { it.className.startsWith("com.sanka1610.reprodroid.runner.") }
+                .take(3)
+                .joinToString("|") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }
+                .ifEmpty { "none" }
+            jobCoordinatorLogger.error(
+                "Job executor failed unexpectedly (type={}, cause={}, top={}:{}, sqlState={}, vendorCode={}, sqliteResult={}, runnerFrames={}).",
+                failure.javaClass.simpleName,
+                failure.cause?.javaClass?.simpleName ?: "none",
+                top?.let { "${it.className}.${it.methodName}" } ?: "none",
+                top?.lineNumber ?: -1,
+                sqlFailure?.sqlState ?: "none",
+                sqlFailure?.errorCode?.toString() ?: "none",
+                (sqlFailure as? SQLiteException)?.resultCode?.let { "${it.name}:${it.code}" } ?: "none",
+                runnerFrames,
+            )
             store.failIfActive(
                 jobId = jobId,
                 error = JobError("INTERNAL_EXECUTION_ERROR", "The job executor failed unexpectedly."),

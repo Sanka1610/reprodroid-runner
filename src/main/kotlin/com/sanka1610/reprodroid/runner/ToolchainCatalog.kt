@@ -99,6 +99,18 @@ internal class ToolchainCatalog private constructor(
                     require(!it.signingKeyResource.isNullOrBlank())
                     require(FINGERPRINT.matches(it.signingKeyFingerprint.orEmpty()))
                 }
+                val localPackage = it.androidLocalPackage
+                if (localPackage != null) {
+                    require(it.component == ToolchainComponent.ANDROID_PLATFORM)
+                    require(ANDROID_PACKAGE_PATH.matches(localPackage.path))
+                    require(localPackage.path == it.installSubdirectory.removePrefix("android/").replace('/', ';'))
+                    require(ANDROID_API_LEVEL.matches(localPackage.apiLevel))
+                    require(localPackage.revisionMajor in 1..9999)
+                    require(localPackage.extensionLevel in 0..9999)
+                    require(localPackage.codename.matches(ANDROID_CODENAME))
+                    require(localPackage.layoutlibApi in 1..9999)
+                    require(localPackage.displayName.length in 1..128 && localPackage.displayName.all { char -> char.code in 0x20..0x7e })
+                }
             }
         }
 
@@ -106,6 +118,9 @@ internal class ToolchainCatalog private constructor(
         private val SHA256 = Regex("[0-9a-f]{64}")
         private val FINGERPRINT = Regex("[0-9A-F]{40}")
         private val ARTIFACT_ID = Regex("[a-z0-9][a-z0-9._+-]{2,100}")
+        private val ANDROID_PACKAGE_PATH = Regex("platforms;android-[1-9][0-9]{0,2}(?:[.][0-9]{1,3})?")
+        private val ANDROID_API_LEVEL = Regex("[1-9][0-9]{0,2}(?:[.][0-9]{1,3})?")
+        private val ANDROID_CODENAME = Regex("[A-Za-z0-9_.-]{0,64}")
     }
 }
 
