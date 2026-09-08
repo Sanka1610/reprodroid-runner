@@ -37,19 +37,13 @@ internal class StorageRetentionStore(
     init {
         require(Files.isDirectory(stateDirectory, LinkOption.NOFOLLOW_LINKS))
         Class.forName("org.sqlite.JDBC")
+        RunnerSecurityStore(stateDirectory, clock).runnerId()
         initializeDefaults()
         reconcileInterruptedOperations()
     }
 
     @Synchronized
-    fun runnerId(): String = connection().use { connection ->
-        connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT runner_id FROM runner_identity WHERE singleton = 1").use { rows ->
-                check(rows.next())
-                rows.getString(1)
-            }
-        }
-    }
+    fun runnerId(): String = RunnerSecurityStore(stateDirectory, clock).runnerId()
 
     @Synchronized
     fun operation(operationId: String, principalId: String): V2OperationResponse = connection().use { connection ->
@@ -116,7 +110,7 @@ internal class StorageRetentionStore(
         command: HoldCreateCommand,
     ): OperationReceipt {
         existingOperation(principalId, OP_HOLD_CREATE, idempotencyKey, command.normalizedRequest)?.let { return it }
-        requireResourceExists(command.resourceKind, command.resourceId)
+        requireResourceExists(principalId, command.resourceKind, command.resourceId)
         val reserved = reserveOperation(principalId, OP_HOLD_CREATE, idempotencyKey, command.normalizedRequest)
         if (reserved.existing) return reserved
         transitionOperation(reserved.response.operationId, V2OperationState.APPLYING)
@@ -193,7 +187,7 @@ internal class StorageRetentionStore(
     ): OperationReceipt {
         existingOperation(principalId, OP_RESERVATION_CREATE, idempotencyKey, command.normalizedRequest)?.let { return it }
         ensureNoReconciliationRequired()
-        requireResourceExists(command.resourceKind, command.resourceId)
+        requireResourceExists(principalId, command.resourceKind, command.resourceId)
         if (command.area != StorageArea.RUNNER_JOB) {
             throw ApiException.conflict("CAPABILITY_UNAVAILABLE", "Toolchain storage reservations are not available in this contract.")
         }
@@ -353,7 +347,7 @@ internal class StorageRetentionStore(
         if (reserved.existing) return reserved
         transitionOperation(reserved.response.operationId, V2OperationState.APPLYING)
         return try {
-            val candidates = inventory(command)
+            val candidates = inventory(command, principalId)
             val truncated = candidates.size > MAX_PREVIEW_ITEMS
             val selected = candidates.take(MAX_PREVIEW_ITEMS)
             val previewId = UUID.randomUUID().toString()
@@ -490,7 +484,7 @@ internal class StorageRetentionStore(
         var reconciliationRequired = false
         command.itemIds.forEach { itemId ->
             val row = preview.items.single { it.itemId == itemId }
-            val result = evaluateAndDelete(row)
+            val result = evaluateAndDelete(row, principalId)
             try {
                 persistCleanupItem(preview.cleanupRunId, row, result)
             } catch (failure: Throwable) {
@@ -520,14 +514,15 @@ internal class StorageRetentionStore(
         cleanupRun(connection, cleanupRunId, principalId)
     }
 
-    private fun inventory(command: CleanupPreviewCommand): List<ResourceCandidate> {
+    private fun inventory(command: CleanupPreviewCommand, principalId: String): List<ResourceCandidate> {
         val cutoff = Instant.parse(command.eligibleBefore)
         val candidates = mutableListOf<ResourceCandidate>()
         connection().use { connection ->
-            connection.createStatement().use { statement ->
-                statement.executeQuery(
-                    "SELECT job_id, state, updated_at, sandbox_cleanup_status FROM jobs ORDER BY job_id",
-                ).use { rows ->
+            connection.prepareStatement(
+                "SELECT job_id, state, updated_at, sandbox_cleanup_status FROM jobs WHERE principal_id=? ORDER BY job_id",
+            ).use { statement ->
+                statement.setString(1, principalId)
+                statement.executeQuery().use { rows ->
                     while (rows.next()) {
                         val jobId = rows.getString("job_id")
                         val updatedAt = Instant.parse(rows.getString("updated_at"))
@@ -574,13 +569,16 @@ internal class StorageRetentionStore(
                 }
             }
             if (CleanupResourceKind.JOB_ARTIFACT in command.resourceKinds) {
-                connection.createStatement().use { statement ->
+                connection.prepareStatement(
+                    """
+                    SELECT a.artifact_id, a.job_id, a.content_path, j.updated_at, j.state,
+                           j.sandbox_cleanup_status
+                    FROM artifacts a JOIN jobs j ON j.job_id = a.job_id
+                    WHERE j.principal_id=? ORDER BY a.artifact_id
+                    """.trimIndent(),
+                ).use { statement ->
+                    statement.setString(1, principalId)
                     statement.executeQuery(
-                        """
-                        SELECT a.artifact_id, a.job_id, a.content_path, j.updated_at, j.state,
-                               j.sandbox_cleanup_status
-                        FROM artifacts a JOIN jobs j ON j.job_id = a.job_id ORDER BY a.artifact_id
-                        """.trimIndent(),
                     ).use { rows ->
                         while (rows.next()) {
                             val artifactId = rows.getString("artifact_id")
@@ -685,8 +683,8 @@ internal class StorageRetentionStore(
         }
     }
 
-    private fun evaluateAndDelete(row: CleanupItemRow): ItemExecutionResult {
-        val current = resolveCurrentCandidate(row)
+    private fun evaluateAndDelete(row: CleanupItemRow, principalId: String): ItemExecutionResult {
+        val current = resolveCurrentCandidate(row, principalId)
             ?: return ItemExecutionResult(CleanupItemResult.FAILED, 0, "RESOURCE_NOT_FOUND", "The resource header no longer exists.")
         if (current.protections.isNotEmpty()) {
             val code = current.protections.sorted().first()
@@ -716,7 +714,7 @@ internal class StorageRetentionStore(
         }
     }
 
-    private fun resolveCurrentCandidate(row: CleanupItemRow): ResourceCandidate? {
+    private fun resolveCurrentCandidate(row: CleanupItemRow, principalId: String): ResourceCandidate? {
         val command = CleanupPreviewCommand(
             area = StorageArea.RUNNER_JOB,
             resourceKinds = setOf(row.kind),
@@ -724,7 +722,7 @@ internal class StorageRetentionStore(
             resourceIds = setOf(row.resourceId),
             normalizedRequest = JsonObject(emptyMap()),
         )
-        return inventory(command).singleOrNull()?.copy(itemId = row.itemId, eligibleAt = row.eligibleAt)
+        return inventory(command, principalId).singleOrNull()?.copy(itemId = row.itemId, eligibleAt = row.eligibleAt)
     }
 
     private fun safeDelete(path: Path) {
@@ -976,13 +974,6 @@ internal class StorageRetentionStore(
     private fun initializeDefaults() {
         transaction { connection ->
             val current = now()
-            connection.prepareStatement(
-                "INSERT OR IGNORE INTO runner_identity(singleton, runner_id, created_at) VALUES(1, ?, ?)",
-            ).use { statement ->
-                statement.setString(1, UUID.randomUUID().toString())
-                statement.setString(2, current)
-                statement.executeUpdate()
-            }
             listOf(
                 StorageArea.RUNNER_JOB to JOB_BUDGET_BYTES,
                 StorageArea.RUNNER_TOOLCHAIN to TOOLCHAIN_BUDGET_BYTES,
@@ -1192,6 +1183,7 @@ internal class StorageRetentionStore(
     ): OperationReceipt {
         val requestSha = requestSha256(kind, normalizedRequest)
         return transaction { connection ->
+            requireActivePrincipal(connection, principalId)
             findOperation(connection, principalId, kind, idempotencyKey)?.let { existing ->
                 if (existing.requestSha256 != requestSha) {
                     throw ApiException.conflict(
@@ -1242,6 +1234,7 @@ internal class StorageRetentionStore(
     ): OperationReceipt? {
         val expectedHash = requestSha256(kind, normalizedRequest)
         return connection().use { connection ->
+            requireActivePrincipal(connection, principalId)
             findOperation(connection, principalId, kind, idempotencyKey)?.let { existing ->
                 if (existing.requestSha256 != expectedHash) {
                     throw ApiException.conflict(
@@ -1355,14 +1348,15 @@ internal class StorageRetentionStore(
             statement.executeQuery().use { rows -> if (rows.next()) rows.getString(1) else null }
         }
 
-    private fun requireResourceExists(kind: RetentionResourceKind, resourceId: String) {
+    private fun requireResourceExists(principalId: String, kind: RetentionResourceKind, resourceId: String) {
         val exists = connection().use { connection ->
             val sql = when (kind) {
-                RetentionResourceKind.JOB -> "SELECT 1 FROM jobs WHERE job_id = ?"
-                RetentionResourceKind.ARTIFACT -> "SELECT 1 FROM artifacts WHERE artifact_id = ?"
+                RetentionResourceKind.JOB -> "SELECT 1 FROM jobs WHERE job_id = ? AND principal_id = ?"
+                RetentionResourceKind.ARTIFACT -> "SELECT 1 FROM artifacts a JOIN jobs j ON j.job_id=a.job_id WHERE a.artifact_id = ? AND j.principal_id = ?"
             }
             connection.prepareStatement(sql).use { statement ->
                 statement.setString(1, resourceId)
+                statement.setString(2, principalId)
                 statement.executeQuery().use(ResultSet::next)
             }
         }

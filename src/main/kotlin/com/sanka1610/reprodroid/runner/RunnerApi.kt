@@ -47,6 +47,7 @@ class ApiException(
 fun Application.runnerModule(config: RunnerConfig) {
     val logger = LoggerFactory.getLogger("ReproDroidRunner")
     val store = SQLiteJobStore(config.stateDirectory)
+    val security = RunnerSecurityStore(config.stateDirectory)
     val coordinator = JobCoordinator(
         store = store,
         coroutineContext = Dispatchers.IO,
@@ -66,7 +67,10 @@ fun Application.runnerModule(config: RunnerConfig) {
         toolchains?.close()
     }
 
-    install(CallLogging)
+    install(CallLogging) {
+        // URLs, query strings, bodies and exception messages can contain submitted secrets.
+        format { call -> "Runner response status=${call.response.status()?.value ?: 0}" }
+    }
     install(ContentNegotiation) {
         json(
             Json {
@@ -83,27 +87,30 @@ fun Application.runnerModule(config: RunnerConfig) {
         exception<BadRequestException> { call, failure ->
             call.respond(
                 HttpStatusCode.BadRequest,
-                ApiErrorResponse("INVALID_REQUEST", failure.message ?: "The request body is invalid."),
+                ApiErrorResponse("INVALID_REQUEST", "The request body is invalid."),
             )
         }
         exception<SerializationException> { call, failure ->
             call.respond(
                 HttpStatusCode.BadRequest,
-                ApiErrorResponse("INVALID_REQUEST", failure.message ?: "The request body is invalid."),
+                ApiErrorResponse("INVALID_REQUEST", "The request body is invalid."),
             )
         }
         exception<Throwable> { call, failure ->
-            logger.error("Unhandled Runner API failure", failure)
+            logger.error("Unhandled Runner API failure ({})", failure.javaClass.simpleName)
             call.respond(
                 HttpStatusCode.InternalServerError,
                 ApiErrorResponse("INTERNAL_ERROR", "The Runner could not complete the request."),
             )
         }
     }
+    install(runnerAuthentication(config, security))
 
     routing {
+        if (config.transportMode == TransportMode.PAIRED_HTTPS) pairingRoutes(security)
         route("/v1") {
             get("/health") {
+                call.requirePrincipal(config, security)
                 call.respond(
                     HealthResponse(
                         runnerVersion = "0.1.0-alpha01",
@@ -114,28 +121,34 @@ fun Application.runnerModule(config: RunnerConfig) {
                 )
             }
             post("/jobs") {
+                val principalId = call.requirePrincipal(config, security)
                 if (config.apiV2Enabled) apiUpgradeRequired()
                 val request = call.receive<CreateJobRequest>()
-                call.respond(HttpStatusCode.Accepted, coordinator.create(request))
+                call.respond(HttpStatusCode.Accepted, coordinator.create(request, principalId))
             }
             get("/jobs/{jobId}") {
-                call.respond(coordinator.get(call.requiredJobId()))
+                val principalId = call.requirePrincipal(config, security)
+                call.respond(coordinator.get(call.requiredJobId(), principalId))
             }
             post("/jobs/{jobId}/confirm") {
+                val principalId = call.requirePrincipal(config, security)
                 if (config.apiV2Enabled) apiUpgradeRequired()
                 val request = call.receive<ConfirmJobRequest>()
-                coordinator.confirm(call.requiredJobId(), request)
+                coordinator.confirm(call.requiredJobId(), request, principalId)
                 call.respond(HttpStatusCode.NoContent)
             }
             post("/jobs/{jobId}/cancel") {
-                coordinator.cancel(call.requiredJobId())
+                val principalId = call.requirePrincipal(config, security)
+                coordinator.cancel(call.requiredJobId(), principalId)
                 call.respond(HttpStatusCode.NoContent)
             }
             post("/jobs/{jobId}/retry") {
+                val principalId = call.requirePrincipal(config, security)
                 if (config.apiV2Enabled) apiUpgradeRequired()
-                call.respond(HttpStatusCode.Accepted, coordinator.retry(call.requiredJobId()))
+                call.respond(HttpStatusCode.Accepted, coordinator.retry(call.requiredJobId(), principalId))
             }
             get("/jobs/{jobId}/logs") {
+                val principalId = call.requirePrincipal(config, security)
                 val rawAfterSequence = call.request.queryParameters["afterSequence"]
                 val rawLimit = call.request.queryParameters["limit"]
                 val afterSequence = rawAfterSequence?.toLongOrNull()
@@ -145,27 +158,32 @@ fun Application.runnerModule(config: RunnerConfig) {
                 if (afterSequence < 0 || limit !in 1..500) {
                     invalidLogCursor()
                 }
-                call.respond(coordinator.logs(call.requiredJobId(), afterSequence, limit))
+                call.respond(coordinator.logs(call.requiredJobId(), afterSequence, limit, principalId))
             }
             get("/jobs/{jobId}/artifacts") {
-                call.respond(coordinator.artifacts(call.requiredJobId()))
+                val principalId = call.requirePrincipal(config, security)
+                call.respond(coordinator.artifacts(call.requiredJobId(), principalId))
             }
             get("/jobs/{jobId}/build-environment-manifest") {
-                call.respond(coordinator.buildEnvironmentManifest(call.requiredJobId()))
+                val principalId = call.requirePrincipal(config, security)
+                call.respond(coordinator.buildEnvironmentManifest(call.requiredJobId(), principalId))
             }
             get("/jobs/{jobId}/source-scan") {
-                call.respond(coordinator.sourceScan(call.requiredJobId()))
+                val principalId = call.requirePrincipal(config, security)
+                call.respond(coordinator.sourceScan(call.requiredJobId(), principalId))
             }
             post("/jobs/{jobId}/source-scan/continue") {
+                val principalId = call.requirePrincipal(config, security)
                 if (config.apiV2Enabled) apiUpgradeRequired()
                 val request = call.receive<ContinueSourceScanRequest>()
-                coordinator.continueSourceScan(call.requiredJobId(), request)
+                coordinator.continueSourceScan(call.requiredJobId(), request, principalId)
                 call.respond(HttpStatusCode.NoContent)
             }
             get("/jobs/{jobId}/artifacts/{artifactId}/content") {
+                val principalId = call.requirePrincipal(config, security)
                 val artifactId = call.parameters["artifactId"]?.takeIf(String::isNotBlank)
                     ?: throw ApiException.badRequest("ARTIFACT_ID_REQUIRED", "artifactId is required.")
-                val artifact = coordinator.artifactContent(call.requiredJobId(), artifactId)
+                val artifact = coordinator.artifactContent(call.requiredJobId(), artifactId, principalId)
                 call.response.header(HttpHeaders.ContentType, "application/vnd.android.package-archive")
                 call.response.header(HttpHeaders.ContentLength, artifact.metadata.sizeBytes.toString())
                 call.response.header(HttpHeaders.ETag, "\"${artifact.metadata.sha256}\"")
@@ -176,9 +194,19 @@ fun Application.runnerModule(config: RunnerConfig) {
             storageRetentionV2Routes(
                 storageRetention,
                 genericExecutionEnabled = config.realBuildEnabled && config.buildSandbox == BuildSandboxMode.DOCKER,
+                config = config,
+                security = security,
             )
-            toolchainV2Routes(requireNotNull(toolchains))
-            genericBuildV2Routes(coordinator, store)
+            toolchainV2Routes(requireNotNull(toolchains), config, security)
+            genericBuildV2Routes(coordinator, store, config, security)
+            route("/v2/authentication") {
+                post("/self-revoke") {
+                    val principalId = call.requirePrincipal(config, security)
+                    val body = StrictV2Json.receive(call)
+                    if (body.isNotEmpty()) throw ApiException.badRequest("INVALID_REQUEST", "The request body must be an empty JSON object.")
+                    call.respond(security.selfRevoke(principalId))
+                }
+            }
         }
     }
 }

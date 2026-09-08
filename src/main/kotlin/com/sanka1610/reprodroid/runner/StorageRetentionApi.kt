@@ -18,9 +18,15 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.add
 import java.time.Instant
 
-internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore, genericExecutionEnabled: Boolean = false) {
+internal fun Route.storageRetentionV2Routes(
+    store: StorageRetentionStore,
+    genericExecutionEnabled: Boolean = false,
+    config: RunnerConfig,
+    security: RunnerSecurityStore,
+) {
     route("/v2") {
         get("/capabilities") {
+            call.requirePrincipal(config, security)
             call.respond(
                 V2CapabilitiesResponse(
                     apiVersion = "v2",
@@ -37,60 +43,71 @@ internal fun Route.storageRetentionV2Routes(store: StorageRetentionStore, generi
                             add(V2Capability("generic-build", 1))
                             add(V2Capability("apk-comparison", 1))
                         }
+                        if (config.transportMode == TransportMode.PAIRED_HTTPS) add(V2Capability("runner-authentication", 1))
                     },
                 ),
             )
         }
         get("/operations/{operationId}") {
-            call.respond(store.operation(call.requiredCanonicalUuid("operationId"), LOCAL_PRINCIPAL))
+            val principalId = call.requirePrincipal(config, security)
+            call.respond(store.operation(call.requiredCanonicalUuid("operationId"), principalId))
         }
         get("/storage/summary") {
+            call.requirePrincipal(config, security)
             call.respond(store.storageSummary())
         }
         post("/retention/holds") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireMutationHeaders()
             val command = parseHoldCreate(StrictV2Json.receive(call))
-            call.respondReceipt(store.createHold(LOCAL_PRINCIPAL, key, command))
+            call.respondReceipt(store.createHold(principalId, key, command))
         }
         post("/retention/holds/{holdId}/release") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireMutationHeaders()
             val holdId = call.requiredCanonicalUuid("holdId")
             val request = parseReason(
                 StrictV2Json.receive(call),
                 setOf("REFERENCE_RELEASED", "APP_REMOVED", "COMPARISON_REPLACED"),
             )
-            call.respondReceipt(store.releaseHold(LOCAL_PRINCIPAL, key, holdId, request))
+            call.respondReceipt(store.releaseHold(principalId, key, holdId, request))
         }
         post("/storage/reservations") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireMutationHeaders()
             val command = parseReservationCreate(StrictV2Json.receive(call))
-            call.respondReceipt(store.createReservation(LOCAL_PRINCIPAL, key, command))
+            call.respondReceipt(store.createReservation(principalId, key, command))
         }
         post("/storage/reservations/{reservationId}/release") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireMutationHeaders()
             val reservationId = call.requiredCanonicalUuid("reservationId")
             val request = parseReason(
                 StrictV2Json.receive(call),
                 setOf("OPERATION_CANCELLED", "OPERATION_COMPLETED", "RESERVATION_NOT_NEEDED"),
             )
-            call.respondReceipt(store.releaseReservation(LOCAL_PRINCIPAL, key, reservationId, request))
+            call.respondReceipt(store.releaseReservation(principalId, key, reservationId, request))
         }
         post("/cleanup/previews") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireMutationHeaders()
             val command = parseCleanupPreview(StrictV2Json.receive(call))
-            call.respondReceipt(store.createCleanupPreview(LOCAL_PRINCIPAL, key, command))
+            call.respondReceipt(store.createCleanupPreview(principalId, key, command))
         }
         get("/cleanup/previews/{previewId}") {
-            call.respond(store.cleanupPreview(call.requiredCanonicalUuid("previewId"), LOCAL_PRINCIPAL))
+            val principalId = call.requirePrincipal(config, security)
+            call.respond(store.cleanupPreview(call.requiredCanonicalUuid("previewId"), principalId))
         }
         post("/cleanup/previews/{previewId}/execute") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireMutationHeaders()
             val previewId = call.requiredCanonicalUuid("previewId")
             val command = parseCleanupExecute(StrictV2Json.receive(call))
-            call.respondReceipt(store.executeCleanup(LOCAL_PRINCIPAL, key, previewId, command))
+            call.respondReceipt(store.executeCleanup(principalId, key, previewId, command))
         }
         get("/cleanup/runs/{cleanupRunId}") {
-            call.respond(store.cleanupRun(call.requiredCanonicalUuid("cleanupRunId"), LOCAL_PRINCIPAL))
+            val principalId = call.requirePrincipal(config, security)
+            call.respond(store.cleanupRun(call.requiredCanonicalUuid("cleanupRunId"), principalId))
         }
     }
 }
@@ -281,7 +298,6 @@ internal fun requireCanonicalUuid(value: String, field: String): String {
     return value
 }
 
-private const val LOCAL_PRINCIPAL = "local-development"
 private const val CONTRACT_HEADER = "X-ReproDroid-Contract"
 private const val CONTRACT_VALUE = "storage-retention@1"
 private const val IDEMPOTENCY_HEADER = "Idempotency-Key"

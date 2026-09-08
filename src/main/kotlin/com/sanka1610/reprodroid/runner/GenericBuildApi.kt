@@ -21,9 +21,10 @@ private data class GenericBuildCreateBody(
     val riskAcknowledged: Boolean,
 )
 
-internal fun Route.genericBuildV2Routes(coordinator: JobCoordinator, store: SQLiteJobStore) {
+internal fun Route.genericBuildV2Routes(coordinator: JobCoordinator, store: SQLiteJobStore, config: RunnerConfig, security: RunnerSecurityStore) {
     route("/v2") {
         post("/builds") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireGenericMutationHeaders(GENERIC_BUILD_CONTRACT)
             val bodyObject = StrictV2Json.receive(call)
             val body = decode<GenericBuildCreateBody>(bodyObject.toString())
@@ -39,56 +40,64 @@ internal fun Route.genericBuildV2Routes(coordinator: JobCoordinator, store: SQLi
                 body.genericBuild,
                 key,
                 canonicalSha(bodyObject.toString()),
+                principalId,
             )
             call.respond(if (receipt.existing) HttpStatusCode.OK else HttpStatusCode.Accepted, receipt.response)
         }
         get("/builds/{jobId}") {
-            val response = coordinator.get(call.requiredGenericUuid("jobId"))
+            val principalId = call.requirePrincipal(config, security)
+            val response = coordinator.get(call.requiredGenericUuid("jobId"), principalId)
             val generic = response.genericBuild
                 ?: throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
             call.respond(GenericBuildResponse(response, generic, response.discovery))
         }
         post("/builds/{jobId}:confirm") {
+            val principalId = call.requirePrincipal(config, security)
             call.requireGenericMutationHeaders(GENERIC_BUILD_CONTRACT)
             val body = decode<ConfirmJobRequest>(StrictV2Json.receive(call).toString())
             val jobId = call.requiredGenericUuid("jobId")
-            if (coordinator.get(jobId).genericBuild == null) throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
-            coordinator.confirm(jobId, body)
+            if (coordinator.get(jobId, principalId).genericBuild == null) throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
+            coordinator.confirm(jobId, body, principalId)
             call.respond(HttpStatusCode.NoContent)
         }
         post("/builds/{jobId}:scan-continue") {
+            val principalId = call.requirePrincipal(config, security)
             call.requireGenericMutationHeaders(GENERIC_BUILD_CONTRACT)
             val body = decode<ContinueSourceScanRequest>(StrictV2Json.receive(call).toString())
             val jobId = call.requiredGenericUuid("jobId")
-            if (coordinator.get(jobId).genericBuild == null) throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
-            coordinator.continueSourceScan(jobId, body)
+            if (coordinator.get(jobId, principalId).genericBuild == null) throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
+            coordinator.continueSourceScan(jobId, body, principalId)
             call.respond(HttpStatusCode.NoContent)
         }
         post("/builds/{jobId}:cancel") {
+            val principalId = call.requirePrincipal(config, security)
             call.requireGenericMutationHeaders(GENERIC_BUILD_CONTRACT)
             val body = StrictV2Json.receive(call)
             if (body.isNotEmpty()) throw ApiException.badRequest("INVALID_REQUEST", "The cancel body must be an empty JSON object.")
             val jobId = call.requiredGenericUuid("jobId")
-            if (coordinator.get(jobId).genericBuild == null) throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
-            coordinator.cancel(jobId)
+            if (coordinator.get(jobId, principalId).genericBuild == null) throw ApiException.notFound("GENERIC_BUILD_NOT_FOUND", "The requested Job is not a generic build.")
+            coordinator.cancel(jobId, principalId)
             call.respond(HttpStatusCode.NoContent)
         }
         post("/comparisons") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireGenericMutationHeaders(APK_COMPARISON_CONTRACT)
             val bodyObject = StrictV2Json.receive(call)
             val request = decode<CreateGenericComparisonRequest>(bodyObject.toString())
-            val receipt = store.createGenericComparison(request, key, canonicalSha(bodyObject.toString()))
+            val receipt = store.createGenericComparison(request, key, canonicalSha(bodyObject.toString()), principalId)
             call.respond(if (receipt.existing) HttpStatusCode.OK else HttpStatusCode.Accepted, receipt.response)
         }
         get("/comparisons/{comparisonId}") {
-            call.respond(store.genericComparison(call.requiredGenericUuid("comparisonId")))
+            val principalId = call.requirePrincipal(config, security)
+            call.respond(store.genericComparison(call.requiredGenericUuid("comparisonId"), principalId))
         }
         post("/comparisons/{comparisonId}:retry-resource") {
+            val principalId = call.requirePrincipal(config, security)
             val key = call.requireGenericMutationHeaders(APK_COMPARISON_CONTRACT)
             val body = StrictV2Json.receive(call)
             if (body.isNotEmpty()) throw ApiException.badRequest("INVALID_REQUEST", "The retry body must be an empty JSON object.")
             val comparisonId = call.requiredGenericUuid("comparisonId")
-            val receipt = coordinator.retryGenericResources(comparisonId, key, canonicalSha(body.toString()))
+            val receipt = coordinator.retryGenericResources(comparisonId, key, canonicalSha(body.toString()), principalId)
             call.respond(if (receipt.existing) HttpStatusCode.OK else HttpStatusCode.Accepted, receipt.response)
         }
     }
