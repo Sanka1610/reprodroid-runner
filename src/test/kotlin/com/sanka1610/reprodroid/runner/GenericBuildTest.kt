@@ -52,12 +52,23 @@ class GenericBuildTest {
             ),
             UUID.randomUUID().toString(),
             "b".repeat(64),
+            SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
         ).response
         assertEquals(0, comparison.resourceRetryCount)
 
         val key = UUID.randomUUID().toString()
-        val first = store.createGenericResourceRetry(comparisonId, key, "c".repeat(64))
-        val second = store.createGenericResourceRetry(comparisonId, key, "c".repeat(64))
+        val first = store.createGenericResourceRetry(
+            comparisonId,
+            key,
+            "c".repeat(64),
+            SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
+        )
+        val second = store.createGenericResourceRetry(
+            comparisonId,
+            key,
+            "c".repeat(64),
+            SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
+        )
 
         assertTrue(!first.existing)
         assertTrue(second.existing)
@@ -96,6 +107,7 @@ class GenericBuildTest {
                 ),
                 UUID.randomUUID().toString(),
                 "d".repeat(64),
+                SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
             )
         }.exceptionOrNull()
         assertTrue(failure is ApiException, failure.toString())
@@ -126,6 +138,7 @@ class GenericBuildTest {
             ),
             UUID.randomUUID().toString(),
             "e".repeat(64),
+            SQLiteJobStore.LOCAL_DEVELOPMENT_PRINCIPAL,
         ).response
     }
 
