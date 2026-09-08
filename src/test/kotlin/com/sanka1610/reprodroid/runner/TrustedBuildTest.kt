@@ -265,6 +265,30 @@ class TrustedBuildTest {
     }
 
     @Test
+    fun `API 37 SDK validation requires the exact 37 point 0 package directory`() {
+        val sdkRoot = stateDirectory.resolve("sdk").also(Path::createDirectories)
+        val legacyPlatform = sdkRoot.resolve("platforms/android-37").also(Path::createDirectories)
+        Files.writeString(legacyPlatform.resolve("android.jar"), "android")
+        val buildTools = sdkRoot.resolve("build-tools/37.0.0").also(Path::createDirectories)
+        val aapt2 = buildTools.resolve("aapt2")
+        Files.writeString(aapt2, "aapt2")
+        assertTrue(aapt2.toFile().setExecutable(true))
+        val recipe = defaultRecipe().copy(androidSdkApiLevel = 37, buildToolsVersion = "37.0.0")
+
+        val missingExactPackage = assertThrows(TrustedBuildFailure::class.java) {
+            validateAndroidSdkEnvironment(mapOf("ANDROID_SDK_ROOT" to sdkRoot.toString()), recipe)
+        }
+        assertEquals("ANDROID_SDK_PLATFORM_INVALID", missingExactPackage.code)
+
+        val exactPlatform = sdkRoot.resolve("platforms/android-37.0").also(Path::createDirectories)
+        Files.writeString(exactPlatform.resolve("android.jar"), "android")
+        val validated = validateAndroidSdkEnvironment(mapOf("ANDROID_SDK_ROOT" to sdkRoot.toString()), recipe)
+
+        assertEquals(37, validated.apiLevel)
+        assertEquals("37.0.0", validated.buildToolsVersion)
+    }
+
+    @Test
     fun `new recipe defaults to lockfile offline`() {
         val recipe = BuildRecipe(
             id = "fixture",

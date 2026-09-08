@@ -330,7 +330,7 @@ internal class ToolchainInstaller(
 
     private fun validateMetadata(artifact: ToolchainCatalogArtifact, root: Path) {
         val required = when (artifact.component) {
-            ToolchainComponent.JDK -> listOf("bin/java", "release")
+            ToolchainComponent.JDK -> listOf("bin/java", "release", "lib/jspawnhelper")
             ToolchainComponent.GRADLE -> listOf("bin/gradle", "lib")
             ToolchainComponent.ANDROID_COMMAND_LINE_TOOLS -> listOf("bin/sdkmanager", "source.properties")
             ToolchainComponent.ANDROID_PLATFORM -> listOf("android.jar", "source.properties")
@@ -340,6 +340,15 @@ internal class ToolchainInstaller(
         }
         if (required.any { !root.resolve(it).exists(LinkOption.NOFOLLOW_LINKS) }) {
             throw ToolchainInstallFailure("TOOLCHAIN_METADATA_INVALID", "Extracted ${artifact.artifactId} does not match its catalog component.")
+        }
+        if (
+            artifact.component == ToolchainComponent.JDK &&
+            (
+                !root.resolve("lib").isDirectory(LinkOption.NOFOLLOW_LINKS) ||
+                    !root.resolve("lib/jspawnhelper").isRegularFile(LinkOption.NOFOLLOW_LINKS)
+                )
+        ) {
+            throw ToolchainInstallFailure("TOOLCHAIN_METADATA_INVALID", "Extracted ${artifact.artifactId} does not contain a safe JDK process helper.")
         }
     }
 
@@ -371,7 +380,11 @@ internal class ToolchainInstaller(
 
     private fun restoreExecutableEntries(component: ToolchainComponent, root: Path) {
         val executableRoots = when (component) {
-            ToolchainComponent.JDK,
+            ToolchainComponent.JDK -> buildList {
+                add(root.resolve("bin"))
+                val lib = root.resolve("lib")
+                if (lib.isDirectory(LinkOption.NOFOLLOW_LINKS)) add(lib.resolve("jspawnhelper"))
+            }
             ToolchainComponent.GRADLE,
             ToolchainComponent.ANDROID_COMMAND_LINE_TOOLS,
             ToolchainComponent.CMAKE,

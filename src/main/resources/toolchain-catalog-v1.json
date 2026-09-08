@@ -117,7 +117,7 @@
       "archiveSizeBytes": "67281901",
       "maximumExpandedBytes": "268435456",
       "maximumEntries": 20000,
-      "installSubdirectory": "android/platforms/android-37",
+      "installSubdirectory": "android/platforms/android-37.0",
       "licenseId": "android-sdk-license"
     },
     {

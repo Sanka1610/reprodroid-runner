@@ -29,6 +29,10 @@ class ToolchainApiTest {
         assertEquals(9, catalog.artifacts.size)
         assertTrue(catalog.catalogSha256.matches(Regex("[0-9a-f]{64}")))
         assertTrue(catalog.artifacts.all { it.archiveSha256.matches(Regex("[0-9a-f]{64}")) && it.archiveSha256.toSet() != setOf('0') })
+        assertEquals(
+            "android/platforms/android-37.0",
+            catalog.artifacts.single { it.artifactId == "android-platform-37.0-r02" }.installSubdirectory,
+        )
 
         val response = client.post("/v2/toolchains/plans:resolve") {
             contentType(ContentType.Application.Json)

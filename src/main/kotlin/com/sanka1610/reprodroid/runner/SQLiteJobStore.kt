@@ -269,7 +269,11 @@ class SQLiteJobStore(
         val required = listOf(
             Triple("JDK", "21.0.12+1", "toolchains/jdk/21.0.12+1"),
             Triple("GRADLE", configuration.gradleVersion, "toolchains/gradle/${configuration.gradleVersion}"),
-            Triple("ANDROID_PLATFORM", if (configuration.compileSdk == 36) "36-r02" else "37.0-r02", "toolchains/android/platforms/android-${configuration.compileSdk}"),
+            Triple(
+                "ANDROID_PLATFORM",
+                if (configuration.compileSdk == 36) "36-r02" else "37.0-r02",
+                "toolchains/android/platforms/${androidPlatformDirectoryName(configuration.compileSdk)}",
+            ),
             Triple("ANDROID_BUILD_TOOLS", configuration.buildToolsVersion, "toolchains/android/build-tools/${configuration.buildToolsVersion}"),
         )
         connection().use { connection ->

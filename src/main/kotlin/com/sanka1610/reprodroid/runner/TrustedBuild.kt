@@ -1005,7 +1005,7 @@ internal fun validateAndroidSdkEnvironment(
             "The configured Android SDK root is not a non-symlink directory.",
         )
     }
-    val platformDirectory = sdkRoot.resolve("platforms/android-${recipe.androidSdkApiLevel}").normalize()
+    val platformDirectory = sdkRoot.resolve("platforms/${androidPlatformDirectoryName(recipe.androidSdkApiLevel)}").normalize()
     val androidJar = platformDirectory.resolve("android.jar").normalize()
     val buildToolsDirectory = sdkRoot.resolve("build-tools/${recipe.buildToolsVersion}").normalize()
     val aapt2 = buildToolsDirectory.resolve("aapt2").normalize()

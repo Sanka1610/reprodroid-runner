@@ -253,7 +253,7 @@ internal class DockerBuildExecutor(
             test "$(id -g)" = 1000
             cat /proc/self/status
             /opt/jdk/bin/java -Duser.home=/home/ubuntu -XshowSettings:properties -version
-            test -r /opt/android-sdk/platforms/android-${recipe.androidSdkApiLevel}/android.jar
+            test -r /opt/android-sdk/platforms/${androidPlatformDirectoryName(recipe.androidSdkApiLevel)}/android.jar
             /opt/android-sdk/build-tools/${recipe.buildToolsVersion}/aapt2 version
         """.trimIndent()
         if (!generic) return base

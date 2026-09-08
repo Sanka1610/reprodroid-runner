@@ -46,6 +46,102 @@ class ToolchainInstallerTest {
     }
 
     @Test
+    fun `jdk process helper is executable and covered by the content manifest`() {
+        val archive = stateDirectory.resolve("jdk-fixture.zip")
+        zip(
+            archive,
+            mapOf(
+                "jdk-fixture/bin/java" to "#!/bin/sh\n",
+                "jdk-fixture/release" to "JAVA_VERSION=fixture\n",
+                "jdk-fixture/lib/jspawnhelper" to "helper",
+                "jdk-fixture/lib/marker" to "not executable",
+            ),
+        )
+        val installer = installerFor(archive)
+
+        val installed = installer.install(UUID.randomUUID().toString(), jdkArtifact(archive), { false }) { _, _ -> }
+
+        val final = stateDirectory.resolve(installed.relativePath)
+        val java = final.resolve("bin/java")
+        val helper = final.resolve("lib/jspawnhelper")
+        val marker = final.resolve("lib/marker")
+        assertTrue(Files.isExecutable(java))
+        assertTrue(Files.isExecutable(helper))
+        assertFalse(Files.isExecutable(marker))
+        assertFalse(Files.isWritable(java))
+        assertFalse(Files.isWritable(helper))
+        assertFalse(Files.isWritable(marker))
+        assertTrue(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+
+        helper.toFile().setExecutable(false, false)
+
+        assertFalse(installer.verifyInstalled(installed.relativePath, installed.contentManifestSha256))
+    }
+
+    @Test
+    fun `jdk missing process helper is rejected before final publish`() {
+        val archive = stateDirectory.resolve("jdk-missing-helper.zip")
+        zip(
+            archive,
+            mapOf(
+                "jdk-fixture/bin/java" to "#!/bin/sh\n",
+                "jdk-fixture/release" to "JAVA_VERSION=fixture\n",
+            ),
+        )
+
+        val failure = assertThrows(ToolchainInstallFailure::class.java) {
+            installerFor(archive).install(UUID.randomUUID().toString(), jdkArtifact(archive), { false }) { _, _ -> }
+        }
+
+        assertEquals("TOOLCHAIN_METADATA_INVALID", failure.code)
+        assertFalse(Files.exists(stateDirectory.resolve("toolchains/jdk/fixture")))
+    }
+
+    @Test
+    fun `jdk process helper symlink is rejected before final publish`() {
+        val payload = jdkTarPayload("jdk-helper-link")
+        Files.writeString(payload.resolve("lib/helper-target"), "helper")
+        Files.createSymbolicLink(payload.resolve("lib/jspawnhelper"), Path.of("helper-target"))
+        val archive = stateDirectory.resolve("jdk-helper-link.tar.gz")
+        tarGz(payload, archive)
+
+        val failure = assertThrows(ToolchainInstallFailure::class.java) {
+            installerFor(archive).install(
+                UUID.randomUUID().toString(),
+                jdkArtifact(archive).copy(archiveType = ToolchainArchiveType.TAR_GZ),
+                { false },
+            ) { _, _ -> }
+        }
+
+        assertEquals("TOOLCHAIN_METADATA_INVALID", failure.code)
+        assertFalse(Files.exists(stateDirectory.resolve("toolchains/jdk/fixture")))
+    }
+
+    @Test
+    fun `jdk lib directory symlink is rejected before final publish`() {
+        val payload = stateDirectory.resolve("jdk-lib-link/jdk-fixture")
+        Files.createDirectories(payload.resolve("bin"))
+        Files.createDirectories(payload.resolve("real-lib"))
+        Files.writeString(payload.resolve("bin/java"), "#!/bin/sh\n")
+        Files.writeString(payload.resolve("release"), "JAVA_VERSION=fixture\n")
+        Files.writeString(payload.resolve("real-lib/jspawnhelper"), "helper")
+        Files.createSymbolicLink(payload.resolve("lib"), Path.of("real-lib"))
+        val archive = stateDirectory.resolve("jdk-lib-link.tar.gz")
+        tarGz(payload, archive)
+
+        val failure = assertThrows(ToolchainInstallFailure::class.java) {
+            installerFor(archive).install(
+                UUID.randomUUID().toString(),
+                jdkArtifact(archive).copy(archiveType = ToolchainArchiveType.TAR_GZ),
+                { false },
+            ) { _, _ -> }
+        }
+
+        assertEquals("TOOLCHAIN_METADATA_INVALID", failure.code)
+        assertFalse(Files.exists(stateDirectory.resolve("toolchains/jdk/fixture")))
+    }
+
+    @Test
     fun `zip traversal is rejected before final publish`() {
         val archive = stateDirectory.resolve("escape.zip")
         zip(archive, mapOf("../escape" to "bad", "gradle-fixture/bin/gradle" to "x", "gradle-fixture/lib/marker" to "x"))
@@ -149,6 +245,30 @@ class ToolchainInstallerTest {
         installSubdirectory = "gradle/fixture",
         licenseId = "gradle-apache-2.0",
     )
+
+    private fun jdkArtifact(archive: Path) = artifact(archive).copy(
+        artifactId = "jdk-fixture",
+        component = ToolchainComponent.JDK,
+        url = "https://github.com/adoptium/fixture.zip",
+        installSubdirectory = "jdk/fixture",
+        licenseId = "jdk-gpl-2.0-with-classpath-exception",
+    )
+
+    private fun jdkTarPayload(directory: String): Path {
+        val payload = stateDirectory.resolve("$directory/jdk-fixture")
+        Files.createDirectories(payload.resolve("bin"))
+        Files.createDirectories(payload.resolve("lib"))
+        Files.writeString(payload.resolve("bin/java"), "#!/bin/sh\n")
+        Files.writeString(payload.resolve("release"), "JAVA_VERSION=fixture\n")
+        return payload
+    }
+
+    private fun tarGz(payload: Path, archive: Path) {
+        val result = ProcessBuilder("tar", "-C", payload.parent.toString(), "-czf", archive.toString(), payload.fileName.toString())
+            .redirectErrorStream(true)
+            .start()
+        assertEquals(0, result.waitFor(), result.inputStream.bufferedReader().readText())
+    }
 
     private fun zip(path: Path, entries: Map<String, String>) {
         ZipOutputStream(Files.newOutputStream(path)).use { output ->

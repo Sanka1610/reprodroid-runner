@@ -186,6 +186,12 @@ class GenericBuildTest {
         buildToolsVersion = "36.0.0",
     )
 
+    @Test
+    fun `Android API 37 uses the SDK package directory advertised by its metadata`() {
+        assertEquals("android-36", androidPlatformDirectoryName(36))
+        assertEquals("android-37.0", androidPlatformDirectoryName(37))
+    }
+
     private fun installManagedToolchainFixture() {
         listOf(
             Triple("toolchains/jdk/21.0.12+1", "toolchains/jdk/21.0.12+1", "JDK" to "21.0.12+1"),

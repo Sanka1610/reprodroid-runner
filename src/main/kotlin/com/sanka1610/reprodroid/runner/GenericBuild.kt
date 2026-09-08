@@ -125,6 +125,11 @@ internal data class ManagedToolchains(
     val androidSdkRoot: Path,
 )
 
+internal fun androidPlatformDirectoryName(apiLevel: Int): String = when (apiLevel) {
+    37 -> "android-37.0"
+    else -> "android-$apiLevel"
+}
+
 internal object GenericBuildContract {
     private val json = Json { ignoreUnknownKeys = false; explicitNulls = true; encodeDefaults = true }
     private val sha256Pattern = Regex("[0-9a-f]{64}")
