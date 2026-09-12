@@ -152,8 +152,8 @@ internal class WrapperVerifier(
         }
         val distributionUrl = properties.getProperty("distributionUrl")
             ?: throw TrustedBuildFailure("WRAPPER_DISTRIBUTION_URL_MISSING", "distributionUrl is missing.")
-        validateDistributionUrl(distributionUrl, recipe)
-        val officialDistribution = checksumSource.distributionChecksum(recipe.gradleVersion, recipe.distributionType)
+        val sourceDistributionType = validateDistributionUrl(distributionUrl, recipe)
+        val officialDistribution = checksumSource.distributionChecksum(recipe.gradleVersion, sourceDistributionType)
         val repositoryChecksum = properties.getProperty("distributionSha256Sum")?.trim()?.lowercase()
         val checksumSourceLabel = if (repositoryChecksum == null) {
             if (!recipe.allowRunnerSuppliedDistributionChecksum) {
@@ -212,22 +212,33 @@ internal class WrapperVerifier(
         }
     }
 
-    private fun validateDistributionUrl(distributionUrl: String, recipe: BuildRecipe) {
+    private fun validateDistributionUrl(distributionUrl: String, recipe: BuildRecipe): String {
         val uri = runCatching { URI(distributionUrl) }.getOrNull()
             ?: throw TrustedBuildFailure("INVALID_DISTRIBUTION_URL", "distributionUrl is not a valid URI.")
-        val expectedPath = "/distributions/gradle-${recipe.gradleVersion}-${recipe.distributionType}.zip"
+        // Managed generic builds execute the catalog-mounted GradleMain rather than the source wrapper.
+        // The source wrapper remains provenance and may name either official Gradle distribution flavor.
+        val allowedDistributionTypes = if (recipe.managedToolchains) {
+            MANAGED_WRAPPER_DISTRIBUTION_TYPES
+        } else {
+            setOf(recipe.distributionType)
+        }
+        val distributionType = allowedDistributionTypes.singleOrNull { type ->
+            uri.path == "/distributions/gradle-${recipe.gradleVersion}-$type.zip"
+        }
         if (
             uri.scheme?.lowercase() != "https" ||
             uri.host?.lowercase() !in OFFICIAL_GRADLE_HOSTS ||
             uri.userInfo != null || uri.port != -1 || uri.query != null || uri.fragment != null ||
-            uri.path != expectedPath
+            distributionType == null
         ) {
             throw TrustedBuildFailure("INVALID_DISTRIBUTION_URL", "distributionUrl does not match the fixed Gradle recipe.")
         }
+        return distributionType
     }
 
     private companion object {
         val OFFICIAL_GRADLE_HOSTS = setOf("services.gradle.org", "downloads.gradle.org")
+        val MANAGED_WRAPPER_DISTRIBUTION_TYPES = setOf("bin", "all")
     }
 }
 

@@ -151,6 +151,70 @@ class TrustedBuildTest {
     }
 
     @Test
+    fun `managed generic wrapper accepts official all distribution provenance`() = runBlocking {
+        val buildRoot = stateDirectory.resolve("managed-project").also(Path::createDirectories)
+        val wrapperDirectory = buildRoot.resolve("gradle/wrapper").also(Path::createDirectories)
+        val wrapperJar = wrapperDirectory.resolve("gradle-wrapper.jar")
+        Files.writeString(wrapperJar, "official wrapper")
+        val distributionChecksum = "c".repeat(64)
+        Files.writeString(
+            wrapperDirectory.resolve("gradle-wrapper.properties"),
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.6.1-all.zip\n" +
+                "distributionSha256Sum=$distributionChecksum\n",
+        )
+        var requestedDistributionType: String? = null
+        val verifier = WrapperVerifier(
+            object : GradleChecksumSource {
+                override fun distributionChecksum(gradleVersion: String, distributionType: String): String {
+                    requestedDistributionType = distributionType
+                    return distributionChecksum
+                }
+
+                override fun wrapperJarChecksum(gradleVersion: String) = sha256(wrapperJar)
+            },
+        )
+        val managedRecipe = defaultRecipe().copy(
+            gradleVersion = "9.6.1",
+            distributionType = "bin",
+            wrapperJarGradleVersion = "9.6.1",
+            managedToolchains = true,
+        )
+
+        val verification = verifier.verifyAndHarden(buildRoot, managedRecipe)
+
+        assertEquals("all", requestedDistributionType)
+        assertEquals(distributionChecksum, verification.distributionSha256)
+        assertEquals("REPOSITORY", verification.distributionChecksumSource)
+    }
+
+    @Test
+    fun `fixed wrapper recipe still rejects alternate distribution flavor`() = runBlocking {
+        val buildRoot = stateDirectory.resolve("fixed-project").also(Path::createDirectories)
+        val wrapperDirectory = buildRoot.resolve("gradle/wrapper").also(Path::createDirectories)
+        Files.writeString(wrapperDirectory.resolve("gradle-wrapper.jar"), "official wrapper")
+        Files.writeString(
+            wrapperDirectory.resolve("gradle-wrapper.properties"),
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.3-all.zip\n" +
+                "distributionSha256Sum=${"a".repeat(64)}\n",
+        )
+        val verifier = WrapperVerifier(
+            object : GradleChecksumSource {
+                override fun distributionChecksum(gradleVersion: String, distributionType: String) = "a".repeat(64)
+                override fun wrapperJarChecksum(gradleVersion: String) = "b".repeat(64)
+            },
+        )
+
+        val failure = try {
+            verifier.verifyAndHarden(buildRoot, defaultRecipe())
+            throw AssertionError("TrustedBuildFailure was expected")
+        } catch (failure: TrustedBuildFailure) {
+            failure
+        }
+
+        assertEquals("INVALID_DISTRIBUTION_URL", failure.code)
+    }
+
+    @Test
     fun `wrapper checksum hardening cannot be absorbed by a trailing continuation`() = runBlocking {
         val buildRoot = stateDirectory.resolve("project").also(Path::createDirectories)
         val wrapperDirectory = buildRoot.resolve("gradle/wrapper").also(Path::createDirectories)
