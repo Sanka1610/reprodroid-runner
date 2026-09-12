@@ -99,7 +99,11 @@ internal class DockerBuildExecutor(
                 }
             }
             val probeTimeout = recipe.discoveryTimeout ?: Duration.ofSeconds(60)
-            val probe = control.command(listOf("container", "start", "--attach", requireNotNull(preflight.containerId)), probeTimeout)
+            val probe = control.command(
+                listOf("container", "start", "--attach", requireNotNull(preflight.containerId)),
+                probeTimeout,
+                if (job.genericBuild != null) 8 * 1024 * 1024 else 65_536,
+            )
             val probeState = inspection.inspect(preflight.containerId).getValue("State").jsonObject
             require(!probeState.boolean("Running") && probeState.number("ExitCode") == 0L && !probeState.boolean("OOMKilled"))
             val measuredJava = PublicJavaRuntime(property(probe, "java.version"), property(probe, "java.vendor"))
