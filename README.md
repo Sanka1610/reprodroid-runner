@@ -1,5 +1,7 @@
 # ReproDroid Runner
 
+**Phase 4.8実装・受入作業中（2026-09-12）:** bounded Runner／Job log export、SQLite8→12 migration回帰、固定unsigned CI、配布archive、SBOM、license監査を実装し、全JVM 234件中218件実行・16件明示opt-in skip・failure／error 0を再確認しました。最終Docker製品経路、統合sourceからのarchive再生成、checksum／来歴照合が完了するまではPhase 4.8完了とは扱いません。push、`main`統合、公開は行いません。契約は[Phase 4.8 release hardening](../reprodroid-project/docs/design/phase-4-release-hardening-contract.md)です。
+
 **Phase 4.7実装・製品受入完了（2026-09-09）:** public `github.com`／`codeberg.org`だけの閉じたsource registryと`codeberg-source@1`をSQLite12／API v2へ追加しました。JDK導入時は`bin/java`と`release`に加えて非symlink regular fileの`lib/jspawnhelper`を必須化し、`bin/*`とhelperだけの実行bitを復元・content manifestへ束縛します。API 37の正規SDK package directoryはcatalog、inventory、host／Docker preflightで`android-37.0`へ統一し、旧`android-37`や自動SDK導入へfallbackしません。新規Jobは`docker-generic-v2`の分離tmpfs（`/tmp` 960 MiB `noexec`、`/run/reprodroid-native` 64 MiB `exec`）を使用し、SQLiteの並行ログ追記はWALを導入せず`IMMEDIATE` transactionで直列化します。Runner全JVMは217件、failure／error 0、明示opt-in skip 16件です。製品UIからの負経路では固定Wrapper不一致、source scan上限、旧SDK配置不一致をfail closedに拒否し、artifactを受入しないことを確認しました。修正後の`qwerty287/ftpclient`独立Build A／Bは成功し、Androidがraw三軸をOfficial vs A `DIFFERENT`、Official vs B `DIFFERENT`、A vs B `MATCH`として保存・表示しました。[Phase 4.7実装記録](../reprodroid-project/reports/2026/09/2026-09-08-phase-4-7-implementation.md)を参照してください。
 
 **Phase 4.6実装・受入完了（2026-09-08）:** exclusive development HTTP／paired HTTPS、Runner-local P-256 CAとrenewable leaf、root SPKI pin、local CLI承認／失効、Android生成Bearerのhash保存、全通常API認証、明示LAN、legacy principalのpreview付きatomic adoption、verified SQLite12 migrationを実装しました。Runner全197件中、既存Docker環境gate 16件をskipし181件がPASS、failure／error 0です。実TLS／CLI 26観測、ADB reverseのAndroid pairing／失効、同一root leaf更新、root交換後の旧client拒否・再pair、task-key署名release、ADB reverseなしのAndroid 16 emulator private-host `10.0.2.2:8443`におけるallow／deny／revoke／re-grantもPASSです。RC46は44 PASS／0 PARTIAL／0 NOT_RUNで、firewall／routerは変更していません。QR／camera／Play servicesは追加していません。[実装記録](../reprodroid-project/reports/2026/09/2026-09-08-phase-4-6-implementation.md)を参照してください。
@@ -245,9 +247,10 @@ Phase 3Dは`GET /v1/jobs/{jobId}`へcompact `sourceScan` summaryを加え、`GET
 | `REPRODROID_ENABLE_REAL_BUILDS` | `false` | `REAL_TRUSTED`ホスト実行の危険受容 |
 | `REPRODROID_ENABLE_API_V2` | `false` | loopback限定のdevelopment API v2 storage-retention |
 | `REPRODROID_JDK_18_HOME` | なし | MicroG-RE `6.1.4` release profile専用JDK 18 |
-| `REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK` | `false` | 非loopback bindの危険受容 |
+| `REPRODROID_TRANSPORT_MODE` | `DEVELOPMENT_HTTP` | 排他的な`DEVELOPMENT_HTTP`または`PAIRED_HTTPS` |
+| `REPRODROID_ADVERTISED_ENDPOINT` | なし | paired modeで証明書とmanual pairingへ束縛する正確なHTTPS origin |
 
-非loopbackへbindする場合は`REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`による明示的な危険受容が必要です。認証は未実装であるため、通常の利用では指定しないでください。
+`DEVELOPMENT_HTTP`は正確なloopback bindだけを受け付けます。LAN接続には`PAIRED_HTTPS`、初期化済みRunner-local CA、正確なadvertised endpoint、Android側の明示的なprivate-host許可が必要です。旧`REPRODROID_ALLOW_UNAUTHENTICATED_NON_LOOPBACK`は受け付けず、設定失敗時にHTTPへfallbackしません。
 
 Androidからは開発用のADB reverseを使用します。
 
@@ -255,7 +258,7 @@ Androidからは開発用のADB reverseを使用します。
 adb reverse tcp:8080 tcp:8080
 ```
 
-認証機構を実装するまでは、無認証HTTPをLANへデフォルト公開しません。非loopback bindを用意する場合も、明示設定と警告を必須にします。
+ADB reverseの開発接続はloopback限定の無認証HTTPです。配布運用では下記のpaired HTTPS手順を使用し、ADB reverseの有無を認証済み接続の証拠にしません。
 
 ## 環境構築
 
@@ -324,6 +327,21 @@ build/install/reprodroid-runner/bin/reprodroid-runner
 鍵は専用`security`ディレクトリ内でowner-onlyに保管し、root／leafの不整合や欠損はfail closedで止めます。同じrootのleaf更新は期限7日前から自動で行い、新規TLS接続へ適用します。Androidのlocal-deleteとRunnerでの失効は別操作です。再pairは新principalを作り、旧所有権・RCE同意・scan review・trust・install権限を自動継承しません。
 
 暗号ライブラリのlicenseと配布時のnoticeは[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)を参照してください。QR生成／scan、CAMERA permission、Google Play services、LAN管理APIは追加しません。
+
+## Phase 4.8 Runner／Jobログのローカルexport
+
+Runner自身の運用ログは、指定したstate directory直下の`runner.log`へUTF-8で追記し、console出力も維持します。ファイルはサイズ・日付でrotationされ、保持量は約4 MiBにboundedです。ログメッセージにはtoken、key、passphrase、pairing secret、credential envelope、秘密HTTP headerを記録しません。ただし、実ビルドのstdout／stderrはJobログとして別に保存されるため、build scriptが出力した秘密や絶対pathまで自動的にredactされるとは限りません。
+
+配布物または外部送信へ直接ログを追加するHTTP routeはありません。Runnerを実行している同じlocal principalだけが、明示した出力ファイルへatomicにexportできます。
+
+```bash
+build/install/reprodroid-runner/bin/reprodroid-runner runner-log-export /absolute/path/to/runner-log.txt
+build/install/reprodroid-runner/bin/reprodroid-runner job-log-export <jobId> /absolute/path/to/job-log.txt
+```
+
+`runner-log-export`は現行ログと安全に検査できるrotation済みログを時系列でまとめます。`job-log-export`は指定Jobの保存済みログ索引を読み、Job ownerが`local-development`でない場合は拒否します。どちらも出力先の親directoryが既存・non-symlinkであること、出力先が未作成であることを要求し、既存ファイル、symbolic link、pathの途中にあるsymbolic linkを拒否します。Runnerが読み書きするのは固定したstate内のログと、利用者が明示した安全な出力先だけです。出力はUTF-8 textで、headerに対象、生成時刻、sequence／時間範囲、欠損、truncated状態、秘密を含む可能性がある旨を記載します。1回のexportはheaderを含めて32 MiB以下で、上限を超える未出力部分は`truncated=true`として明示します。欠損したJobログはエラーにせず、headerの`missing=true`と利用不能理由を含むboundedなexportになります。
+
+この機能はRunnerの既存JobログAPI／認証・owner検査を再利用するlocal操作です。paired Android向けの新しいv2 capability／APIは追加せず、Androidが必要とする既存のJob APIとの責務境界を維持します。`LICENSE`と`THIRD_PARTY_LICENSES.md`はdistribution archiveへ同梱されますが、正確なresolved dependency graphとnative bundle noticeの確認は各releaseのCI gateです。
 
 ## Phase 4.6実装後のRunner境界・対象外
 
