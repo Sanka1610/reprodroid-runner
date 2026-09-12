@@ -17,6 +17,7 @@ ReproDroid AndroidアプリからJobを受け、source取得、検査、許可�
 - API v1のJob作成、確認、ログ、cancel／retry、artifact metadata／download
 - SQLite12によるJob、監査、artifact、operation、principalの永続化
 - allowlistされた固定recipeと、Docker限定generic build
+- 解決済みcommitだけを返す限定`git rev-parse` shimを備えた`docker-generic-v3`
 - Build Environment Manifestのredacted public projection
 - dependency pinning、determinism、pre-build source scan、digest-bound review
 - managed toolchain catalog、検証、導入、inventory、manual removal
@@ -49,6 +50,7 @@ Gradle build scriptとpluginは任意コードを実行できます。Wrapperや
 - repositoryとrevisionを組にしたallowlist、または制限されたgeneric build contractを要求
 - Jobごとに解決済みcommitとRCEリスクの明示確認を要求
 - generic buildはDocker必須でHOST fallbackなし
+- `docker-generic-v3`のGit互換shimはdetached HEAD確認に必要な3形式だけを受け付け、その他のGit操作を拒否
 - Docker socket、DinD、privileged、host network、任意image／mountを許可しない
 - Runnerのprivate keyをbuild workspace／container／Androidへ渡さない
 - Runnerの`SUCCEEDED`をAPKの再現性、trust、install eligibilityとして扱わない
