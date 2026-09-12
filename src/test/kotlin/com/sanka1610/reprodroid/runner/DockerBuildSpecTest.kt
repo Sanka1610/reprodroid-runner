@@ -90,6 +90,56 @@ class DockerBuildSpecTest {
         assertTrue(arguments.windowed(2).contains(listOf("--env", "JAVA_TOOL_OPTIONS=${profile.sqliteNativeJvmOption}")))
     }
 
+    @Test fun `generic v3 adds only the detached Git shim directory to the v2 environment`() {
+        val v2 = GenericDockerSandboxProfile()
+        val v3 = DetachedGitGenericDockerSandboxProfile()
+        assertEquals(v2.tmpfsPolicies(), v3.tmpfsPolicies())
+        assertEquals(v2.containerEnvironment().filterKeys { it != "PATH" }, v3.containerEnvironment().filterKeys { it != "PATH" })
+        assertEquals(
+            "/opt/jdk/bin:/opt/gradle/bin:/run/reprodroid-native:/usr/bin:/bin",
+            v3.containerEnvironment().getValue("PATH"),
+        )
+        assertEquals("/run/reprodroid-native/git", v3.detachedGitShimPath)
+        assertEquals("detached-rev-parse-v1", v3.detachedGitCommandSet)
+    }
+
+    @Test fun `generic v3 build command provides only detached revision metadata`() {
+        val commit = "a".repeat(40)
+        val profile = DetachedGitGenericDockerSandboxProfile()
+        val recipe = BuildRecipeRegistry.defaultRecipes.first().copy(tasks = listOf(":app:assembleRelease"))
+        val job = StoredJob(
+            jobId = "job",
+            principalId = "principal",
+            executionMode = ExecutionMode.REAL_TRUSTED,
+            repositoryUrl = recipe.repositoryUrl,
+            revision = recipe.revision,
+            simulationOutcome = null,
+            resolvedCommitSha = commit,
+            state = JobState.BUILDING,
+            sandbox = SandboxSnapshot.newGenericJob(),
+            genericBuild = GenericBuildSnapshot(
+                comparisonId = UUID.randomUUID().toString(),
+                attempt = GenericBuildAttempt.A,
+                configurationRevision = 1,
+                configurationSha256 = "b".repeat(64),
+                configurationCanonicalJson = "{}",
+                expectedArtifactFileName = "app.apk",
+            ),
+        )
+
+        val command = dockerBuildCommand(job, recipe, profile)
+        assertEquals(listOf("/bin/sh", "-ec"), command.take(2))
+        val script = command.single { it.contains("REPRODROID_DETACHED_GIT") }
+        assertTrue(script.contains("rev-parse --abbrev-ref HEAD"))
+        assertTrue(script.contains("rev-parse --verify HEAD"))
+        assertTrue(script.contains("printf '%s\\n' $commit"))
+        assertTrue(script.contains("*) exit 64 ;;"))
+        assertTrue(script.contains("exec '/opt/jdk/bin/java'"))
+        assertThrows(IllegalArgumentException::class.java) {
+            dockerBuildCommand(job.copy(resolvedCommitSha = "invalid"), recipe, profile)
+        }
+    }
+
     @Test fun `historical profiles retain their exact single tmpfs and environment`() {
         listOf<DockerSandboxPolicy>(DockerSandboxProfile(), LegacyGenericDockerSandboxProfile()).forEach { profile ->
             assertEquals(
