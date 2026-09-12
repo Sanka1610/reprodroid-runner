@@ -63,7 +63,7 @@ class StorageRetentionApiTest {
         val wire = client.get("/v2/capabilities").bodyAsText()
         assertTrue(wire.contains("\"apiVersion\":\"v2\""))
         assertTrue(wire.contains("\"foundationContractVersion\":1"))
-        assertTrue(wire.contains("\"runnerVersion\":\"0.1.0-alpha01\""))
+        assertTrue(wire.contains("\"runnerVersion\":\"0.1.0-alpha02\""))
         assertTrue(wire.contains("\"capabilities\":["))
 
         val storageWire = client.get("/v2/storage/summary") {
