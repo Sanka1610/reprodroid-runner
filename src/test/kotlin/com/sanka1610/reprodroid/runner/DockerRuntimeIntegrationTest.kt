@@ -131,12 +131,12 @@ class DockerRuntimeIntegrationTest {
         var buildContainerId: String? = null
         var buildStarts = 0
         val control = object : DockerControl {
-            override suspend fun command(arguments: List<String>, timeout: Duration): String {
+            override suspend fun command(arguments: List<String>, timeout: Duration, maxOutputBytes: Int): String {
                 if (arguments.first() == "info" && fault == Fault.ENGINE_UNAVAILABLE) error("fixture unavailable engine")
                 if (arguments.take(2) == listOf("image", "inspect") && fault == Fault.IMAGE_MISSING) error("fixture missing image")
                 val creatingBuild = arguments.take(2) == listOf("container", "create") && arguments.contains("com.reprodroid.role=BUILD")
                 if (creatingBuild && fault == Fault.BEFORE_CREATE) error("fixture failure before Docker create")
-                val output = realControl.command(arguments, timeout)
+                val output = realControl.command(arguments, timeout, maxOutputBytes)
                 if (arguments.first() == "info" && fault == Fault.CPU_CAPACITY) {
                     return JsonObject(Json.parseToJsonElement(output).jsonObject + ("NCPU" to JsonPrimitive(4))).toString()
                 }

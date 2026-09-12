@@ -14,12 +14,12 @@ internal data class SandboxTmpfs(val path: String, val options: List<String>) {
 }
 
 internal fun DockerSandboxPolicy.tmpfsPolicies(): List<SandboxTmpfs> =
-    if (this is GenericDockerSandboxProfile) {
+    nativeTmpfsPolicy()?.let { policy ->
         listOf(
-            SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "noexec", "mode=1777", "size=$regularTmpfsBytes")),
-            SandboxTmpfs(nativeTmpfsPath, listOf("rw", "nosuid", "nodev", "exec", "mode=1777", "size=$nativeTmpfsBytes")),
+            SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "noexec", "mode=1777", "size=${policy.regularBytes}")),
+            SandboxTmpfs(policy.nativePath, listOf("rw", "nosuid", "nodev", "exec", "mode=1777", "size=${policy.nativeBytes}")),
         )
-    } else {
+    } ?: run {
         // Preserve the exact docker-microg-v1 and docker-generic-v1 policy and audit shape.
         listOf(SandboxTmpfs("/tmp", listOf("rw", "nosuid", "nodev", "size=$tmpfsBytes")))
     }

@@ -122,19 +122,7 @@ internal class BuildManifestPublisher(
             require(image.getValue("RepoDigests").jsonArray.any { it.jsonPrimitive.content == profile.image })
             val environment = profile.containerEnvironment()
             fixedProfile?.requireSupported(recipe)
-            val launcher = if (job.genericBuild == null) {
-                listOf(
-                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
-                    "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
-                )
-            } else {
-                listOf(
-                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
-                    "-classpath", "${requireNotNull(profile.gradle)}/lib/*:${profile.gradle}/lib/plugins/*", "org.gradle.launcher.GradleMain",
-                )
-            }
-            val genericOptions = if (job.genericBuild != null) listOf("--rerun-tasks", "--no-configuration-cache", "--max-workers=2") else emptyList()
-            val command = launcher + gradleOptions(recipe) + genericOptions + recipe.tasks
+            val command = dockerBuildCommand(job, recipe, profile)
             val workingDirectory = if (recipe.buildRoot == ".") profile.source else "${profile.source}/${recipe.buildRoot}"
             DockerBuildSpec(profile, audit.mounts, environment, workingDirectory).validateInspection(
                 PRIVATE_JSON.parseToJsonElement(audit.buildInspection).jsonObject, build, audit.imageId, command,

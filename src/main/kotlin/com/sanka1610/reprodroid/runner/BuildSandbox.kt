@@ -46,6 +46,7 @@ private val SUPPORTED_DOCKER_PROFILE_IDS = setOf(
     DockerSandboxProfile.ID,
     LegacyGenericDockerSandboxProfile.ID,
     GenericDockerSandboxProfile.ID,
+    DetachedGitGenericDockerSandboxProfile.ID,
 )
 
 internal enum class SandboxManifestFormat { LEGACY_ALLOWED, REQUIRED_V4 }
@@ -173,7 +174,7 @@ internal data class LegacyGenericDockerSandboxProfile(
     companion object { const val ID = "docker-generic-v1" }
 }
 
-/** Phase 4.7 generic profile with a bounded executable native-library tmpfs. */
+/** Historical Phase 4.7 generic profile with a bounded executable native-library tmpfs. */
 @Serializable
 internal data class GenericDockerSandboxProfile(
     override val profileId: String = ID,
@@ -234,15 +235,95 @@ internal data class GenericDockerSandboxProfile(
     }
 }
 
+/** Generic profile that adds a fail-closed detached-checkout Git metadata shim. */
+@Serializable
+internal data class DetachedGitGenericDockerSandboxProfile(
+    override val profileId: String = ID,
+    override val image: String = "ubuntu@${DockerSandboxProfile.IMAGE_DIGEST}",
+    override val platform: String = "linux/amd64",
+    override val dockerExecutable: String = "/usr/bin/docker",
+    override val endpoint: String = "unix:///var/run/docker.sock",
+    override val uid: Int = 1000,
+    override val gid: Int = 1000,
+    override val cpuCount: Int = 4,
+    override val cpuset: String = "0-3",
+    override val memoryBytes: Long = GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES,
+    override val memorySwapBytes: Long = GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES,
+    override val pids: Int = 1024,
+    override val tmpfsBytes: Long = GenericDockerSandboxProfile.TOTAL_TMPFS_BYTES,
+    val regularTmpfsBytes: Long = GenericDockerSandboxProfile.REGULAR_TMPFS_BYTES,
+    val nativeTmpfsBytes: Long = GenericDockerSandboxProfile.NATIVE_TMPFS_BYTES,
+    val nativeTmpfsPath: String = GenericDockerSandboxProfile.NATIVE_TMPFS_PATH,
+    val sqliteNativeJvmOption: String = GenericDockerSandboxProfile.SQLITE_NATIVE_JVM_OPTION,
+    val detachedGitShimPath: String = DETACHED_GIT_SHIM_PATH,
+    val detachedGitCommandSet: String = DETACHED_GIT_COMMAND_SET,
+    override val networkMode: String = "BRIDGE",
+    val readOnlyRoot: Boolean = true,
+    val capDropAll: Boolean = true,
+    val noNewPrivileges: Boolean = true,
+    val seccomp: String = "DEFAULT",
+    val sdkReadOnly: Boolean = true,
+    val jdkReadOnly: Boolean = true,
+    override val gradleReadOnly: Boolean = true,
+    val dockerSocketMounted: Boolean = false,
+    val jobDiskQuotaEnforced: Boolean = false,
+    override val minimumFreeDiskBytes: Long = 17_179_869_184,
+    override val home: String = "/home/ubuntu",
+    override val source: String = "/work/source",
+    override val gradleHome: String = "/work/gradle-home",
+    override val jdk: String = "/opt/jdk",
+    override val sdk: String = "/opt/android-sdk",
+    override val gradle: String = "/opt/gradle",
+    val maxGradleWorkers: Int = 2,
+    val detailedLogBytes: Long = 67_108_864,
+) : DockerSandboxPolicy {
+    init {
+        require(memoryBytes in setOf(GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES, GenericDockerSandboxProfile.RETRY_MEMORY_BYTES))
+        require(memorySwapBytes == memoryBytes)
+        require(tmpfsBytes == GenericDockerSandboxProfile.TOTAL_TMPFS_BYTES)
+        require(regularTmpfsBytes == GenericDockerSandboxProfile.REGULAR_TMPFS_BYTES &&
+            nativeTmpfsBytes == GenericDockerSandboxProfile.NATIVE_TMPFS_BYTES)
+        require(regularTmpfsBytes + nativeTmpfsBytes == tmpfsBytes)
+        require(nativeTmpfsPath == GenericDockerSandboxProfile.NATIVE_TMPFS_PATH &&
+            sqliteNativeJvmOption == GenericDockerSandboxProfile.SQLITE_NATIVE_JVM_OPTION)
+        require(detachedGitShimPath == DETACHED_GIT_SHIM_PATH && detachedGitCommandSet == DETACHED_GIT_COMMAND_SET)
+    }
+
+    companion object {
+        const val ID = "docker-generic-v3"
+        const val DETACHED_GIT_SHIM_PATH = "${GenericDockerSandboxProfile.NATIVE_TMPFS_PATH}/git"
+        const val DETACHED_GIT_COMMAND_SET = "detached-rev-parse-v1"
+    }
+}
+
+internal data class NativeTmpfsPolicy(
+    val regularBytes: Long,
+    val nativeBytes: Long,
+    val nativePath: String,
+    val sqliteJvmOption: String,
+)
+
+internal fun DockerSandboxPolicy.nativeTmpfsPolicy(): NativeTmpfsPolicy? = when (this) {
+    is GenericDockerSandboxProfile -> NativeTmpfsPolicy(
+        regularTmpfsBytes, nativeTmpfsBytes, nativeTmpfsPath, sqliteNativeJvmOption,
+    )
+    is DetachedGitGenericDockerSandboxProfile -> NativeTmpfsPolicy(
+        regularTmpfsBytes, nativeTmpfsBytes, nativeTmpfsPath, sqliteNativeJvmOption,
+    )
+    else -> null
+}
+
 internal fun DockerSandboxPolicy.containerEnvironment(): Map<String, String> = buildMap {
-    put("PATH", listOfNotNull("$jdk/bin", gradle?.let { "$it/bin" }, "/usr/bin", "/bin").joinToString(":"))
+    val detachedGitDirectory = (this@containerEnvironment as? DetachedGitGenericDockerSandboxProfile)
+        ?.detachedGitShimPath?.substringBeforeLast('/')
+    put("PATH", listOfNotNull("$jdk/bin", gradle?.let { "$it/bin" }, detachedGitDirectory, "/usr/bin", "/bin").joinToString(":"))
     put("JAVA_HOME", jdk)
     put("HOME", home)
     put("GRADLE_USER_HOME", gradleHome)
     put("ANDROID_HOME", sdk)
     put("ANDROID_SDK_ROOT", sdk)
-    if (this@containerEnvironment is GenericDockerSandboxProfile) {
-        put("JAVA_TOOL_OPTIONS", sqliteNativeJvmOption)
+    nativeTmpfsPolicy()?.let { policy ->
+        put("JAVA_TOOL_OPTIONS", policy.sqliteJvmOption)
     }
 }
 
@@ -288,13 +369,13 @@ internal data class SandboxSnapshot(
         }
 
         fun newGenericJob(memoryBytes: Long = GenericDockerSandboxProfile.DEFAULT_MEMORY_BYTES): SandboxSnapshot {
-            val profile = GenericDockerSandboxProfile(memoryBytes = memoryBytes, memorySwapBytes = memoryBytes)
+            val profile = DetachedGitGenericDockerSandboxProfile(memoryBytes = memoryBytes, memorySwapBytes = memoryBytes)
             val canonical = SNAPSHOT_JSON.encodeToString(profile)
             return SandboxSnapshot(
                 jobSandbox = JobSandbox(
                     BuildSandboxMode.DOCKER,
                     SandboxOrigin.NEW_JOB,
-                    profileId = GenericDockerSandboxProfile.ID,
+                    profileId = DetachedGitGenericDockerSandboxProfile.ID,
                     cleanupStatus = SandboxCleanupStatus.NOT_CREATED,
                 ),
                 canonicalProfile = canonical,
@@ -311,7 +392,11 @@ internal data class SandboxSnapshot(
 
     fun validatedGenericProfile(): DockerSandboxPolicy? {
         try {
-            if (jobSandbox.profileId !in setOf(LegacyGenericDockerSandboxProfile.ID, GenericDockerSandboxProfile.ID)) return null
+            if (jobSandbox.profileId !in setOf(
+                    LegacyGenericDockerSandboxProfile.ID,
+                    GenericDockerSandboxProfile.ID,
+                    DetachedGitGenericDockerSandboxProfile.ID,
+                )) return null
             require(jobSandbox.mode == BuildSandboxMode.DOCKER && manifestFormat == SandboxManifestFormat.REQUIRED_V4)
             val canonical = requireNotNull(canonicalProfile)
             require(canonical.toByteArray(Charsets.UTF_8).size <= 8192)
@@ -319,12 +404,15 @@ internal data class SandboxSnapshot(
             val decoded: DockerSandboxPolicy = when (jobSandbox.profileId) {
                 LegacyGenericDockerSandboxProfile.ID -> GENERIC_SNAPSHOT_JSON.decodeFromString<LegacyGenericDockerSandboxProfile>(canonical)
                 GenericDockerSandboxProfile.ID -> GENERIC_SNAPSHOT_JSON.decodeFromString<GenericDockerSandboxProfile>(canonical)
+                DetachedGitGenericDockerSandboxProfile.ID ->
+                    GENERIC_SNAPSHOT_JSON.decodeFromString<DetachedGitGenericDockerSandboxProfile>(canonical)
                 else -> error("unsupported generic profile")
             }
             require(decoded.profileId == jobSandbox.profileId)
             val encoded = when (decoded) {
                 is LegacyGenericDockerSandboxProfile -> GENERIC_SNAPSHOT_JSON.encodeToString(decoded)
                 is GenericDockerSandboxProfile -> GENERIC_SNAPSHOT_JSON.encodeToString(decoded)
+                is DetachedGitGenericDockerSandboxProfile -> GENERIC_SNAPSHOT_JSON.encodeToString(decoded)
                 else -> error("unsupported generic profile")
             }
             require(canonical == encoded)
@@ -335,7 +423,11 @@ internal data class SandboxSnapshot(
     }
 
     fun validateAnyProfile() {
-        if (jobSandbox.profileId in setOf(LegacyGenericDockerSandboxProfile.ID, GenericDockerSandboxProfile.ID)) {
+        if (jobSandbox.profileId in setOf(
+                LegacyGenericDockerSandboxProfile.ID,
+                GenericDockerSandboxProfile.ID,
+                DetachedGitGenericDockerSandboxProfile.ID,
+            )) {
             validatedGenericProfile()
         } else {
             validatedProfile()

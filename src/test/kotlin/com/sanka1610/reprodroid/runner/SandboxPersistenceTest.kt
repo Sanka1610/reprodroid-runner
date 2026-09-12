@@ -45,10 +45,22 @@ class SandboxPersistenceTest {
         assertFalse(raw.contains("snapshot"))
     }
 
-    @Test fun `new generic snapshots use v2 while canonical v1 snapshots remain readable`() {
+    @Test fun `new generic snapshots use v3 while canonical v1 and v2 snapshots remain readable`() {
         val current = SandboxSnapshot.newGenericJob()
-        assertEquals(GenericDockerSandboxProfile.ID, current.jobSandbox.profileId)
-        assertEquals(GenericDockerSandboxProfile(), current.validatedGenericProfile())
+        assertEquals(DetachedGitGenericDockerSandboxProfile.ID, current.jobSandbox.profileId)
+        assertEquals(DetachedGitGenericDockerSandboxProfile(), current.validatedGenericProfile())
+
+        val v2 = GenericDockerSandboxProfile()
+        val v2Json = Json { encodeDefaults = true; ignoreUnknownKeys = false }.encodeToString(v2)
+        val v2Sha256 = MessageDigest.getInstance("SHA-256")
+            .digest(v2Json.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+        val restoredV2 = SandboxSnapshot(
+            JobSandbox(BuildSandboxMode.DOCKER, SandboxOrigin.NEW_JOB, v2.profileId, SandboxCleanupStatus.COMPLETE),
+            v2Json,
+            v2Sha256,
+            SandboxManifestFormat.REQUIRED_V4,
+        )
+        assertEquals(v2, restoredV2.validatedGenericProfile())
 
         val legacy = LegacyGenericDockerSandboxProfile()
         val canonicalJson = """{"profileId":"docker-generic-v1","image":"ubuntu@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316","platform":"linux/amd64","dockerExecutable":"/usr/bin/docker","endpoint":"unix:///var/run/docker.sock","uid":1000,"gid":1000,"cpuCount":4,"cpuset":"0-3","memoryBytes":8589934592,"memorySwapBytes":8589934592,"pids":1024,"tmpfsBytes":1073741824,"networkMode":"BRIDGE","readOnlyRoot":true,"capDropAll":true,"noNewPrivileges":true,"seccomp":"DEFAULT","sdkReadOnly":true,"jdkReadOnly":true,"gradleReadOnly":true,"dockerSocketMounted":false,"jobDiskQuotaEnforced":false,"minimumFreeDiskBytes":17179869184,"home":"/home/ubuntu","source":"/work/source","gradleHome":"/work/gradle-home","jdk":"/opt/jdk","sdk":"/opt/android-sdk","gradle":"/opt/gradle","maxGradleWorkers":2,"detailedLogBytes":67108864}"""
@@ -64,7 +76,7 @@ class SandboxPersistenceTest {
         )
         assertEquals(legacy, restored.validatedGenericProfile())
 
-        val wrongIdentity = restored.copy(jobSandbox = restored.jobSandbox.copy(profileId = GenericDockerSandboxProfile.ID))
+        val wrongIdentity = restored.copy(jobSandbox = restored.jobSandbox.copy(profileId = DetachedGitGenericDockerSandboxProfile.ID))
         assertEquals("SANDBOX_SNAPSHOT_INVALID", assertThrows(TrustedBuildFailure::class.java) {
             wrongIdentity.validatedGenericProfile()
         }.code)

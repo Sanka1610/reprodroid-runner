@@ -3,17 +3,24 @@ package com.sanka1610.reprodroid.runner
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.sqlite.SQLiteConfig
-import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
+import java.nio.charset.CodingErrorAction
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.OpenOption
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption.CREATE
+import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.PosixFilePermissions
 import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
-import kotlin.io.path.createDirectories
 
 internal data class StoredJob(
     val jobId: String,
@@ -72,9 +79,13 @@ class SQLiteJobStore(
     private val logDirectory = stateDirectory.resolve("logs")
 
     init {
+        // Prepare private paths before loading SQLite. JDBC may initialize SLF4J,
+        // which in turn opens the state-local Logback appender.
+        RunnerDatabaseMigrationGate.prepareStateDirectory(stateDirectory)
+        RunnerLogging.prepare(stateDirectory)
         Class.forName("org.sqlite.JDBC")
         RunnerDatabaseMigrationGate.initialize(stateDirectory, SCHEMA_VERSION, migrationPolicy) { initializeSchema(it) }
-        logDirectory.createDirectories()
+        prepareLogDirectory()
     }
 
     @Synchronized
@@ -1307,18 +1318,17 @@ class SQLiteJobStore(
         val timestamp = Instant.now(clock).toString()
         val messageBytes = message.toByteArray(StandardCharsets.UTF_8)
         val logPath = logPath(jobId)
-        Files.createDirectories(logPath.parent)
 
         connection(SQLiteConfig.TransactionMode.IMMEDIATE).use { connection ->
             connection.autoCommit = false
             try {
                 val sequence = latestLogSequence(connection, jobId) + 1
                 val offset: Long
-                RandomAccessFile(logPath.toFile(), "rw").use { file ->
-                    offset = file.length()
-                    file.seek(offset)
-                    file.write(messageBytes)
-                    file.fd.sync()
+                openPrivateJobLog(logPath, setOf(CREATE, READ, WRITE)).use { channel ->
+                    offset = channel.size()
+                    channel.position(offset)
+                    writeFully(channel, ByteBuffer.wrap(messageBytes))
+                    channel.force(true)
                 }
                 connection.prepareStatement(
                     """
@@ -1378,16 +1388,19 @@ class SQLiteJobStore(
             val entries = if (indexedEntries.isEmpty()) {
                 emptyList()
             } else {
-                RandomAccessFile(logPath.toFile(), "r").use { file ->
+                openPrivateJobLog(logPath, setOf(READ)).use { channel ->
                     indexedEntries.map { indexed ->
+                        check(indexed.offset >= 0 && indexed.byteLength >= 0) { "JOB_LOG_INDEX_INVALID" }
+                        check(indexed.offset <= channel.size() - indexed.byteLength) { "JOB_LOG_INDEX_OUT_OF_RANGE" }
                         val bytes = ByteArray(indexed.byteLength)
-                        file.seek(indexed.offset)
-                        file.readFully(bytes)
+                        channel.position(indexed.offset)
+                        val buffer = ByteBuffer.wrap(bytes)
+                        while (buffer.hasRemaining()) check(channel.read(buffer) > 0) { "JOB_LOG_READ_INCOMPLETE" }
                         LogEntry(
                             sequence = indexed.sequence,
                             timestamp = indexed.timestamp,
                             level = indexed.level,
-                            message = String(bytes, StandardCharsets.UTF_8),
+                            message = decodeUtf8(bytes),
                         )
                     }
                 }
@@ -2431,6 +2444,76 @@ class SQLiteJobStore(
                 if (row.next()) GENERIC_JSON.decodeFromString<GenericDiscoveryEvidence>(row.getString(1)) else null
             }
         }
+
+    private fun prepareLogDirectory() {
+        val root = stateDirectory.toAbsolutePath().normalize()
+        val directory = logDirectory.toAbsolutePath().normalize()
+        check(directory.parent == root) { "JOB_LOG_DIRECTORY_OUTSIDE_STATE" }
+        val attributes = if (Files.getFileStore(root).supportsFileAttributeView("posix")) {
+            arrayOf(PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")))
+        } else {
+            emptyArray()
+        }
+        if (!Files.exists(directory, NOFOLLOW_LINKS)) Files.createDirectory(directory, *attributes)
+        check(!Files.isSymbolicLink(directory) && Files.isDirectory(directory, NOFOLLOW_LINKS)) {
+            "JOB_LOG_DIRECTORY_INVALID"
+        }
+        if (Files.getFileStore(root).supportsFileAttributeView("posix")) {
+            check(Files.getOwner(directory, NOFOLLOW_LINKS) == Files.getOwner(root, NOFOLLOW_LINKS)) {
+                "JOB_LOG_OWNER_INVALID"
+            }
+            Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwx------"))
+            check(Files.getPosixFilePermissions(directory, NOFOLLOW_LINKS) == PosixFilePermissions.fromString("rwx------")) {
+                "JOB_LOG_PERMISSIONS_INVALID"
+            }
+        }
+    }
+
+    private fun openPrivateJobLog(path: Path, options: Set<OpenOption>): FileChannel {
+        val root = stateDirectory.toAbsolutePath().normalize()
+        val normalized = path.toAbsolutePath().normalize()
+        check(normalized.parent == logDirectory.toAbsolutePath().normalize()) { "JOB_LOG_PATH_OUTSIDE_STATE" }
+        prepareLogDirectory()
+        if (Files.exists(normalized, NOFOLLOW_LINKS)) securePrivateJobLog(normalized, root)
+        val attributes = if (Files.getFileStore(root).supportsFileAttributeView("posix")) {
+            arrayOf(PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+        } else {
+            emptyArray()
+        }
+        return FileChannel.open(normalized, options + NOFOLLOW_LINKS, *attributes).also { channel ->
+            try {
+                securePrivateJobLog(normalized, root)
+            } catch (failure: Throwable) {
+                channel.close()
+                throw failure
+            }
+        }
+    }
+
+    private fun securePrivateJobLog(path: Path, root: Path) {
+        check(!Files.isSymbolicLink(path) && Files.isRegularFile(path, NOFOLLOW_LINKS)) { "JOB_LOG_FILE_INVALID" }
+        if (!Files.getFileStore(root).supportsFileAttributeView("posix")) return
+        check(Files.getOwner(path, NOFOLLOW_LINKS) == Files.getOwner(root, NOFOLLOW_LINKS)) { "JOB_LOG_OWNER_INVALID" }
+        val permissions = Files.getPosixFilePermissions(path, NOFOLLOW_LINKS)
+        check(permissions.none {
+            it == java.nio.file.attribute.PosixFilePermission.GROUP_WRITE ||
+                it == java.nio.file.attribute.PosixFilePermission.OTHERS_WRITE
+        }) { "JOB_LOG_PERMISSIONS_INVALID" }
+        Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"))
+        check(Files.getPosixFilePermissions(path, NOFOLLOW_LINKS) == PosixFilePermissions.fromString("rw-------")) {
+            "JOB_LOG_PERMISSIONS_INVALID"
+        }
+    }
+
+    private fun writeFully(channel: FileChannel, buffer: ByteBuffer) {
+        while (buffer.hasRemaining()) check(channel.write(buffer) > 0) { "JOB_LOG_WRITE_INCOMPLETE" }
+    }
+
+    private fun decodeUtf8(bytes: ByteArray): String = StandardCharsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+        .decode(ByteBuffer.wrap(bytes))
+        .toString()
 
     private fun logPath(jobId: String): Path = logDirectory.resolve("$jobId.log")
 

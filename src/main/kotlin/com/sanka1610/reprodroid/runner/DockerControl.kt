@@ -17,14 +17,19 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 internal interface DockerControl {
-    suspend fun command(arguments: List<String>, timeout: Duration = Duration.ofSeconds(15)): String
+    suspend fun command(
+        arguments: List<String>,
+        timeout: Duration = Duration.ofSeconds(15),
+        maxOutputBytes: Int = 65_536,
+    ): String
 }
 
 /** Separate from build logs: control output must never be silently truncated or parsed after CLI failure. */
 internal class LocalDockerControl(private val workingDirectory: Path) : DockerControl {
     private val profile = DockerSandboxProfile()
 
-    override suspend fun command(arguments: List<String>, timeout: Duration): String = runInterruptible {
+    override suspend fun command(arguments: List<String>, timeout: Duration, maxOutputBytes: Int): String = runInterruptible {
+        require(maxOutputBytes in 1..8 * 1024 * 1024)
         val executable = Path.of(profile.dockerExecutable).toRealPath()
         require(Files.isRegularFile(executable) && Files.isExecutable(executable))
         // Desktop WSL integration supplies a nobody-owned CLI on a read-only ISO9660 mount.
@@ -46,7 +51,7 @@ internal class LocalDockerControl(private val workingDirectory: Path) : DockerCo
                     while (true) {
                         val count = input.read(buffer)
                         if (count < 0) break
-                        if (output.size() + count > 65_536) error("Docker control output exceeded its limit.")
+                        if (output.size() + count > maxOutputBytes) error("Docker control output exceeded its limit.")
                         output.write(buffer, 0, count)
                     }
                 }

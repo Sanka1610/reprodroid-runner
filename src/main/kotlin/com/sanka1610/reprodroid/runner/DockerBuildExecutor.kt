@@ -90,7 +90,7 @@ internal class DockerBuildExecutor(
                 SandboxIsolation(profile.uid, profile.gid, true, true, true, "DEFAULT", true, true, false, false, profile.gradleReadOnly),
             ).also { it.validate() }
             failureCode = "SANDBOX_TOOLCHAIN_MISMATCH"
-            val probeCommand = listOf("/bin/sh", "-ec", toolchainProbe(recipe, profile, job.genericBuild != null))
+            val probeCommand = listOf("/bin/sh", "-ec", toolchainProbe(job, recipe, profile))
             val preflight = create(job.jobId, SandboxResourceRole.PREFLIGHT, engineId, imageId, spec, probeCommand, resources)
             val preflightInspection = requireNotNull(store.sandboxResources().single { it.attemptId == preflight.attemptId }.observationJson)
             if (job.genericBuild != null) {
@@ -99,15 +99,19 @@ internal class DockerBuildExecutor(
                 }
             }
             val probeTimeout = recipe.discoveryTimeout ?: Duration.ofSeconds(60)
-            val probe = control.command(listOf("container", "start", "--attach", requireNotNull(preflight.containerId)), probeTimeout)
+            val probe = control.command(
+                listOf("container", "start", "--attach", requireNotNull(preflight.containerId)),
+                probeTimeout,
+                if (job.genericBuild != null) 8 * 1024 * 1024 else 65_536,
+            )
             val probeState = inspection.inspect(preflight.containerId).getValue("State").jsonObject
             require(!probeState.boolean("Running") && probeState.number("ExitCode") == 0L && !probeState.boolean("OOMKilled"))
             val measuredJava = PublicJavaRuntime(property(probe, "java.version"), property(probe, "java.vendor"))
             val measuredOs = listOf("os.name", "os.version", "os.arch").joinToString(" ") { property(probe, it) }
             require(measuredJava == PublicJavaRuntime(java.version, java.vendor))
             require(property(probe, "user.home") == profile.home && property(probe, "java.home") == profile.jdk)
-            if (profile is GenericDockerSandboxProfile) {
-                require(property(probe, "org.sqlite.tmpdir") == profile.nativeTmpfsPath)
+            profile.nativeTmpfsPolicy()?.let { policy ->
+                require(property(probe, "org.sqlite.tmpdir") == policy.nativePath)
                 require(Regex("(?m)^REPRODROID_NATIVE_TMPFS_OK$").containsMatchIn(probe))
             }
             require(Regex("(?m)^CapEff:\\s+0+$").containsMatchIn(probe) && Regex("(?m)^NoNewPrivs:\\s+1$").containsMatchIn(probe))
@@ -143,19 +147,7 @@ internal class DockerBuildExecutor(
             // Remove the probe before the build; the following intent returns COMPLETE to PENDING.
             if (!lifecycle.recover()) throw TrustedBuildFailure("SANDBOX_CLEANUP_FAILED", "Sandbox preflight cleanup is pending.")
             failureCode = "SANDBOX_START_FAILED"
-            val launcher = if (job.genericBuild == null) {
-                listOf(
-                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
-                    "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
-                )
-            } else {
-                listOf(
-                    "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
-                    "-classpath", "${requireNotNull(profile.gradle)}/lib/*:${profile.gradle}/lib/plugins/*", "org.gradle.launcher.GradleMain",
-                )
-            }
-            val genericOptions = if (job.genericBuild != null) listOf("--rerun-tasks", "--no-configuration-cache", "--max-workers=2") else emptyList()
-            val buildCommand = launcher + gradleOptions(recipe) + genericOptions + recipe.tasks
+            val buildCommand = dockerBuildCommand(job, recipe, profile)
             val build = create(job.jobId, SandboxResourceRole.BUILD, engineId, imageId, spec, buildCommand, resources)
             val buildInspection = requireNotNull(store.sandboxResources().single { it.attemptId == build.attemptId }.observationJson)
             if (!store.transitionIfActive(job.jobId, JobState.BUILDING, 55, "Starting confirmed Gradle tasks inside ${profile.profileId}.")) {
@@ -247,10 +239,11 @@ internal class DockerBuildExecutor(
     private fun property(output: String, key: String): String =
         Regex("(?m)^\\s*${Regex.escape(key)} = (.+)$").findAll(output).single().groupValues[1].trim()
 
-    private fun toolchainProbe(recipe: BuildRecipe, profile: DockerSandboxPolicy, generic: Boolean): String {
-        val mountProbe = if (profile is GenericDockerSandboxProfile) """
+    private fun toolchainProbe(job: StoredJob, recipe: BuildRecipe, profile: DockerSandboxPolicy): String {
+        val nativePolicy = profile.nativeTmpfsPolicy()
+        val mountProbe = if (nativePolicy != null) """
             regular_options="$(awk '$2 == "/tmp" { print $4 }' /proc/mounts)"
-            native_options="$(awk '$2 == "${profile.nativeTmpfsPath}" { print $4 }' /proc/mounts)"
+            native_options="$(awk '$2 == "${nativePolicy.nativePath}" { print $4 }' /proc/mounts)"
             test -n "${'$'}regular_options"
             test -n "${'$'}native_options"
             case ",${'$'}regular_options," in *,rw,*) ;; *) exit 1 ;; esac
@@ -261,10 +254,10 @@ internal class DockerBuildExecutor(
             case ",${'$'}native_options," in *,nosuid,*) ;; *) exit 1 ;; esac
             case ",${'$'}native_options," in *,nodev,*) ;; *) exit 1 ;; esac
             case ",${'$'}native_options," in *,noexec,*) exit 1 ;; esac
-            printf '#!/bin/sh\nexit 0\n' > ${profile.nativeTmpfsPath}/reprodroid-exec-probe
-            chmod 700 ${profile.nativeTmpfsPath}/reprodroid-exec-probe
-            ${profile.nativeTmpfsPath}/reprodroid-exec-probe
-            rm ${profile.nativeTmpfsPath}/reprodroid-exec-probe
+            printf '#!/bin/sh\nexit 0\n' > ${nativePolicy.nativePath}/reprodroid-exec-probe
+            chmod 700 ${nativePolicy.nativePath}/reprodroid-exec-probe
+            ${nativePolicy.nativePath}/reprodroid-exec-probe
+            rm ${nativePolicy.nativePath}/reprodroid-exec-probe
             printf '#!/bin/sh\nexit 0\n' > /tmp/reprodroid-noexec-probe
             chmod 700 /tmp/reprodroid-noexec-probe
             if /tmp/reprodroid-noexec-probe 2>/dev/null; then exit 1; fi
@@ -280,14 +273,60 @@ internal class DockerBuildExecutor(
             /opt/android-sdk/build-tools/${recipe.buildToolsVersion}/aapt2 version
         """.trimIndent()
         val verifiedBase = if (mountProbe.isEmpty()) base else "$base\n$mountProbe"
-        if (!generic) return verifiedBase
+        if (job.genericBuild == null) return verifiedBase
         val gradle = requireNotNull(profile.gradle)
         val discovery = gradleOptions(recipe) + listOf("--no-configuration-cache", "--max-workers=2", "--dry-run") + recipe.tasks
         val command = discovery.joinToString(" ") { value -> require(value.matches(Regex("[A-Za-z0-9:._=-]+"))); value }
-        return "$verifiedBase\n/opt/jdk/bin/java -Duser.home=${profile.home} -Dgradle.user.home=${profile.gradleHome} " +
+        val gitSetup = (profile as? DetachedGitGenericDockerSandboxProfile)?.let {
+            "\n${detachedGitShimSetup(requireNotNull(job.resolvedCommitSha), it)}"
+        }.orEmpty()
+        return "$verifiedBase$gitSetup\n/opt/jdk/bin/java -Duser.home=${profile.home} -Dgradle.user.home=${profile.gradleHome} " +
             "-classpath '$gradle/lib/*:$gradle/lib/plugins/*' org.gradle.launcher.GradleMain $command"
     }
 }
+
+internal fun dockerBuildCommand(job: StoredJob, recipe: BuildRecipe, profile: DockerSandboxPolicy): List<String> {
+    val launcher = if (job.genericBuild == null) {
+        listOf(
+            "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+            "-classpath", "${profile.source}/gradle/wrapper/gradle-wrapper.jar", "org.gradle.wrapper.GradleWrapperMain",
+        )
+    } else {
+        listOf(
+            "${profile.jdk}/bin/java", "-Duser.home=${profile.home}", "-Dgradle.user.home=${profile.gradleHome}",
+            "-classpath", "${requireNotNull(profile.gradle)}/lib/*:${profile.gradle}/lib/plugins/*", "org.gradle.launcher.GradleMain",
+        )
+    }
+    val genericOptions = if (job.genericBuild != null) {
+        listOf("--rerun-tasks", "--no-configuration-cache", "--max-workers=2")
+    } else {
+        emptyList()
+    }
+    val gradleCommand = launcher + gradleOptions(recipe) + genericOptions + recipe.tasks
+    val detachedProfile = profile as? DetachedGitGenericDockerSandboxProfile ?: return gradleCommand
+    require(job.genericBuild != null)
+    val shellCommand = detachedGitShimSetup(requireNotNull(job.resolvedCommitSha), detachedProfile) +
+        "\nexec " + gradleCommand.joinToString(" ", transform = ::shellQuote)
+    return listOf("/bin/sh", "-ec", shellCommand)
+}
+
+private fun detachedGitShimSetup(commitSha: String, profile: DetachedGitGenericDockerSandboxProfile): String {
+    require(commitSha.matches(Regex("[0-9a-f]{40}")))
+    return """
+        umask 077
+        cat > ${profile.detachedGitShimPath} <<'REPRODROID_DETACHED_GIT'
+        #!/bin/sh
+        case "${'$'}*" in
+            "rev-parse --abbrev-ref HEAD") printf '%s\n' HEAD ;;
+            "rev-parse HEAD"|"rev-parse --verify HEAD") printf '%s\n' $commitSha ;;
+            *) exit 64 ;;
+        esac
+        REPRODROID_DETACHED_GIT
+        chmod 500 ${profile.detachedGitShimPath}
+    """.trimIndent()
+}
+
+private fun shellQuote(value: String): String = "'${value.replace("'", "'\"'\"'")}'"
 
 /** CLI return is not a substitute for the engine's observation of a started, exited process. */
 internal fun classifyDockerBuildCompletion(state: JsonObject, cliExitCode: Int?, timedOut: Boolean): TrustedBuildFailure? {
