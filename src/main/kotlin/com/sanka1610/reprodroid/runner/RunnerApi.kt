@@ -45,8 +45,8 @@ class ApiException(
 }
 
 fun Application.runnerModule(config: RunnerConfig) {
-    val logger = LoggerFactory.getLogger("ReproDroidRunner")
     val store = SQLiteJobStore(config.stateDirectory)
+    val logger = LoggerFactory.getLogger("ReproDroidRunner")
     val security = RunnerSecurityStore(config.stateDirectory)
     val coordinator = JobCoordinator(
         store = store,
@@ -113,7 +113,7 @@ fun Application.runnerModule(config: RunnerConfig) {
                 call.requirePrincipal(config, security)
                 call.respond(
                     HealthResponse(
-                        runnerVersion = "0.1.0-alpha01",
+                        runnerVersion = "0.1.0-alpha02",
                         apiVersion = "v1",
                         realBuildEnabled = config.realBuildEnabled,
                         databaseReady = store.isReady(),

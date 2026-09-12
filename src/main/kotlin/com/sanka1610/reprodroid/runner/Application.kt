@@ -60,6 +60,7 @@ data class RunnerConfig(
                 "REPRODROID_STATE_DIR must not be blank."
             }
             val stateDirectory = configuredStateDirectory?.let(::Path) ?: defaultStateDirectory
+            RunnerLogging.select(stateDirectory)
             val realBuildEnabled = environment["REPRODROID_ENABLE_REAL_BUILDS"]
                 ?.equals("true", ignoreCase = true) == true
             val sandbox = environment["REPRODROID_BUILD_SANDBOX"]?.let { value ->
@@ -107,12 +108,12 @@ fun main(args: Array<String>) {
     val config = RunnerConfig.fromEnvironment()
     validateLocalCommand(args)
     // Initialize the database (including runnerId and SQLite12) before either CLI or server work.
-    SQLiteJobStore(config.stateDirectory)
+    val store = SQLiteJobStore(config.stateDirectory)
     val security = RunnerSecurityStore(config.stateDirectory)
     security.runnerId()
     val ca = LocalCertificateAuthority(config.stateDirectory)
     if (args.isNotEmpty()) {
-        runLocalCommand(args, config, security, ca)
+        runLocalCommand(args, config, security, ca, store)
         return
     }
     if (config.realBuildEnabled) {
@@ -153,7 +154,13 @@ fun Application.module() {
     runnerModule(RunnerConfig.fromEnvironment())
 }
 
-private fun runLocalCommand(args: Array<String>, config: RunnerConfig, security: RunnerSecurityStore, ca: LocalCertificateAuthority) {
+private fun runLocalCommand(
+    args: Array<String>,
+    config: RunnerConfig,
+    security: RunnerSecurityStore,
+    ca: LocalCertificateAuthority,
+    store: SQLiteJobStore,
+) {
     val command = args.first()
     val endpoint = config.advertisedEndpoint
     when (command) {
@@ -204,6 +211,17 @@ private fun runLocalCommand(args: Array<String>, config: RunnerConfig, security:
         "principal-revoke" -> println(CLI_JSON.encodeToString(security.revoke(requireArg(args, 1, "principalId"))))
         "adoption-preview" -> println(CLI_JSON.encodeToString(security.previewAdoption(requireArg(args, 1, "sourcePrincipalId"), requireArg(args, 2, "targetPrincipalId"))))
         "adoption-execute" -> println(CLI_JSON.encodeToString(security.executeAdoption(requireArg(args, 1, "previewId"))))
+        "runner-log-export" -> printLogExportResult(
+            RunnerLogExporter.exportRunnerLog(config.stateDirectory, Path(requireArg(args, 1, "output"))),
+        )
+        "job-log-export" -> printLogExportResult(
+            RunnerLogExporter.exportJobLog(
+                store,
+                config.stateDirectory,
+                requireArg(args, 1, "jobId"),
+                Path(requireArg(args, 2, "output")),
+            ),
+        )
         else -> error("Unknown local command.")
     }
 }
@@ -216,8 +234,16 @@ private fun validateLocalCommand(args: Array<String>) {
         "pairing-open", "pairing-list", "principals-list", "security-change-endpoint" -> 1..1
         "pairing-approve", "pairing-reject", "principal-revoke", "adoption-execute" -> 2..2
         "adoption-preview" -> 3..3
+        "runner-log-export" -> 2..2
+        "job-log-export" -> 3..3
         else -> error("Unknown local command.")
     }
     require(args.size in argumentCount) { "Invalid local command arguments." }
+}
+private fun printLogExportResult(result: LogExportResult) {
+    println("exportedBytes=${result.bytes}")
+    println("range=${result.range}")
+    println("missing=${result.missing}")
+    println("truncated=${result.truncated}")
 }
 private val CLI_JSON = Json { explicitNulls = false; encodeDefaults = true }

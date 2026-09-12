@@ -32,7 +32,7 @@ internal fun Route.storageRetentionV2Routes(
                     apiVersion = "v2",
                     foundationContractVersion = 1,
                     runnerId = store.runnerId(),
-                    runnerVersion = "0.1.0-alpha01",
+                    runnerVersion = "0.1.0-alpha02",
                     capabilities = buildList {
                         addAll(listOf(
                         V2Capability("foundation", 1),

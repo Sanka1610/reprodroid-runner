@@ -49,8 +49,7 @@ internal object RunnerDatabaseMigrationGate {
     ) {
         require(targetVersion > 0 && policy.recoveryReserveBytes >= 0)
         val root = stateDirectory.toAbsolutePath().normalize()
-        createState(root)
-        validateState(root)
+        prepareStateDirectory(root)
         val database = root.resolve("reprodroid-runner.sqlite3")
         if (Files.exists(database, NOFOLLOW_LINKS)) validateRegular(database, root)
         val lock = root.resolve("database-migration.lock")
@@ -103,6 +102,17 @@ internal object RunnerDatabaseMigrationGate {
                 }
             }
         }
+    }
+
+    /**
+     * Establish the state root before any dependency can initialize logging and
+     * create it using the process umask. New POSIX roots are owner-only, while
+     * existing roots keep the migration gate's non-writable ancestor checks.
+     */
+    fun prepareStateDirectory(stateDirectory: Path) {
+        val root = stateDirectory.toAbsolutePath().normalize()
+        createState(root)
+        validateState(root)
     }
 
     private fun snapshot(database: Path, root: Path, version: Int, identity: String?, policy: RunnerMigrationPolicy) {
