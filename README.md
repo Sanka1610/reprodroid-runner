@@ -3,7 +3,7 @@
 ReproDroid AndroidアプリからJobを受け、source取得、検査、許可されたbuild、artifact配信を行うPC側Runnerです。Androidアプリとは独立したリポジトリとリリースサイクルを維持します。
 
 > [!IMPORTANT]
-> 現在のRunner versionは`0.1.0-alpha02`、databaseはSQLite12です。Phase 4.8の統合・release受入は継続中であり、このREADMEの整理は新しいrelease、push、`main`統合、公開を意味しません。
+> 現在のRunner versionは`0.1.0-alpha02`、databaseはSQLite12です。Phase 4のローカル統合・release受入は完了しています。このREADMEの状態は、新しいrelease、push、`main`統合、公開を意味しません。
 
 ## Repository roles
 
