@@ -269,7 +269,7 @@ class DockerRuntimeIntegrationTest {
         assertTrue(store.completeRealSuccessIfActive(jobId, listOf(StoredArtifact(artifact, null))))
         val publisher = BuildManifestPublisher(store, state)
         val publicManifest = publisher.publicManifest(jobId)
-        assertEquals(3, publicManifest.schemaVersion)
+        assertEquals(4, publicManifest.schemaVersion)
         assertEquals(audit.sandbox, publicManifest.sandbox)
         val publicJson = json.encodeToString(publicManifest)
         assertFalse(publicJson.contains(state.toString()))
