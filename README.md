@@ -3,7 +3,7 @@
 ReproDroid AndroidアプリからJobを受け、source取得、検査、許可されたbuild、artifact配信を行うPC側Runnerです。Androidアプリとは独立したリポジトリとリリースサイクルを維持します。
 
 > [!IMPORTANT]
-> 現在のRunner versionは`0.1.0-alpha02`、databaseはSQLite12です。Phase 4のローカル統合・release受入は完了しています。このREADMEの状態は、新しいrelease、push、`main`統合、公開を意味しません。
+> 現在のRunner versionは`0.1.0-alpha02`、databaseはSQLite12です。Phase 5.6では運用文書だけを同期し、Runner production source、API、schema、dependency、配布内容はPhase 4のローカル受入点から変更していません。このREADMEの状態は、新しいrelease、push、`main`統合、公開を意味しません。
 
 ## Repository roles
 
@@ -156,6 +156,10 @@ build/install/reprodroid-runner/bin/reprodroid-runner job-log-export <jobId> /ab
 
 - [Documentation index](https://github.com/Sanka1610/reprodroid/tree/main/docs)
 - [Architecture overview](https://github.com/Sanka1610/reprodroid/blob/main/docs/architecture/overview.md)
+- [UI architecture and navigation](https://github.com/Sanka1610/reprodroid/blob/main/docs/architecture/ui.md)
+- [Getting started](https://github.com/Sanka1610/reprodroid/blob/main/docs/guides/getting-started.md)
+- [Operations and recovery](https://github.com/Sanka1610/reprodroid/blob/main/docs/guides/operations.md)
+- [Unreleased notes](https://github.com/Sanka1610/reprodroid/blob/main/docs/releases/unreleased.md)
 - [Runner API v1](https://github.com/Sanka1610/reprodroid/blob/main/docs/api/runner-api.md)
 - [Runner API v2](https://github.com/Sanka1610/reprodroid/blob/main/docs/api/runner-api-v2.md)
 - [ADR index](https://github.com/Sanka1610/reprodroid/blob/main/docs/adr/README.md)
