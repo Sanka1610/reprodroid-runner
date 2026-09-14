@@ -151,8 +151,12 @@ class DockerBuildSpecTest {
     }
 
     private fun fixture(): DockerBuildSpec {
-        // Only omit the real 16 GiB check for path tests in JUnit's possibly-small tmpfs.
-        val profile = DockerSandboxProfile(minimumFreeDiskBytes = 0)
+        // Model the owner of JUnit's temporary filesystem while omitting its possibly-small free-space limit.
+        val profile = DockerSandboxProfile(
+            uid = (Files.getAttribute(directory, "unix:uid") as Number).toInt(),
+            gid = (Files.getAttribute(directory, "unix:gid") as Number).toInt(),
+            minimumFreeDiskBytes = 0,
+        )
         val workspace = Files.createDirectories(directory.resolve("workspace"))
         val mounts = listOf(
             workspace.resolve("source") to profile.source, workspace.resolve("home") to profile.home,
