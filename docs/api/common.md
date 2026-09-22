@@ -6,35 +6,37 @@
 - paired: `REPRODROID_ADVERTISED_ENDPOINT`で設定したexact HTTPS origin
 - redirectは追跡しない
 - paired modeの`/v1/*`と`/v2/*`: `Authorization: Bearer <credential>`を1個だけ要求
-- development HTTP: 固定`local-development` principal
+- development HTTP: 固定`local-development` 接続主体
 - `/pairing/v1/*`: [pairing contract](pairing.md)の限定認証を使用
 
-principalはserver側のcredential contextから決定します。request bodyのprincipal IDをauthorizationに使用しません。
+接続主体はサーバー側の認証情報 contextから決定します。要求本文の接続主体 IDをauthorizationに使用しません。
 
 ## JSON
 
-- `application/json`, UTF-8
-- 通常requestは256 KiB以下、通常responseは1 MiB以下
-- nestingはrootを1として32以下
-- 通常stringはdecoded UTF-8で16 KiB以下
-- UUIDはlowercase canonical form
-- Git commitは40桁lowercase SHA-1
-- SHA-256は64桁lowercase hex
-- UTC timestampはRFC 3339
-- duplicate key、unknown request field、BOM、不正UTF-8、末尾余分を拒否
+次の要求制限はAPI v2の`StrictV2Json.receive`に適用します。pairingは`receivePairing`で64 KiB・深さ16・文字列4 KiBに制限します。v1の受信処理は[Jobs APIの実装参照](jobs-v1.md#実装参照)を参照してください。
 
-manifest、source scan、APK、bounded logには各endpoint固有の上限があります。
+- `application/json`, UTF-8
+- v2の要求本文は256 KiB以下
+- nestingはrootを1として32以下
+- 通常文字列はdecoded UTF-8で16 KiB以下
+- UUIDはlowercase canonical form
+- Git コミットは40桁lowercase SHA-1
+- SHA-256は64桁lowercase hex
+- UTC 日時はRFC 3339
+- duplicate key、unknown 要求フィールド、BOM、不正UTF-8、末尾余分を拒否
+
+manifest、ソーススキャン、APK、bounded ログには各エンドポイント固有の上限があります。
 
 ## Mutation header
 
-API v2のmutationはendpointごとのcontractとcanonical UUIDのidempotency keyを要求します。
+各APIで指定された更新操作には、対応するcontractと正規形UUIDのidempotency keyを付けます。ツールチェーン計画の解決とself-revokeなど、ヘッダーを要求しない操作は個別の節を参照してください。
 
 ```http
 X-ReproDroid-Contract: generic-build@1
 Idempotency-Key: 00000000-0000-4000-8000-000000000001
 ```
 
-同じprincipal、operation、key、同じcanonical requestは既存結果を返します。同じkeyを異なるrequestへ再利用すると`409 IDEMPOTENCY_CONFLICT`です。
+作成・保存APIは同じ接続主体、操作、key、正規化済み要求に対して既存結果を返し、異なる要求へのkey再利用を`409 IDEMPOTENCY_CONFLICT`として拒否します。ビルドのconfirm／scan-continue／cancelはヘッダー形式を検査し、実行可否を現在のJob状態で判定します。
 
 ## Error
 
@@ -48,18 +50,18 @@ Idempotency-Key: 00000000-0000-4000-8000-000000000001
 
 | HTTP | 意味 |
 |---|---|
-| `400` | JSON、field、header、cursor等が不正 |
-| `401` | credentialがない、不正、失効 |
+| `400` | JSON、フィールド、ヘッダー、cursor等が不正 |
+| `401` | 認証情報がない、不正、失効 |
 | `403` | capability/permission不足、RCE確認不足 |
-| `404` | resourceなし、またはprincipalが所有しない |
-| `409` | state、digest、plan、preview、idempotencyの競合 |
-| `413` | bodyまたは専用payload上限超過 |
-| `426` | v1 mutationではなくv2を使用する必要がある |
-| `429` | pairing等のrate limit |
+| `404` | リソースなし、または接続主体が所有しない |
+| `409` | 状態、ハッシュ、計画、プレビュー、idempotencyの競合 |
+| `413` | 本文または専用payload上限超過 |
+| `426` | v1 更新操作ではなくv2を使用する必要がある |
+| `429` | pairing等のrate 上限 |
 | `500` | redacted internal failure |
-| `503` | storage/reconciliation等により安全なmutationを継続できない |
+| `503` | storage/reconciliation等により安全な更新操作を継続できない |
 
-errorへtoken、secret、private path、raw tool outputを含めません。
+エラーへトークン、秘密情報、private パス、raw tool outputを含めません。
 
 ## Health
 
@@ -92,11 +94,11 @@ errorへtoken、secret、private path、raw tool outputを含めません。
 }
 ```
 
-`generic-build`、`apk-comparison`、`codeberg-source`はreal buildとDockerが有効な場合に広告します。`runner-authentication`はpaired HTTPSの場合に広告します。
+`generic-build`、`apk-comparison`、`codeberg-source`は実ビルドとDockerが有効な場合に広告します。`runner-authentication`はpaired HTTPSの場合に広告します。
 
 ## Operation
 
-`GET /v2/operations/{operationId}`は、呼出principalが所有するoperationを返します。
+`GET /v2/operations/{operationId}`は、呼出接続主体が所有する操作を返します。
 
 ```json
 {
@@ -111,10 +113,18 @@ errorへtoken、secret、private path、raw tool outputを含めません。
 }
 ```
 
-operation stateは`RESERVED`、`APPLYING`、`COMPLETED`、`REJECTED`、`RECONCILIATION_REQUIRED`です。
+操作状態は`RESERVED`、`APPLYING`、`COMPLETED`、`REJECTED`、`RECONCILIATION_REQUIRED`です。
 
 ## Self revoke
 
 `POST /v2/authentication/self-revoke`
 
-bodyは空JSON object `{}`です。現在のpaired principalを失効させ、`runnerId`、`principalId`、`state`、`revokedAt`を返します。
+本文は空JSON object `{}`です。現在のpaired 接続主体を失効させ、`runnerId`、`principalId`、`state`、`revokedAt`を返します。
+
+## 実装参照
+
+- [StrictV2Json.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/StrictV2Json.kt) — `StrictV2Json.receive / receivePairing`
+- [StorageRetentionApi.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/StorageRetentionApi.kt) — `storageRetentionV2Routes`
+- [StorageRetentionModels.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/StorageRetentionModels.kt) — `V2CapabilitiesResponse / V2OperationResponse`
+- [ApiModels.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/ApiModels.kt) — `HealthResponse / ApiErrorResponse`
+- [PairingApi.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/PairingApi.kt) — `requirePrincipal / runnerAuthentication`

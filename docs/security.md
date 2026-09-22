@@ -1,50 +1,31 @@
-# Security
+# Runnerのセキュリティ
 
 ## 脅威境界
 
-Runnerは第三者のGradle projectを扱うため、build script、plugin、compiler、native toolは任意コードを実行できます。source scan、dependency pinning、container、Build A／Bは観察可能性とcontainmentを改善しますが、sourceの安全性を保証しません。
+Runnerは第三者のGradleプロジェクトをビルドします。スクリプト、プラグイン、コンパイラ、ネイティブツールは任意コードを実行するため、実行対象のコミットとスキャン結果を確認して承認してください。
 
 ## Transportと認証
 
-- development HTTPはexact loopbackだけにbindし、認証済み端末として扱いません。
-- paired HTTPSはmanual invitation、PC承認、root public-key pin、端末別credentialを使用します。
-- 通常のv1/v2 routeはpaired principalを要求します。
-- pairing routeは期限付きinvitationの範囲だけを扱い、通常APIの認証を迂回しません。
-- credential失効後のrequestは拒否します。
+開発用HTTPはループバックに限定され、固定のローカル接続主体を使います。paired HTTPSでは手動ペアリングで登録した端末別の認証情報とルート公開鍵の固定を使います。通常APIの認証は[PairingApi.kt](../src/main/kotlin/com/sanka1610/reprodroid/runner/PairingApi.kt)の`runnerAuthentication`と`requirePrincipal`、証明書・認証情報・失効は[RunnerSecurity.kt](../src/main/kotlin/com/sanka1610/reprodroid/runner/RunnerSecurity.kt)の`LocalCertificateAuthority`と`RunnerSecurityStore`が管理します。
+
+接続の操作は[接続ガイド](networking-and-pairing.md)、要求の形式は[共通API](api/common.md#originと認証)を参照してください。
 
 ## Build isolation
 
-generic buildはDockerを使用します。containerへDocker socket、privileged、host network、任意mount、Runner private key、Android credential、production Android signing keyを渡しません。
+汎用ビルドはDockerを使用します。Runnerがイメージとツールチェーンのマウントを選択し、Docker socket、特権モード、host network、要求側からの任意マウントを許可しません。Runnerの秘密鍵、Androidの認証情報、製品APKの署名鍵はコンテナへ渡しません。
 
-現在のprofileに含まれない境界:
+プロファイルとリソース上限は[BuildSandbox.kt](../src/main/kotlin/com/sanka1610/reprodroid/runner/BuildSandbox.kt)の`GenericDockerSandboxProfile`と`DetachedGitGenericDockerSandboxProfile`で定義します。現行プロファイルには固定の送信先許可リストとJob単位のディスク容量・inode数の強制上限がありません。ビルド実行前にホストの空き容量とネットワーク到達範囲を確認してください。
 
-- 固定egress allowlist
-- Job単位のhard disk quota
-- Job単位のinode quota
-- 第三者によるremote attestation
-- malicious kernel/container escapeへの保証
+## ソースと成果物
 
-## Sourceとartifact
+ソースURLは[BuildRecipes.kt](../src/main/kotlin/com/sanka1610/reprodroid/runner/BuildRecipes.kt)の`BuildRecipeRegistry.canonicalRepositoryKey`で検査します。実行前に参照を完全なコミットSHAへ解決します。
 
-- repository URLをpublic GitHub/Codebergの閉集合へ正規化します。
-- build前にrefをfull commit SHAへ解決し、利用者確認へ表示します。
-- artifactは専用directoryへ移し、download直前にsizeとSHA-256を再検査します。
-- path traversal、symbolic link、登録外artifactを拒否します。
-- `SUCCEEDED`はbuild完了であり、official APKとの一致やinstall可能性ではありません。
+成果物は専用ディレクトリへ保存し、配信直前に登録済みサイズ・SHA-256と照合します。パストラバーサル、シンボリックリンク、登録外の成果物を拒否します。応答と失敗条件は[Artifact API](api/jobs-v1.md#artifact)を参照してください。
 
 ## 秘密情報
 
-次をrepository、build workspace、container、Issue、chat、一般logへ保存しません。
-
-- Runner root/leaf private key
-- invitation secret
-- bearer credential
-- Android client private material
-- production Android signing keystore/passphrase
-- unreviewed state backup
-
-Runnerのlocal state backupとJob logは機微情報として扱います。
+Runnerの秘密鍵、invitation、端末の認証情報、Android署名用keystore・passphraseは、リポジトリ・ビルド保存先・コンテナ・Issue・一般ログへ保存しません。Runnerのデータ保全コピーとJobログには秘密情報が含まれ得るため、共有前に内容と保存先を確認してください。
 
 ## Data retention
 
-Job、operation、artifact、log、principalはSQLite12とstate directoryへ保存されます。cleanupはpreview-firstで、current/pending/referenced resourceとhold対象を保護します。log exportはdiagnostic recordであり、database backupではありません。
+保存先の保全・削除・ログ出力は[運用](operations.md)、削除時の保護条件は[Storage API](api/storage-v2.md#cleanup)を参照してください。

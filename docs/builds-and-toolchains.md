@@ -1,59 +1,28 @@
-# Builds and toolchains
+# ビルドとツールチェーン
 
 ## Buildの開始条件
 
-実source buildは`REPRODROID_ENABLE_REAL_BUILDS=true`の場合だけ開始できます。各Jobはrepository、解決済みfull commit SHA、recipe/configuration、sandbox、toolchainを固定し、RCEリスクの明示確認を要求します。
-
-generic buildはさらに次を要求します。
+汎用ビルドを使う場合は、Runner起動前に次を設定します。
 
 ```bash
 export REPRODROID_ENABLE_REAL_BUILDS=true
 export REPRODROID_BUILD_SANDBOX=DOCKER
 ```
 
-generic requestから任意shell、JVM option、environment、container image、mountを指定することはできません。
+各設定の既定値は[設定](configuration.md)、実行環境と制限は[セキュリティ](security.md#build-isolation)に記載しています。固定MicroG-REレシピは`REPRODROID_JDK_18_HOME`でJDK 18を指定します。レシピは[BuildRecipes.kt](../src/main/kotlin/com/sanka1610/reprodroid/runner/BuildRecipes.kt)の`BuildRecipeRegistry`で管理します。
 
-## Source取得とscan
+## ソースとスキャンの確認
 
-Runnerはpublic `github.com`と`codeberg.org`のHTTPS repository URLを受け付けます。credential、明示port、query、fragment、余分なpath、encoded traversalを拒否し、resolved full commitに固定してから実行します。
+Jobのリポジトリと解決済みコミットSHA、レシピまたはビルド設定を確認します。ビルド前スキャンで指摘がある場合は、検出内容と保存されたスキャンハッシュを確認して継続を判断してください。検出対象は[ApiModels.kt](../src/main/kotlin/com/sanka1610/reprodroid/runner/ApiModels.kt)の`SourceScanDetectorId`、要求形式は[Source scan continue](api/jobs-v1.md#source-scan-continue)を参照してください。
 
-source scanはWrapper、build script、plugin、native execution、network/process等のconfigured indicatorを検出します。findingがある場合は、保存されたscan digestに対する明示的なcontinueが必要です。findingがないことはsourceの安全性を証明しません。
+## ツールチェーンの導入
 
-## Docker境界
+Androidのツールチェーン画面でカタログを取得し、必要構成を計画します。ライセンス・ハッシュ・ダウンロード容量・展開容量を確認して導入してください。導入結果を確認してからJobを作成します。削除時はプレビューで参照中・保護対象の構成を確認します。
 
-generic build containerは次を固定します。
+カタログ、計画、導入・削除のフィールドは[Toolchain API](api/toolchains-v2.md)にまとめています。
 
-- Runnerが選択したimageとtoolchain mount
-- detached checkoutと限定Git互換shim
-- Docker socketなし
-- privileged modeなし
-- host networkなし
-- 任意image／mountなし
-- Runner security state、private key、Android credentialなし
+## Build A／Bと比較
 
-現在のbridge networkには固定egress allowlistがなく、Job単位のhard disk／inode quotaもありません。source repositoryとdependency serverへの通信内容は第三者attestationになりません。
+Androidから各ビルドを個別に承認します。作成した成果物とJob情報をAndroidへ返し、Androidで計算した比較結果を[Comparison API](api/builds-v2.md#comparisonを作成する)へ保存します。Runnerは保存済みのJob・構成・所有権と要求の整合性を検査します。
 
-## Managed toolchain
-
-Androidは次の順でtoolchainを管理します。
-
-1. `GET /v2/toolchains/catalog`
-2. `POST /v2/toolchains/plans:resolve`
-3. licenseとartifact digest／sizeを確認
-4. `POST /v2/toolchains/installations`
-5. operationとinstallation detailをpoll
-6. `GET /v2/toolchains/inventory`
-
-archive digest、展開size、entry数、path、publisher policy、content manifestを検査してからatomicに公開します。removalはpreviewとexecuteを分離し、使用中または保護対象のtoolchainを削除しません。
-
-## Build A／B
-
-Build AとBuild Bは、同じrelease observationとconfiguration hashを使いますが、別Job、別checkout、別build home、別artifactとして実行します。片方のcommit確認、RCE確認、scan確認を他方へ継承しません。
-
-Runnerが作成するraw comparisonは次の三軸を区別します。
-
-- Official vs Build A
-- Official vs Build B
-- Build A vs Build B
-
-`MATCH`、`DIFFERENT`、`INCOMPARABLE`を保存し、resource不足による限定retryでraw結果を成功へ書き換えません。Android側の`Reproducible`表示条件は[Reproducibility](https://github.com/Sanka1610/reprodroid/blob/main/docs/reproducibility.md)を参照してください。
+比較範囲とAndroidでの表示は[再現可能性の判定](https://github.com/Sanka1610/reprodroid/blob/main/docs/reproducibility.md)、メモリ不足時の再試行は[Resource retry](api/builds-v2.md#resource-retry)を参照してください。

@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/reprodroid-runner/runner.env
+# コピー後、ExecStart を実際に展開した版の実行ファイルへ変更する（docs/installation.md）。
 ExecStart=%h/.local/opt/reprodroid-runner-0.1.0-alpha02/bin/reprodroid-runner
 Restart=on-failure
 RestartSec=5

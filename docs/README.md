@@ -1,20 +1,18 @@
-# ReproDroid Runner documentation
+# Runnerドキュメント一覧
 
-Runner `0.1.0-alpha02`の導入、設定、運用、APIを説明します。
+このチェックアウトの導入、設定、運用、APIを説明します。配布物の版と対応Androidは対象Releaseの`release-manifest.json`で確認してください。
 
-## 利用者向け
+| 目的 | 文書 |
+|---|---|
+| ZIPの取得・検証・初期起動 | [導入](installation.md) |
+| ADB reverse、LAN、WSL2、ペアリング | [接続](networking-and-pairing.md) |
+| 環境変数の既定値と受理条件 | [設定](configuration.md) |
+| スキャン、ツールチェーン、Build A／B | [ビルド](builds-and-toolchains.md) |
+| CLI、更新、データ保全、ログ出力、復旧 | [運用](operations.md) |
+| 認証、Docker、秘密情報の管理 | [セキュリティ](security.md) |
+| 接続・ビルド・保存の失敗への対処 | [トラブルシューティング](troubleshooting.md) |
+| ソースからのビルドと配布物作成 | [開発](development.md) |
+| v1、v2、pairingの要求・応答 | [API](api/README.md) |
+| 版ごとの変更 | [変更履歴](../CHANGELOG.md) |
 
-- [Installation](installation.md): Release ZIPの検証、展開、初期起動
-- [Networking and pairing](networking-and-pairing.md): ADB reverse、LAN、WSL2、HTTPS、manual pairing
-- [Configuration](configuration.md): production設定とfail-closed条件
-- [Builds and toolchains](builds-and-toolchains.md): source scan、Docker、managed toolchain、Build A／B
-- [Operations](operations.md): 起動停止、更新、state保全、log export、失効、復旧
-- [Security](security.md): 認証、任意コード実行、container、秘密情報の境界
-- [Troubleshooting](troubleshooting.md): 接続、certificate、build、toolchain、storage
-
-## 開発者向け
-
-- [Development](development.md): source checkout、test、distribution作成
-- [API](api/README.md): v1、v2、pairingのwire contract
-
-Androidアプリ側の操作、比較判定、trust、signer、installは[ReproDroid documentation](https://github.com/Sanka1610/reprodroid/tree/main/docs)を参照してください。
+Androidの操作・比較表示・インストールは[Android文書一覧](https://github.com/Sanka1610/reprodroid/blob/main/docs/README.md)を参照してください。

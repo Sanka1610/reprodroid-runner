@@ -1,23 +1,23 @@
 # Jobs API v1
 
-Base pathは`/v1`です。API v2が有効なRunnerでは、新しいv1 execution mutationは`426 API_UPGRADE_REQUIRED`になります。health、Job detail、log、artifact等のreadは利用できます。
+Base パスは`/v1`です。API v2が有効なRunnerでは、新しいv1 execution 更新操作は`426 API_UPGRADE_REQUIRED`になります。health、Job detail、ログ、成果物等の取得操作は利用できます。
 
 ## Endpoint
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/v1/health` | — | version、real build gate、database readiness |
+| `GET` | `/v1/health` | — | バージョン、実ビルド gate、database readiness |
 | `POST` | `/v1/jobs` | `CreateJobRequest` | `202` Job ID/state |
 | `GET` | `/v1/jobs/{jobId}` | — | Job detail |
-| `POST` | `/v1/jobs/{jobId}/confirm` | commitとRCE確認 | `204` |
+| `POST` | `/v1/jobs/{jobId}/confirm` | コミットとRCE確認 | `204` |
 | `POST` | `/v1/jobs/{jobId}/cancel` | — | `204` |
 | `POST` | `/v1/jobs/{jobId}/retry` | — | `202` 新Job |
-| `GET` | `/v1/jobs/{jobId}/logs` | cursor query | bounded log page |
-| `GET` | `/v1/jobs/{jobId}/artifacts` | — | artifact metadata |
-| `GET` | `/v1/jobs/{jobId}/artifacts/{artifactId}/content` | — | APK bytes |
+| `GET` | `/v1/jobs/{jobId}/logs` | cursor query | bounded ログ page |
+| `GET` | `/v1/jobs/{jobId}/artifacts` | — | 成果物 metadata |
+| `GET` | `/v1/jobs/{jobId}/artifacts/{artifactId}/content` | — | APK バイト列 |
 | `GET` | `/v1/jobs/{jobId}/build-environment-manifest` | — | redacted manifest |
 | `GET` | `/v1/jobs/{jobId}/source-scan` | — | bounded scan detail |
-| `POST` | `/v1/jobs/{jobId}/source-scan/continue` | scan digestと確認 | `204` |
+| `POST` | `/v1/jobs/{jobId}/source-scan/continue` | scan ハッシュと確認 | `204` |
 
 ## Jobを作成する
 
@@ -30,7 +30,7 @@ Base pathは`/v1`です。API v2が有効なRunnerでは、新しいv1 execution
 }
 ```
 
-`executionMode`は`SIMULATED`または`REAL_TRUSTED`、revision typeは`BRANCH`、`TAG`、`COMMIT`です。実buildはRunner内のallowlist/fixed recipe、`REPRODROID_ENABLE_REAL_BUILDS=true`、解決済みcommitの確認を要求します。Gradle task、argument、artifact path、Java runtimeをrequestから指定できません。
+`executionMode`は`SIMULATED`または`REAL_TRUSTED`、revision typeは`BRANCH`、`TAG`、`COMMIT`です。実ビルドはRunner内のallowlist/fixed recipe、`REPRODROID_ENABLE_REAL_BUILDS=true`、解決済みコミットの確認を要求します。Gradle task、argument、成果物パス、Java runtimeを要求から指定できません。
 
 ```json
 {"jobId":"00000000-0000-4000-8000-000000000001","state":"CREATED"}
@@ -40,7 +40,7 @@ Base pathは`/v1`です。API v2が有効なRunnerでは、新しいv1 execution
 
 `CREATED`、`RESOLVING_SOURCE`、`AWAITING_CONFIRMATION`、`QUEUED`、`CLONING`、`SCANNING_SOURCE`、`AWAITING_SCAN_REVIEW`、`VERIFYING_WRAPPER`、`DISCOVERING_CONFIGURATION`、`BUILDING`、`DISCOVERING_ARTIFACTS`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`INTERRUPTED`を使用します。
 
-Job detailはrequest、resolved commit、state/progress、effective build、log cursor、artifact、error、timestampを返します。未知stateを成功として扱いません。
+Job detailは要求、resolved コミット、state/progress、effective ビルド、ログ cursor、成果物、エラー、日時を返します。未知状態を成功として扱いません。
 
 ## Confirm
 
@@ -51,7 +51,7 @@ Job detailはrequest、resolved commit、state/progress、effective build、log 
 }
 ```
 
-現在保存されているcommitと完全一致し、`riskAcknowledged`がtrueの場合だけqueueへ進みます。retryは新Jobを作り、ref解決と確認をやり直します。
+現在保存されているコミットと完全一致し、`riskAcknowledged`がtrueの場合だけキューへ進みます。再試行は新Jobを作り、ref解決と確認をやり直します。
 
 ## Source scan continue
 
@@ -62,24 +62,29 @@ Job detailはrequest、resolved commit、state/progress、effective build、log 
 }
 ```
 
-保存されたscan digestと一致するfindingだけを確認します。
+保存されたscan ハッシュと一致するfindingだけを確認します。
 
 ## Logs
 
 `GET /v1/jobs/{jobId}/logs?afterSequence=0&limit=200`
 
-`afterSequence`は0以上、`limit`は1..500です。responseは`entries`、`nextAfterSequence`、`hasMore`を返します。
+`afterSequence`は0以上、`limit`は1..500です。応答は`entries`、`nextAfterSequence`、`hasMore`を返します。
 
 ## Artifact
 
-artifact listは`artifactId`、`fileName`、`sizeBytes`、`sha256`等を返します。content responseは次を返します。
+成果物 listは`artifactId`、`fileName`、`sizeBytes`、`sha256`等を返します。content 応答は次を返します。
 
 - `Content-Type: application/vnd.android.package-archive`
 - `Content-Length`
 - SHA-256を引用符で囲んだ`ETag`
 
-Runnerはdownload直前に登録済みsize/digestと実fileを照合します。Job未完了、contentなし、path/symlink/digest不一致は`409`です。
+Runnerはダウンロード直前に登録済みsize/digestと実ファイルを照合します。Job未完了、contentなし、path/symlink/digest不一致は`409`です。
 
 ## Build Environment Manifest
 
-private manifestを直接返さず、path、user、secretを除去したpublic projectionを返します。commit、Java、Gradle、Android SDK/build tools、dependency digest、APK digest、determinism、scan、sandbox identityを含みます。Androidはmanifest単独をtrustまたはreproducibility判定に使用しません。
+private manifestを直接返さず、パス、利用者、秘密情報を除去したpublic projectionを返します。コミット、Java、Gradle、Android SDK/build tools、dependency ハッシュ、APK ハッシュ、determinism、scan、sandbox identityを含みます。Androidはmanifest単独をtrustまたはreproducibility判定に使用しません。
+
+## 実装参照
+
+- [RunnerApi.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/RunnerApi.kt) — `runnerModule`
+- [ApiModels.kt](../../src/main/kotlin/com/sanka1610/reprodroid/runner/ApiModels.kt) — `CreateJobRequest / JobState / JobResponse / LogResponse`
